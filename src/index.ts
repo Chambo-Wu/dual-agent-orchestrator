@@ -427,6 +427,71 @@ function normalizeAnthropicToolMessages(messages: AnthropicMessage[] | undefined
   return normalized;
 }
 
+function safeParseToolInput(argumentsText: string | undefined): Record<string, unknown> {
+  if (typeof argumentsText !== "string" || !argumentsText.trim()) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(argumentsText);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | undefined): boolean {
+  if (!Array.isArray(messages) || messages.length < 2) {
+    return false;
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  const previousMessage = messages[messages.length - 2];
+  if (lastMessage?.role !== "tool" || previousMessage?.role !== "assistant" || !Array.isArray(previousMessage.tool_calls)) {
+    return false;
+  }
+
+  const matchedTool = previousMessage.tool_calls.find((call) => call?.id === lastMessage.tool_call_id);
+  const toolName = matchedTool?.function?.name;
+  if (toolName !== "write_file") {
+    return false;
+  }
+
+  const toolContent = getMessageText(lastMessage);
+  return /"ok"\s*:\s*true/i.test(toolContent) || /"summary"\s*:\s*"Wrote file/i.test(toolContent);
+}
+
+function extractLatestAnthropicWriteToolCompletion(messages: AnthropicMessage[] | undefined): boolean {
+  if (!Array.isArray(messages) || messages.length < 2) {
+    return false;
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  const previousMessage = messages[messages.length - 2];
+  if (lastMessage?.role !== "user" || previousMessage?.role !== "assistant") {
+    return false;
+  }
+  if (!Array.isArray(lastMessage.content) || !Array.isArray(previousMessage.content)) {
+    return false;
+  }
+
+  const latestToolResult = [...lastMessage.content].reverse().find((part) => part?.type === "tool_result" && typeof part.tool_use_id === "string");
+  if (!latestToolResult) {
+    return false;
+  }
+
+  const matchedToolUse = previousMessage.content.find((part) => part?.type === "tool_use" && part.id === latestToolResult.tool_use_id);
+  if (matchedToolUse?.name !== "write_file") {
+    return false;
+  }
+
+  const content = typeof latestToolResult.content === "string"
+    ? latestToolResult.content
+    : typeof latestToolResult.text === "string"
+      ? latestToolResult.text
+      : JSON.stringify(latestToolResult.content ?? "");
+  return /"ok"\s*:\s*true/i.test(content) || /"summary"\s*:\s*"Wrote file/i.test(content);
+}
+
 function buildUserGoal(messages: OpenAIMessage[]): string {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
   if (lastUserMessage) {
@@ -785,6 +850,11 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
 
   if (toolMode) {
+    if (extractLatestOpenAIWriteToolCompletion(body.messages)) {
+      jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
+      return;
+    }
+
     const toolResult = await runToolMode(normalizeOpenAIToolMessages(body.messages || []), body.model, body.tools);
 
     if (!body.stream) {
@@ -931,6 +1001,11 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
 
   if (toolMode) {
+    if (extractLatestAnthropicWriteToolCompletion(body.messages)) {
+      jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
+      return;
+    }
+
     const anthropicTools = body.tools ?? [];
     const convertedTools = anthropicTools.map((tool) => ({
       type: "function",
@@ -953,7 +1028,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
             type: "tool_use",
             id: call.id,
             name: call.name,
-            input: JSON.parse(call.arguments || "{}"),
+            input: safeParseToolInput(call.arguments),
           })),
           stop_reason: "tool_use",
           stop_sequence: null,

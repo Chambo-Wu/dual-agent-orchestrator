@@ -7,6 +7,7 @@ import { parseExecutorOutput } from "./executor-adapter.js";
 import type { RunLogger } from "./logger.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
+import { RUNTIME_ROOT } from "./paths.js";
 import type { ExecutorOutput, OrchestratorConfig, PlannerExecutorRequest, PlannerOutput, RoutePolicy, TaskType } from "./types.js";
 
 export class PlannerUnavailableError extends Error {
@@ -47,6 +48,10 @@ function previewText(input: string, limit = 400): string {
     return normalized;
   }
   return `${normalized.slice(0, limit)}...`;
+}
+
+function shouldReturnAfterSuccessfulTool(tool: string): boolean {
+  return tool === "write_file" || tool === "read_file" || tool === "list_files";
 }
 
 function safeReadTextFile(path: string): string {
@@ -246,20 +251,26 @@ function parseRepoCandidatesFromText(text: string, source: string): RepoCandidat
     return [];
   }
 
+  const directArray = (() => {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  })();
+  if (directArray) {
+    return normalizeRepoCandidatesFromArray(directArray, source);
+  }
+
   try {
     const parsed = parseModelJson<unknown>(trimmed);
     if (Array.isArray(parsed)) {
-      return parsed.flatMap((item) => {
-        const repo = isRecord(item) ? normalizeRepoRecord(item, source) : null;
-        return repo ? [repo] : [];
-      });
+      return normalizeRepoCandidatesFromArray(parsed, source);
     }
     if (isRecord(parsed)) {
       if (Array.isArray(parsed.items)) {
-        return parsed.items.flatMap((item) => {
-          const repo = isRecord(item) ? normalizeRepoRecord(item, source) : null;
-          return repo ? [repo] : [];
-        });
+        return normalizeRepoCandidatesFromArray(parsed.items, source);
       }
       const repo = normalizeRepoRecord(parsed, source);
       return repo ? [repo] : [];
@@ -269,6 +280,50 @@ function parseRepoCandidatesFromText(text: string, source: string): RepoCandidat
   }
 
   return [];
+}
+
+function normalizeRepoCandidatesFromArray(items: unknown[], source: string): RepoCandidate[] {
+  const candidates: RepoCandidate[] = [];
+  for (const item of items) {
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    const normalized = normalizeRepoRecord(item, source);
+    if (normalized) {
+      candidates.push(normalized);
+      continue;
+    }
+
+    const fullName = typeof item.full_name === "string" ? item.full_name.trim() : "";
+    const htmlUrl = typeof item.html_url === "string" ? item.html_url.trim() : "";
+    if (!fullName || !htmlUrl) {
+      continue;
+    }
+
+    const description = typeof item.description === "string" ? item.description : "";
+    const topics = Array.isArray(item.topics)
+      ? item.topics.filter((topic): topic is string => typeof topic === "string")
+      : [];
+
+    candidates.push(scoreRepoCandidate({
+      name: fullName.includes("/") ? fullName.split("/").pop() || fullName : fullName,
+      full_name: fullName,
+      html_url: htmlUrl,
+      description,
+      stargazers_count: typeof item.stargazers_count === "number" ? item.stargazers_count : 0,
+      language: typeof item.language === "string" ? item.language : undefined,
+      updated_at: typeof item.updated_at === "string" ? item.updated_at : undefined,
+      topics,
+      score: 0,
+      label: "consider",
+      reasons: [],
+      concerns: [],
+      source,
+    }));
+  }
+
+  return candidates;
 }
 
 function extractScoredCandidates(executorHistory: ExecutorOutput[]): RepoCandidate[] {
@@ -307,6 +362,168 @@ function extractScoredCandidates(executorHistory: ExecutorOutput[]): RepoCandida
     .slice(0, 8);
 }
 
+async function runExecutorConversation(
+  config: OrchestratorConfig,
+  request: PlannerOutput["executor_request"],
+  allowedTools: typeof TOOL_DEFINITIONS,
+  stepNumber: number,
+  logger?: RunLogger
+): Promise<{ response: Awaited<ReturnType<typeof runChatCompletionDetailed>>; executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>; artifacts: ExecutorOutput["artifacts"]; lastSummary: string; lastRawResult: string; lastError?: string; ok: boolean }> {
+  const messages = buildExecutorMessages(request);
+  const artifacts: ExecutorOutput["artifacts"] = [];
+  const executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }> = [];
+  let lastSummary = "";
+  let lastRawResult = "";
+  let lastError: string | undefined;
+  let ok = true;
+
+  for (let toolRound = 0; toolRound <= config.policy.maxToolRetries; toolRound++) {
+    const executorResponse = await runChatCompletionDetailed(config.executor, messages, allowedTools);
+    emitReasoningTrace("executor", stepNumber, executorResponse.reasoning, logger);
+    logger?.log("executor.response.raw", {
+      step: stepNumber,
+      tool_round: toolRound,
+      content: executorResponse.content,
+      reasoning: executorResponse.reasoning,
+      tool_calls: executorResponse.toolCalls,
+      raw: executorResponse.raw,
+    });
+
+    if (executorResponse.toolCalls.length === 0) {
+      return {
+        response: executorResponse,
+        executedCalls,
+        artifacts,
+        lastSummary,
+        lastRawResult,
+        lastError,
+        ok,
+      };
+    }
+
+    messages.push({
+      role: "assistant",
+      content: executorResponse.content || "",
+      tool_calls: executorResponse.toolCalls.map((call) => ({
+        id: call.id || call.name,
+        type: "function",
+        function: {
+          name: call.name,
+          arguments: call.arguments,
+        },
+      })),
+    });
+
+    for (const nativeCall of executorResponse.toolCalls) {
+      let argumentsObject: Record<string, unknown> = {};
+      try {
+        argumentsObject = JSON.parse(nativeCall.arguments) as Record<string, unknown>;
+      } catch {
+        argumentsObject = {};
+      }
+
+      const call = { tool: nativeCall.name, arguments: argumentsObject };
+      executedCalls.push(call);
+
+      if (!request?.allowed_tools.includes(call.tool)) {
+        logger?.log("tool.blocked", {
+          step: stepNumber,
+          tool: call.tool,
+          arguments: call.arguments,
+          reason: "Tool not allowed for this step",
+        });
+        return {
+          response: executorResponse,
+          executedCalls,
+          artifacts,
+          lastSummary: `Executor requested disallowed tool ${call.tool}`,
+          lastRawResult,
+          lastError: `Tool ${call.tool} is not allowed for this step`,
+          ok: false,
+        };
+      }
+
+      logger?.log("tool.execution.started", {
+        step: stepNumber,
+        tool: call.tool,
+        arguments: call.arguments,
+      });
+      const result = executeTool(call.tool, call.arguments);
+      logger?.log("tool.execution.finished", {
+        step: stepNumber,
+        tool: call.tool,
+        ok: result.ok,
+        summary: result.summary,
+        error: result.error,
+        artifact: result.artifact,
+        raw_result_preview: result.rawResult.slice(0, 500),
+      });
+
+      if (result.artifact) {
+        artifacts.push(result.artifact);
+      }
+      lastSummary = result.summary;
+      lastRawResult = result.rawResult;
+      if (!result.ok) {
+        ok = false;
+        lastError = result.error;
+      }
+
+      if (result.ok && shouldReturnAfterSuccessfulTool(call.tool)) {
+        return {
+          response: executorResponse,
+          executedCalls,
+          artifacts,
+          lastSummary: result.summary,
+          lastRawResult: result.rawResult,
+          lastError,
+          ok,
+        };
+      }
+
+      messages.push({
+        role: "tool",
+        name: call.tool,
+        tool_call_id: nativeCall.id || call.tool,
+        content: JSON.stringify({
+          ok: result.ok,
+          summary: result.summary,
+          raw_result: result.rawResult,
+          artifact: result.artifact,
+          error: result.error,
+        }),
+      });
+    }
+
+    if (!ok) {
+      return {
+        response: executorResponse,
+        executedCalls,
+        artifacts,
+        lastSummary,
+        lastRawResult,
+        lastError,
+        ok,
+      };
+    }
+  }
+
+  return {
+    response: {
+      content: "",
+      reasoning: "",
+      toolCalls: [],
+      raw: {},
+    },
+    executedCalls,
+    artifacts,
+    lastSummary: lastSummary || "Executor exceeded tool round limit.",
+    lastRawResult,
+    lastError: lastError || "Executor exceeded tool round limit",
+    ok: false,
+  };
+}
+
 function buildCandidateRankingText(executorHistory: ExecutorOutput[]): string {
   const ranked = extractScoredCandidates(executorHistory);
   if (ranked.length === 0) {
@@ -324,7 +541,7 @@ function getResearchRankingArtifactPath(logger?: RunLogger): string | undefined 
   if (!logger) {
     return undefined;
   }
-  return resolve("runtime", "command-results", `${logger.runId}-ranking.json`);
+  return resolve(RUNTIME_ROOT, "command-results", `${logger.runId}-ranking.json`);
 }
 
 function persistRankingArtifact(executorHistory: ExecutorOutput[], logger?: RunLogger): string | undefined {
@@ -356,6 +573,13 @@ function hasUsefulArtifactRead(history: ExecutorOutput[]): boolean {
   return history.some((item) =>
     item.tool_calls_made.some((call) => call.tool === "read_file") &&
     item.status === "success"
+  );
+}
+
+function hasSuccessfulWrite(history: ExecutorOutput[]): boolean {
+  return history.some((item) =>
+    item.status === "success"
+    && item.tool_calls_made.some((call) => call.tool === "write_file")
   );
 }
 
@@ -468,101 +692,44 @@ async function runExecutorStep(
     request: planner.executor_request,
     allowed_tools: allowedTools.map((tool) => tool.name),
   });
-  const executorResponse = await runChatCompletionDetailed(
-    config.executor,
-    buildExecutorMessages(planner.executor_request),
-    allowedTools
+  const conversation = await runExecutorConversation(
+    config,
+    planner.executor_request,
+    allowedTools,
+    stepNumber,
+    logger
   );
-  emitReasoningTrace("executor", stepNumber, executorResponse.reasoning, logger);
-  logger?.log("executor.response.raw", {
-    step: stepNumber,
-    content: executorResponse.content,
-    reasoning: executorResponse.reasoning,
-    tool_calls: executorResponse.toolCalls,
-    raw: executorResponse.raw,
-  });
-
-  const parsed = executorResponse.toolCalls.length > 0
-    ? {
-        status: "success" as const,
-        summary: executorResponse.content || "Executor requested native tool calls.",
-        tool_calls_made: executorResponse.toolCalls.map((call) => {
-          let argumentsObject: Record<string, unknown> = {};
-          try {
-            argumentsObject = JSON.parse(call.arguments) as Record<string, unknown>;
-          } catch {
-            argumentsObject = {};
-          }
-          return { tool: call.name, arguments: argumentsObject };
-        }),
-        artifacts: [],
-        raw_result: JSON.stringify(executorResponse.raw),
-        error: undefined,
-      }
-    : parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
+  const executorResponse = conversation.response;
+  const parsed = parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
   logger?.log("executor.response.parsed", {
     step: stepNumber,
     parsed,
-    used_native_tool_calls: executorResponse.toolCalls.length > 0,
+    used_native_tool_calls: conversation.executedCalls.length > 0,
   });
 
-  if (parsed.tool_calls_made.length === 0) {
-    return parsed;
-  }
-
-  const artifacts = [...parsed.artifacts];
-  let summary = parsed.summary;
-  let rawResult = parsed.raw_result;
-  let error = parsed.error;
-  let ok = parsed.status === "success";
-
-  for (const call of parsed.tool_calls_made) {
-    if (!planner.executor_request.allowed_tools.includes(call.tool)) {
-      logger?.log("tool.blocked", {
-        step: stepNumber,
-        tool: call.tool,
-        arguments: call.arguments,
-        reason: "Tool not allowed for this step",
-      });
-      return {
-        status: "blocked",
-        summary: `Executor requested disallowed tool ${call.tool}`,
-        tool_calls_made: parsed.tool_calls_made,
-        artifacts,
-        raw_result: rawResult,
-        error: `Tool ${call.tool} is not allowed for this step`,
-      };
-    }
-
-    logger?.log("tool.execution.started", {
-      step: stepNumber,
-      tool: call.tool,
-      arguments: call.arguments,
-    });
-    const result = executeTool(call.tool, call.arguments);
-    logger?.log("tool.execution.finished", {
-      step: stepNumber,
-      tool: call.tool,
-      ok: result.ok,
-      summary: result.summary,
-      error: result.error,
-      artifact: result.artifact,
-      raw_result_preview: result.rawResult.slice(0, 500),
-    });
-    if (result.artifact) artifacts.push(result.artifact);
-    summary = result.summary;
-    rawResult = result.rawResult;
-    if (!result.ok) {
-      ok = false;
-      error = result.error;
-      break;
-    }
-  }
+  const toolCallsMade = parsed.tool_calls_made.length > 0
+    ? parsed.tool_calls_made
+    : conversation.executedCalls;
+  const artifacts = parsed.artifacts.length > 0
+    ? [...conversation.artifacts, ...parsed.artifacts]
+    : conversation.artifacts;
+  const summary = parsed.summary !== "Executor did not return valid JSON."
+    ? parsed.summary
+    : (conversation.lastSummary || parsed.summary);
+  const rawResult = parsed.raw_result && parsed.raw_result !== (executorResponse.content || executorResponse.reasoning || "")
+    ? parsed.raw_result
+    : (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw));
+  const error = parsed.error || conversation.lastError;
+  const status = !conversation.ok
+    ? "failed"
+    : (toolCallsMade.length > 0 && parsed.status === "failed" && parsed.error === "Unable to parse executor output as JSON")
+      ? "success"
+      : parsed.status;
 
   return {
-    status: ok ? "success" : "failed",
+    status,
     summary,
-    tool_calls_made: parsed.tool_calls_made,
+    tool_calls_made: toolCallsMade,
     artifacts,
     raw_result: rawResult,
     error,
@@ -673,6 +840,7 @@ export async function runOrchestrator(
     if (
       planner.status === "final"
       && routePolicy.requireEvidenceBeforeFinal
+      && !hasSuccessfulWrite(executorHistory)
       && !hasUsefulArtifactRead(executorHistory)
       && executorHistory.some((item) => item.artifacts.some((artifact) => artifact.path?.includes("command-results")))
     ) {
@@ -697,6 +865,7 @@ export async function runOrchestrator(
     if (
       planner.status === "final"
       && routePolicy.requireEvidenceBeforeFinal
+      && !hasSuccessfulWrite(executorHistory)
       && (!hasUsefulArtifactRead(executorHistory) || !hasNonEmptyCommandArtifact(executorHistory))
     ) {
       logger?.log("planner.protocol_violation", {

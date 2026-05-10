@@ -9,7 +9,7 @@ planner:
 executor:
   base_url: "http://192.168.1.161:3001/v1"
   api_key: "env:EXECUTOR_API_KEY"
-  model: "LongCat-Flash-Chat"
+  model: "Qwen/Qwen3-8B"
   timeout_ms: 60000
   max_tokens: 8192
   temperature: 0

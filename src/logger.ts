@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { RUNTIME_ROOT } from "./paths.js";
 
 export interface RunLogger {
   runId: string;
@@ -18,7 +19,7 @@ function safeSerialize(payload: unknown): string {
 }
 
 export function createRunLogger(userGoal: string): RunLogger {
-  const logsDir = resolve("runtime", "logs");
+  const logsDir = resolve(RUNTIME_ROOT, "logs");
   mkdirSync(logsDir, { recursive: true });
 
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(36).slice(2, 8)}`;

@@ -2,9 +2,8 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ToolDefinition, ToolExecutionResult } from "./types.js";
+import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 
-const runtimeRoot = resolve("runtime");
-const workspaceRoot = resolve(".");
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const POWERSHELL_CANDIDATES = [
   "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
@@ -54,14 +53,14 @@ function safePath(inputPath: unknown): string {
   if (typeof inputPath !== "string" || !inputPath.trim()) {
     throw new Error("path must be a non-empty string");
   }
-  return resolve(runtimeRoot, inputPath);
+  return resolve(RUNTIME_ROOT, inputPath);
 }
 
 function safeWorkspacePath(inputPath: unknown): string {
   if (typeof inputPath !== "string" || !inputPath.trim()) {
-    return workspaceRoot;
+    return WORKSPACE_ROOT;
   }
-  return resolve(workspaceRoot, inputPath);
+  return resolve(WORKSPACE_ROOT, inputPath);
 }
 
 function runPowerShellCommand(command: string, cwd: string, timeoutMs: number) {
@@ -79,7 +78,7 @@ function runPowerShellCommand(command: string, cwd: string, timeoutMs: number) {
       return result;
     }
   }
-  return lastResult;
+  return lastResult?.error ? null : lastResult;
 }
 
 function normalizePotentiallyInteractiveWebCmd(command: string): string {
@@ -91,8 +90,14 @@ function normalizePotentiallyInteractiveWebCmd(command: string): string {
   return normalized;
 }
 
+function prefersPowerShell(command: string): boolean {
+  return /\b(ConvertFrom-Json|ConvertTo-Json|Invoke-WebRequest|Invoke-RestMethod|Select-Object|Out-File|Get-ChildItem|ForEach-Object)\b/i.test(command)
+    || /\$\w+/.test(command)
+    || /@\{/.test(command);
+}
+
 function saveShellOutput(output: string): string {
-  const dir = resolve(runtimeRoot, "command-results");
+  const dir = resolve(RUNTIME_ROOT, "command-results");
   mkdirSync(dir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const trimmed = output.trim();
@@ -172,7 +177,9 @@ export function executeTool(name: string, args: Record<string, unknown>): ToolEx
       : DEFAULT_COMMAND_TIMEOUT_MS;
 
     const normalizedCommand = normalizePotentiallyInteractiveWebCmd(command);
-    const result = runPowerShellCommand(normalizedCommand, cwd, timeoutMs) ?? runCmdCommand(normalizedCommand, cwd, timeoutMs);
+    const result = prefersPowerShell(normalizedCommand)
+      ? (runPowerShellCommand(normalizedCommand, cwd, timeoutMs) ?? runCmdCommand(normalizedCommand, cwd, timeoutMs))
+      : (runCmdCommand(normalizedCommand, cwd, timeoutMs) ?? runPowerShellCommand(normalizedCommand, cwd, timeoutMs));
     if (!result) {
       return {
         ok: false,
