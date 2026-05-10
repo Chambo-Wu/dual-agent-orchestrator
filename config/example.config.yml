@@ -1,0 +1,24 @@
+planner:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "env:PLANNER_API_KEY"
+  model: "GLM-5"
+  timeout_ms: 120000
+  max_tokens: 8192
+  temperature: 0.2
+
+executor:
+  base_url: "http://192.168.1.161:3001/v1"
+  api_key: "env:EXECUTOR_API_KEY"
+  model: "LongCat-Flash-Chat"
+  timeout_ms: 60000
+  max_tokens: 8192
+  temperature: 0
+
+policy:
+  max_steps: 8
+  max_replans: 3
+  max_tool_retries: 2
+  planner_history_max_entries: 6
+  planner_history_preview_chars: 180
+  max_repeated_executor_requests: 2
+  task_routing_path: "config/task-routing.yml"
