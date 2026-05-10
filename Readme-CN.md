@@ -232,7 +232,7 @@ CLI 会在 stderr 打印本次日志路径，便于快速定位单次运行问�
 
 默认假设：
 
-- 服务地址：`http://127.0.0.1:32124`
+- 服务地址：`http://127.0.0.1:8787`
 - API key：`dual-agent-local`
 - 模型名：`dual-agent-orchestrator`
 
@@ -243,7 +243,7 @@ CLI 会在 stderr 打印本次日志路径，便于快速定位单次运行问�
 `curl`：
 
 ```bash
-curl http://127.0.0.1:32124/v1/chat/completions \
+curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
@@ -304,7 +304,7 @@ $body = @{
 
 Invoke-WebRequest -UseBasicParsing `
   -Method Post `
-  -Uri "http://127.0.0.1:32124/v1/chat/completions" `
+  -Uri "http://127.0.0.1:8787/v1/chat/completions" `
   -Headers @{ Authorization = "Bearer dual-agent-local" } `
   -ContentType "application/json; charset=utf-8" `
   -Body $body | Select-Object -ExpandProperty Content
@@ -327,7 +327,7 @@ Invoke-WebRequest -UseBasicParsing `
 `curl`：
 
 ```bash
-curl http://127.0.0.1:32124/v1/chat/completions \
+curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
@@ -426,7 +426,7 @@ $body = @{
 
 Invoke-WebRequest -UseBasicParsing `
   -Method Post `
-  -Uri "http://127.0.0.1:32124/v1/chat/completions" `
+  -Uri "http://127.0.0.1:8787/v1/chat/completions" `
   -Headers @{ Authorization = "Bearer dual-agent-local" } `
   -ContentType "application/json; charset=utf-8" `
   -Body $body | Select-Object -ExpandProperty Content
@@ -444,7 +444,7 @@ Invoke-WebRequest -UseBasicParsing `
 `curl`：
 
 ```bash
-curl http://127.0.0.1:32124/v1/messages \
+curl http://127.0.0.1:8787/v1/messages \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
@@ -499,7 +499,7 @@ $body = @{
 
 Invoke-WebRequest -UseBasicParsing `
   -Method Post `
-  -Uri "http://127.0.0.1:32124/v1/messages" `
+  -Uri "http://127.0.0.1:8787/v1/messages" `
   -Headers @{ Authorization = "Bearer dual-agent-local" } `
   -ContentType "application/json; charset=utf-8" `
   -Body $body | Select-Object -ExpandProperty Content
@@ -522,7 +522,7 @@ Invoke-WebRequest -UseBasicParsing `
 `curl`：
 
 ```bash
-curl http://127.0.0.1:32124/v1/messages \
+curl http://127.0.0.1:8787/v1/messages \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
@@ -619,7 +619,7 @@ $body = @{
 
 Invoke-WebRequest -UseBasicParsing `
   -Method Post `
-  -Uri "http://127.0.0.1:32124/v1/messages" `
+  -Uri "http://127.0.0.1:8787/v1/messages" `
   -Headers @{ Authorization = "Bearer dual-agent-local" } `
   -ContentType "application/json; charset=utf-8" `
   -Body $body | Select-Object -ExpandProperty Content

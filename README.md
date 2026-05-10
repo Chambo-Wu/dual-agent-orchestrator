@@ -2,6 +2,8 @@
 
 This project turns the planner + executor idea into a minimal runnable skeleton.
 
+Chinese documentation: [Readme-CN.md](./Readme-CN.md)
+
 ## Design
 
 - `planner`: a stronger model behind a web API, focused on understanding, planning, and final answers
@@ -69,7 +71,8 @@ npm run typecheck
 3. Run:
 
 ```powershell
-node src/index.ts "Write a markdown file named notes/todo.md with three deployment tasks."
+npm run build
+node --enable-source-maps dist/index.js "Write a markdown file named notes/todo.md with three deployment tasks."
 ```
 
 ## Local API service
@@ -215,14 +218,14 @@ Shell command note:
 
 Default assumptions:
 
-- base URL: `http://127.0.0.1:32124`
+- base URL: `http://127.0.0.1:8787`
 - API key: `dual-agent-local`
 - model: `dual-agent-orchestrator`
 
 ### OpenAI tool call, first round
 
 ```bash
-curl http://127.0.0.1:32124/v1/chat/completions \
+curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
@@ -264,7 +267,7 @@ Expected:
 ### Anthropic tool_use, first round
 
 ```bash
-curl http://127.0.0.1:32124/v1/messages \
+curl http://127.0.0.1:8787/v1/messages \
   -H "Authorization: Bearer dual-agent-local" \
   -H "Content-Type: application/json" \
   -d '{
