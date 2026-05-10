@@ -2,7 +2,7 @@
 
 This project turns the planner + executor idea into a minimal runnable skeleton.
 
-Chinese documentation: [Readme-CN.md](./Readme-CN.md)
+中文文档: [Readme-CN.md](./Readme-CN.md)
 
 ## Design
 
