@@ -420,6 +420,50 @@ function hasSufficientEvidenceForRoute(executorHistory: ExecutorOutput[], routeP
   return true;
 }
 
+function isFetchAccessError(message: string | undefined): boolean {
+  if (!message) {
+    return false;
+  }
+  return /\b(401|403|429)\b|forbidden|unauthorized|rate limit/i.test(message);
+}
+
+function hasRecentFetchAccessFailures(executorHistory: ExecutorOutput[]): boolean {
+  const recent = executorHistory.slice(-3);
+  if (recent.length === 0) {
+    return false;
+  }
+  let fetchFailureCount = 0;
+  for (const item of recent) {
+    const lastTool = item.tool_calls_made.at(-1)?.tool;
+    if (lastTool === "url_fetch" && isFetchAccessError(item.error)) {
+      fetchFailureCount++;
+    }
+  }
+  return fetchFailureCount >= 2;
+}
+
+function hasUsableResearchArtifacts(executorHistory: ExecutorOutput[]): boolean {
+  return executorHistory.some((item) =>
+    item.artifacts.some((artifact) =>
+      Boolean(artifact.path)
+      && artifact.content_preview.trim().length > 0
+      && (artifact.type === "file" || artifact.type === "json")
+    )
+  );
+}
+
+function hasReadableFetchedEvidence(executorHistory: ExecutorOutput[]): boolean {
+  return executorHistory.some((item) =>
+    item.source === "native_tool"
+    && item.artifacts.some((artifact) =>
+      typeof artifact.path === "string"
+      && artifact.path.includes("command-results")
+      && artifact.content_preview.trim().length > 0
+      && artifact.content_preview !== "(no output)"
+    )
+  );
+}
+
 async function runExecutorConversation(
   config: OrchestratorConfig,
   request: PlannerOutput["executor_request"],
@@ -612,38 +656,43 @@ function finalizeExecutorResult(
     ok: boolean;
   },
 ): ExecutorOutput {
+  const rawExecutorText = executorResponse.content || executorResponse.reasoning || "";
   const usedNativeToolCalls = conversation.executedCalls.length > 0;
   const usefulProgress = hasUsefulExecutorProgress(conversation);
-  const parsed = usedNativeToolCalls
-    ? {
-        status: usefulProgress && conversation.lastError ? "partial_success" as const : "success" as const,
-        summary: conversation.lastSummary || "Executor completed via native tool execution.",
-        tool_calls_made: [],
-        artifacts: [],
-        raw_result: conversation.lastRawResult,
-        error: conversation.lastError,
-      }
-    : parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
+  const parsed = parseExecutorOutput(rawExecutorText);
+  const modelReturnedStructuredJson = parsed.summary !== "Executor did not return valid JSON."
+    || parsed.error !== "Unable to parse executor output as JSON";
+  const honorModelTerminalAssessment = usedNativeToolCalls
+    && modelReturnedStructuredJson
+    && (parsed.status === "failed" || parsed.status === "blocked");
   const declaredToolCallsWithoutExecution = !usedNativeToolCalls && parsed.tool_calls_made.length > 0;
 
-  const summary = usedNativeToolCalls
-    ? (conversation.lastSummary || parsed.summary)
+  const summary = honorModelTerminalAssessment
+    ? parsed.summary
+    : usedNativeToolCalls
+      ? (conversation.lastSummary || parsed.summary)
     : parsed.summary !== "Executor did not return valid JSON."
       ? parsed.summary
       : (conversation.lastSummary || parsed.summary);
-  const rawResult = usedNativeToolCalls
-    ? (conversation.lastRawResult || JSON.stringify(executorResponse.raw))
+  const rawResult = honorModelTerminalAssessment
+    ? (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw))
+    : usedNativeToolCalls
+      ? (conversation.lastRawResult || JSON.stringify(executorResponse.raw))
     : parsed.raw_result && parsed.raw_result !== (executorResponse.content || executorResponse.reasoning || "")
       ? parsed.raw_result
       : (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw));
-  const error = usedNativeToolCalls
-    ? conversation.lastError
+  const error = honorModelTerminalAssessment
+    ? (parsed.error || conversation.lastError)
+    : usedNativeToolCalls
+      ? conversation.lastError
     : (parsed.error || conversation.lastError);
 
   const status = !conversation.ok
     ? "failed"
     : declaredToolCallsWithoutExecution
       ? "blocked"
+      : honorModelTerminalAssessment
+        ? parsed.status
       : usedNativeToolCalls && conversation.ok
         ? (conversation.lastError ? "partial_success" : "success")
         : parsed.status === "success" && !usedNativeToolCalls
@@ -954,7 +1003,26 @@ async function runPlannerStep(
 
   // R4+: Research finalization requires actual evidence, even if a markdown file was already written.
   if (planner.status === "final" && routePolicy.requireEvidenceBeforeFinal) {
-    if (routePolicy.requireArtifactReadback
+    const researchAccessDegraded = hasRecentFetchAccessFailures(executorHistory)
+      && hasReadableFetchedEvidence(executorHistory)
+      && hasUsableResearchArtifacts(executorHistory);
+
+    if (researchAccessDegraded && !hasUsefulArtifactRead(executorHistory)) {
+      planner.status = "need_executor";
+      planner.audit = {
+        verdict: "retry",
+        notes: "Research degraded: recent url_fetch calls were blocked by source-site access limits, so continue from the artifacts already collected instead of expanding search.",
+      };
+      planner.executor_request = {
+        instruction: rankingArtifactPath
+          ? `Read the ranking artifact at ${rankingArtifactPath} plus the strongest already-fetched evidence artifact, then write a constrained evidence summary. Clearly separate confirmed facts from gaps caused by 403/401/429 source restrictions. Do not call web_search or url_fetch again unless a local artifact is unreadable.`
+          : "Read the strongest already-fetched evidence artifact under runtime/command-results, then write a constrained evidence summary. Clearly separate confirmed facts from gaps caused by 403/401/429 source restrictions. Do not call web_search or url_fetch again unless a local artifact is unreadable.",
+        allowed_tools: rankingArtifactPath ? ["read_file"] : ["list_files", "read_file"],
+        expected_output: "Grounded summary based only on the existing readable artifacts, with explicit evidence gaps.",
+      };
+      planner.final_answer = undefined;
+    } else if (!researchAccessDegraded
+      && routePolicy.requireArtifactReadback
       && !hasUsefulArtifactRead(executorHistory)
       && executorHistory.some((i) => i.artifacts.some((a) => a.path?.includes("command-results")))) {
       planner.status = "need_executor";
@@ -965,7 +1033,7 @@ async function runPlannerStep(
         expected_output: "Structured summary of candidates.",
       };
       planner.final_answer = undefined;
-    } else if (!hasSufficientEvidenceForRoute(executorHistory, routePolicy)) {
+    } else if (!researchAccessDegraded && !hasSufficientEvidenceForRoute(executorHistory, routePolicy)) {
       planner.status = "need_executor";
       planner.audit = {
         verdict: "retry",

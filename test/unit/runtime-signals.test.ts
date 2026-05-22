@@ -18,6 +18,54 @@ test("loop detector identifies repeated missing-file failures", () => {
   assert.equal(result.type, "missing_file");
 });
 
+test("loop detector attributes repeated tool failure to the last failed tool call", () => {
+  const detector = new LoopDetector();
+  const history: ExecutorOutput[] = [
+    {
+      status: "failed",
+      summary: "Fetch failed",
+      tool_calls_made: [
+        { tool: "web_search", arguments: { query: "DeepSeek V4" } },
+        { tool: "url_fetch", arguments: { url: "https://example.com/a" } },
+      ],
+      artifacts: [{ type: "json", path: "/tmp/runtime/command-results/a.json", content_preview: "[]" }],
+      raw_result: "",
+      error: "HTTP 403: Forbidden",
+      source: "native_tool",
+    },
+    {
+      status: "failed",
+      summary: "Fetch failed",
+      tool_calls_made: [
+        { tool: "web_search", arguments: { query: "DeepSeek V4 对比" } },
+        { tool: "url_fetch", arguments: { url: "https://example.com/b" } },
+      ],
+      artifacts: [{ type: "json", path: "/tmp/runtime/command-results/b.json", content_preview: "[]" }],
+      raw_result: "",
+      error: "HTTP 403: Forbidden",
+      source: "native_tool",
+    },
+    {
+      status: "failed",
+      summary: "Fetch failed",
+      tool_calls_made: [
+        { tool: "web_search", arguments: { query: "Qwen3 对比" } },
+        { tool: "url_fetch", arguments: { url: "https://example.com/c" } },
+      ],
+      artifacts: [{ type: "json", path: "/tmp/runtime/command-results/c.json", content_preview: "[]" }],
+      raw_result: "",
+      error: "HTTP 403: Forbidden",
+      source: "native_tool",
+    },
+  ];
+
+  const result = detector.check(history);
+
+  assert.equal(result.detected, true);
+  assert.equal(result.type, "repeated_tool_failure");
+  assert.equal(result.message, "Tool url_fetch failed 3 times in recent steps.");
+});
+
 test("artifact signal helpers distinguish command artifacts, readback, and writes", () => {
   const history: ExecutorOutput[] = [
     {

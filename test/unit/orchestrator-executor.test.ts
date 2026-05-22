@@ -83,3 +83,33 @@ test("finalizeExecutorResult marks native partial progress as partial_success wh
   assert.equal(result.source, "native_tool");
   assert.equal(result.summary, "Found 3 results");
 });
+
+test("finalizeExecutorResult preserves model-declared failure after native tool execution", () => {
+  const executorResponse: ModelResponse = {
+    content: JSON.stringify({
+      status: "failed",
+      summary: "Search results were low quality and did not establish a trustworthy answer.",
+      raw_result: "Search results were dominated by irrelevant placeholder domains.",
+      error: "Need better sources before continuing.",
+    }),
+    reasoning: "",
+    toolCalls: [],
+    raw: { id: "resp_failed_after_tools" },
+  };
+
+  const result = orchestratorTestables.finalizeExecutorResult(executorResponse, {
+    executedCalls: [{ tool: "web_search", arguments: { query: "example topic" } }],
+    artifacts: [{ type: "json", path: "runtime/command-results/search.json", content_preview: "[{\"title\":\"Example\"}]" }],
+    lastSummary: "Found 5 results",
+    lastRawResult: "[{\"title\":\"Example\"}]",
+    ok: true,
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.source, "native_tool");
+  assert.equal(result.summary, "Search results were low quality and did not establish a trustworthy answer.");
+  assert.equal(result.raw_result, "Search results were dominated by irrelevant placeholder domains.");
+  assert.equal(result.error, "Need better sources before continuing.");
+  assert.deepEqual(result.tool_calls_made, [{ tool: "web_search", arguments: { query: "example topic" } }]);
+  assert.deepEqual(result.artifacts, [{ type: "json", path: "runtime/command-results/search.json", content_preview: "[{\"title\":\"Example\"}]" }]);
+});

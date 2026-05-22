@@ -39,12 +39,15 @@ function detectRepeatedBlocked(history: ExecutorOutput[]): boolean {
 function detectRepeatedToolFailure(history: ExecutorOutput[]): LoopDetectionResult | null {
   const recent = history.slice(-4);
   if (recent.length < 3) return null;
-  // Count failures on the same tool name in recent steps
+
+  // Attribute a failed step to the last tool call it attempted. This avoids
+  // blaming earlier successful tools from the same step when a later tool failed.
   const toolFailures = new Map<string, number>();
   for (const item of recent) {
     if (item.status === "failed" || item.error) {
-      for (const call of item.tool_calls_made) {
-        const key = call.tool;
+      const failedCall = item.tool_calls_made.at(-1);
+      if (failedCall) {
+        const key = failedCall.tool;
         toolFailures.set(key, (toolFailures.get(key) ?? 0) + 1);
       }
     }
