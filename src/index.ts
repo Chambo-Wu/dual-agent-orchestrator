@@ -1,16 +1,29 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import * as process from "node:process";
+import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 import { loadConfig } from "./config.js";
+import { compressJsonOutput, compressToolOutput } from "./compress.js";
 import { createRunLogger } from "./logger.js";
-import { PlannerUnavailableError, runOrchestrator } from "./orchestrator.js";
+import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getRoutePolicy } from "./orchestrator.js";
+import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
-import type { OrchestratorConfig } from "./types.js";
+import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, Plan, TaskRun } from "./types.js";
+import { runTeam, type TeamAgent } from "./team.js";
+import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
+import { Tracer } from "./trace.js";
+import { listStoredJobs, persistJobRecord, readJobRecord, updateJobControlState, type StoredJobRecord } from "./job-store.js";
+import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, unregisterActiveJobSession } from "./job-runtime.js";
+import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
 const PLANNER_FAILURE_THRESHOLD = 3;
 const PLANNER_COOLDOWN_MS = 60_000;
+const MAX_TOOL_RESULT_CHARS = 2000;
+const MAX_TOOL_MODE_ROUNDS = 4;
+const MAX_TOOL_CONTEXT_CHARS = 1200;
 
 type PlannerCircuitState = {
   consecutiveFailures: number;
@@ -57,6 +70,11 @@ interface ChatCompletionRequest {
   stream?: boolean;
   tools?: unknown[];
   tool_choice?: unknown;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  stop?: string | string[];
+  stream_options?: { include_usage?: boolean };
 }
 
 interface ResponseInputItem {
@@ -92,6 +110,12 @@ interface AnthropicMessagesRequest {
   messages?: AnthropicMessage[];
   stream?: boolean;
   tools?: Array<{ name?: string; description?: string; input_schema?: Record<string, unknown> }>;
+  tool_choice?: unknown;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  stop_sequences?: string[];
 }
 
 interface ExposedModel {
@@ -105,6 +129,38 @@ interface ExposedModel {
   executor_base_url?: string;
   executor_api_key?: string;
   description?: string;
+}
+
+interface TaskExecutionPayload {
+  content: string;
+  logPath: string;
+  resolvedModel: string;
+  job: Job;
+  plan: Plan;
+  taskRuns: TaskRun[];
+  artifacts: Artifact[];
+}
+
+interface TaskExecutionContext {
+  jobId: string;
+  planId: string;
+  taskRunId: string;
+  signal: AbortSignal;
+}
+
+let injectedTaskExecutor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null = null;
+
+function setTaskExecutorForTests(executor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null): void {
+  injectedTaskExecutor = executor;
+}
+
+function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): string {
+  return persistJobRecord({
+    job: payload.job,
+    plan: payload.plan,
+    taskRuns: payload.taskRuns,
+    artifacts: payload.artifacts,
+  });
 }
 
 function getServerApiKey(): string {
@@ -304,6 +360,33 @@ function getAnthropicContentText(content: string | AnthropicContentBlock[] | und
   return "";
 }
 
+function truncateToolResultContent(content: string): string {
+  const normalized = content.trim();
+  if (normalized.length <= MAX_TOOL_RESULT_CHARS) {
+    return normalized;
+  }
+
+  const headLength = 1500;
+  const tailLength = 300;
+  const omitted = normalized.length - headLength - tailLength;
+  const head = normalized.slice(0, headLength);
+  const tail = normalized.slice(-tailLength);
+  return `${head}\n... [truncated ${omitted} chars] ...\n${tail}`;
+}
+
+export function summarizeToolResultContent(content: string): string {
+  const normalized = content.trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= MAX_TOOL_CONTEXT_CHARS) {
+    return normalized;
+  }
+  return normalized.startsWith("{") || normalized.startsWith("[")
+    ? compressJsonOutput(normalized, MAX_TOOL_CONTEXT_CHARS)
+    : compressToolOutput(normalized, MAX_TOOL_CONTEXT_CHARS);
+}
+
 function normalizeChatMessages(messages: OpenAIMessage[]): OpenAIMessage[] {
   return messages.map((message) => ({
     role: message.role || "user",
@@ -404,11 +487,11 @@ function normalizeAnthropicToolMessages(messages: AnthropicMessage[] | undefined
         normalized.push({
           role: "tool",
           tool_call_id: part.tool_use_id,
-          content: typeof part.content === "string"
+          content: summarizeToolResultContent(typeof part.content === "string"
             ? part.content
             : typeof part.text === "string"
               ? part.text
-              : JSON.stringify(part.content ?? ""),
+              : JSON.stringify(part.content ?? "")),
         });
       }
       continue;
@@ -439,57 +522,79 @@ function safeParseToolInput(argumentsText: string | undefined): Record<string, u
   }
 }
 
-function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | undefined): boolean {
-  if (!Array.isArray(messages) || messages.length < 2) {
-    return false;
-  }
+function isSuccessfulNativeToolResult(content: string): boolean {
+  return /"ok"\s*:\s*true/i.test(content) || /"summary"\s*:\s*"Wrote file/i.test(content) || /"summary"\s*:\s*"Read file/i.test(content);
+}
 
+function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | undefined): boolean {
+  if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
-  if (lastMessage?.role !== "tool" || previousMessage?.role !== "assistant" || !Array.isArray(previousMessage.tool_calls)) {
-    return false;
-  }
-
+  if (lastMessage?.role !== "tool" || previousMessage?.role !== "assistant" || !Array.isArray(previousMessage.tool_calls)) return false;
   const matchedTool = previousMessage.tool_calls.find((call) => call?.id === lastMessage.tool_call_id);
-  const toolName = matchedTool?.function?.name;
-  if (toolName !== "write_file") {
-    return false;
-  }
-
-  const toolContent = getMessageText(lastMessage);
-  return /"ok"\s*:\s*true/i.test(toolContent) || /"summary"\s*:\s*"Wrote file/i.test(toolContent);
+  if (matchedTool?.function?.name !== "write_file") return false;
+  return isSuccessfulNativeToolResult(getMessageText(lastMessage));
 }
 
 function extractLatestAnthropicWriteToolCompletion(messages: AnthropicMessage[] | undefined): boolean {
-  if (!Array.isArray(messages) || messages.length < 2) {
-    return false;
-  }
-
+  if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
-  if (lastMessage?.role !== "user" || previousMessage?.role !== "assistant") {
-    return false;
-  }
-  if (!Array.isArray(lastMessage.content) || !Array.isArray(previousMessage.content)) {
-    return false;
-  }
-
+  if (lastMessage?.role !== "user" || previousMessage?.role !== "assistant") return false;
+  if (!Array.isArray(lastMessage.content) || !Array.isArray(previousMessage.content)) return false;
   const latestToolResult = [...lastMessage.content].reverse().find((part) => part?.type === "tool_result" && typeof part.tool_use_id === "string");
-  if (!latestToolResult) {
-    return false;
-  }
-
+  if (!latestToolResult) return false;
   const matchedToolUse = previousMessage.content.find((part) => part?.type === "tool_use" && part.id === latestToolResult.tool_use_id);
-  if (matchedToolUse?.name !== "write_file") {
-    return false;
-  }
-
+  if (matchedToolUse?.name !== "write_file") return false;
   const content = typeof latestToolResult.content === "string"
     ? latestToolResult.content
     : typeof latestToolResult.text === "string"
       ? latestToolResult.text
       : JSON.stringify(latestToolResult.content ?? "");
-  return /"ok"\s*:\s*true/i.test(content) || /"summary"\s*:\s*"Wrote file/i.test(content);
+  return isSuccessfulNativeToolResult(content);
+}
+
+function extractLatestOpenAIResearchReadCompletion(messages: OpenAIMessage[] | undefined): boolean {
+  if (!Array.isArray(messages) || messages.length < 2) return false;
+  const lastMessage = messages[messages.length - 1];
+  const previousMessage = messages[messages.length - 2];
+  if (lastMessage?.role !== "tool" || previousMessage?.role !== "assistant" || !Array.isArray(previousMessage.tool_calls)) return false;
+  const matchedTool = previousMessage.tool_calls.find((call) => call?.id === lastMessage.tool_call_id);
+  if (matchedTool?.function?.name !== "read_file") return false;
+  return isSuccessfulNativeToolResult(getMessageText(lastMessage));
+}
+
+function extractLatestAnthropicResearchReadCompletion(messages: AnthropicMessage[] | undefined): boolean {
+  if (!Array.isArray(messages) || messages.length < 2) return false;
+  const lastMessage = messages[messages.length - 1];
+  const previousMessage = messages[messages.length - 2];
+  if (lastMessage?.role !== "user" || previousMessage?.role !== "assistant") return false;
+  if (!Array.isArray(lastMessage.content) || !Array.isArray(previousMessage.content)) return false;
+  const latestToolResult = [...lastMessage.content].reverse().find((part) => part?.type === "tool_result" && typeof part.tool_use_id === "string");
+  if (!latestToolResult) return false;
+  const matchedToolUse = previousMessage.content.find((part) => part?.type === "tool_use" && part.id === latestToolResult.tool_use_id);
+  if (matchedToolUse?.name !== "read_file") return false;
+  const content = typeof latestToolResult.content === "string"
+    ? latestToolResult.content
+    : typeof latestToolResult.text === "string"
+      ? latestToolResult.text
+      : JSON.stringify(latestToolResult.content ?? "");
+  return isSuccessfulNativeToolResult(content);
+}
+
+function countToolModeRounds(messages: ChatMessage[]): number {
+  return messages.filter((message) => message.role === "assistant" && message.tool_calls && message.tool_calls.length > 0).length;
+}
+
+export function shouldForceTextResponseForToolMessage(message: ChatMessage | undefined): boolean {
+  if (!message || message.role !== "tool") {
+    return false;
+  }
+  const content = typeof message.content === "string" ? message.content : "";
+  return content.includes("command-results")
+    || content.includes("[...") 
+    || content.includes("truncated")
+    || content.length > MAX_TOOL_CONTEXT_CHARS;
 }
 
 function buildUserGoal(messages: OpenAIMessage[]): string {
@@ -532,18 +637,27 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
+
 function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let raw = "";
+    let totalBytes = 0;
     const decoder = new TextDecoder();
     req.on("data", (chunk) => {
-      raw += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+      const str = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+      totalBytes += Buffer.byteLength(str);
+      if (totalBytes > MAX_BODY_BYTES) {
+        reject(new Error("Request body exceeds maximum size of 10MB."));
+        return;
+      }
+      raw += str;
     });
     req.on("end", () => {
       try {
         resolve(JSON.parse(raw) as T);
       } catch (error) {
-        reject(error);
+        reject(new Error("Invalid JSON in request body."));
       }
     });
     req.on("error", reject);
@@ -588,7 +702,76 @@ function buildHealthResponse(config = loadConfig()): { status: string; planner: 
   };
 }
 
-function buildChatCompletionResponse(model: string, content: string): unknown {
+function buildWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): unknown {
+  return {
+    job: payload.job,
+    plan: payload.plan,
+    taskRuns: payload.taskRuns,
+    artifacts: payload.artifacts,
+  };
+}
+
+function buildStepList(record: StoredJobRecord): unknown[] {
+  return record.taskRuns.map((taskRun) => {
+    const executorHistory = taskRun.executorHistory ?? [];
+    const latestExecutorOutput = executorHistory.at(-1);
+    return {
+      id: taskRun.id,
+      job_id: record.job.id,
+      plan_id: record.plan.id,
+      title: taskRun.title,
+      description: taskRun.description,
+      status: taskRun.status,
+      assignee: taskRun.assignee,
+      depends_on: taskRun.dependsOn,
+      verified: taskRun.verified,
+      attempts: taskRun.attempts,
+      output: taskRun.output,
+      artifacts: taskRun.artifacts,
+      executor_history: executorHistory,
+      latest_executor_status: latestExecutorOutput?.status ?? null,
+      latest_executor_summary: latestExecutorOutput?.summary ?? null,
+    };
+  });
+}
+
+function latestExecutorStatus(record: StoredJobRecord): ExecutorOutput["status"] | null {
+  const history = record.taskRuns.flatMap((taskRun) => taskRun.executorHistory ?? []);
+  return history.at(-1)?.status ?? null;
+}
+
+function buildJobResponse(record: StoredJobRecord): unknown {
+  const latestStep = record.taskRuns.at(-1);
+  return {
+    saved_at: record.savedAt,
+    job: record.job,
+    plan: record.plan,
+    taskRuns: record.taskRuns,
+    artifacts: record.artifacts,
+    step_count: record.taskRuns.length,
+    artifact_count: record.artifacts.length,
+    latest_step: latestStep
+      ? {
+          id: latestStep.id,
+          status: latestStep.status,
+          verified: latestStep.verified,
+          attempts: latestStep.attempts,
+          latest_executor_status: latestExecutorStatus(record),
+        }
+      : null,
+    control: record.control ?? {},
+  };
+}
+
+function buildWorkflowEvent(type: string, workflow: unknown, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    type,
+    workflow,
+    ...extra,
+  });
+}
+
+function buildChatCompletionResponse(model: string, content: string, workflow?: unknown): unknown {
   const created = Math.floor(Date.now() / 1000);
   return {
     id: `chatcmpl-${Date.now()}`,
@@ -610,6 +793,7 @@ function buildChatCompletionResponse(model: string, content: string): unknown {
       completion_tokens: 0,
       total_tokens: 0,
     },
+    workflow,
   };
 }
 
@@ -662,7 +846,7 @@ function buildChatCompletionChunk(model: string, id: string, delta: Record<strin
   });
 }
 
-function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id: string; name: string; arguments: string }, finishReason: string | null): string {
+function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id: string; name: string; arguments: string }, finishReason: string | null, toolIndex = 0): string {
   return JSON.stringify({
     id,
     object: "chat.completion.chunk",
@@ -674,7 +858,7 @@ function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id:
         delta: {
           tool_calls: [
             {
-              index: 0,
+              index: toolIndex,
               id: toolCall.id,
               type: "function",
               function: {
@@ -732,7 +916,7 @@ function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
     if (role === "tool") {
       return [{
         role: "tool",
-        content,
+        content: truncateToolResultContent(content),
         tool_call_id: typeof asRecord.tool_call_id === "string" ? asRecord.tool_call_id : undefined,
         name: typeof asRecord.name === "string" ? asRecord.name : undefined,
       }];
@@ -763,7 +947,112 @@ function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
   });
 }
 
-async function runTaskFromRequest(body: ChatCompletionRequest): Promise<{ content: string; logPath: string }> {
+async function executeTaskGoal(userGoal: string, model: string | undefined, requirePlannerCircuit: boolean): Promise<TaskExecutionPayload> {
+  const jobId = `job_${randomUUID()}`;
+  const planId = `plan_${randomUUID()}`;
+  const taskRunId = `taskrun_${randomUUID()}`;
+  const abortController = new AbortController();
+  registerActiveJobSession(jobId, userGoal, abortController);
+  const pendingTaskRun = createTaskRunRecord({
+    id: taskRunId,
+    title: "Primary Task",
+    description: userGoal,
+    status: "pending",
+    verified: false,
+    output: "",
+    attempts: 0,
+    artifacts: [],
+  });
+  const pendingPlan = createPlanRecord({
+    id: planId,
+    goal: userGoal,
+    mode: "task",
+    taskRunIds: [taskRunId],
+    summary: "Single-task orchestration run.",
+  });
+  const pendingJob = createJobRecord({
+    id: jobId,
+    goal: userGoal,
+    mode: "task",
+    status: "blocked",
+    verified: false,
+    output: "Running...",
+    plan: pendingPlan,
+    taskRuns: [pendingTaskRun],
+    artifacts: [],
+  });
+  persistWorkflowPayload({
+    job: pendingJob,
+    plan: pendingPlan,
+    taskRuns: [pendingTaskRun],
+    artifacts: [],
+  });
+  try {
+    if (abortController.signal.aborted) {
+      throw new Error("Run cancelled before start.");
+    }
+
+    if (injectedTaskExecutor) {
+      return await injectedTaskExecutor(userGoal, model, requirePlannerCircuit, {
+        jobId,
+        planId,
+        taskRunId,
+        signal: abortController.signal,
+      });
+    }
+
+    const baseConfig = loadConfig();
+    const modelSelection = resolveRequestedModel(baseConfig, model);
+    if (requirePlannerCircuit) {
+      assertPlannerCircuitClosed();
+    }
+    const logger = createRunLogger(userGoal);
+    const routing = loadTaskRoutingConfig(modelSelection.resolvedConfig.taskRoutingPath);
+    const taskType = detectTaskType(userGoal, routing);
+    const routePolicy = getRoutePolicy(taskType, routing);
+    let result;
+    try {
+      result = await runTask(modelSelection.resolvedConfig, userGoal, routePolicy, logger, undefined, {
+        abortSignal: abortController.signal,
+        jobId,
+        planId,
+        taskRunId,
+      });
+      if (requirePlannerCircuit) {
+        markPlannerSuccess();
+      }
+    } catch (error) {
+      if (requirePlannerCircuit && error instanceof PlannerUnavailableError) {
+        throw markPlannerFailure(error.message);
+      }
+      throw error;
+    }
+
+    const content = result.output || "";
+    const jobRecordPath = persistWorkflowPayload({
+      job: result.job,
+      plan: result.plan,
+      taskRuns: result.taskRuns,
+      artifacts: result.artifacts,
+    });
+
+    console.error(`Run log: ${logger.logPath}`);
+    console.error(`Job record: ${jobRecordPath}`);
+    return {
+      content,
+      logPath: logger.logPath,
+      resolvedModel: modelSelection.exposed.id,
+      job: result.job,
+      plan: result.plan,
+      taskRuns: result.taskRuns,
+      artifacts: result.artifacts,
+    };
+  } finally {
+    unregisterActiveJobSession(jobId);
+  }
+}
+
+async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExecutionPayload> {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
   }
@@ -774,17 +1063,10 @@ async function runTaskFromRequest(body: ChatCompletionRequest): Promise<{ conten
     throw new Error("Unable to derive a user goal from the provided messages.");
   }
 
-  const baseConfig = loadConfig();
-  const modelSelection = resolveRequestedModel(baseConfig, body.model);
-  const logger = createRunLogger(userGoal);
-  const result = await runOrchestrator(modelSelection.resolvedConfig, userGoal, logger);
-  const content = result.final_answer || result.clarification_question || result.reasoning_summary || "";
-
-  console.error(`Run log: ${logger.logPath}`);
-  return { content, logPath: logger.logPath };
+  return executeTaskGoal(userGoal, body.model, false);
 }
 
-async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined): Promise<{ content: string; logPath: string; resolvedModel: string }> {
+async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined): Promise<TaskExecutionPayload> {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
   }
@@ -795,27 +1077,10 @@ async function runTaskFromMessages(messages: OpenAIMessage[], model: string | un
     throw new Error("Unable to derive a user goal from the provided messages.");
   }
 
-  const baseConfig = loadConfig();
-  const modelSelection = resolveRequestedModel(baseConfig, model);
-  assertPlannerCircuitClosed();
-  const logger = createRunLogger(userGoal);
-  let result;
-  try {
-    result = await runOrchestrator(modelSelection.resolvedConfig, userGoal, logger);
-    markPlannerSuccess();
-  } catch (error) {
-    if (error instanceof PlannerUnavailableError) {
-      throw markPlannerFailure(error.message);
-    }
-    throw error;
-  }
-  const content = result.final_answer || result.clarification_question || result.reasoning_summary || "";
-
-  console.error(`Run log: ${logger.logPath}`);
-  return { content, logPath: logger.logPath, resolvedModel: modelSelection.exposed.id };
+  return executeTaskGoal(userGoal, model, true);
 }
 
-async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown): Promise<{
+async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown, requestOverrides?: import("./providers/openai-compatible.js").CompletionOverrides): Promise<{
   resolvedModel: string;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
   content: string;
@@ -823,7 +1088,13 @@ async function runToolMode(messages: ChatMessage[], model: string | undefined, t
   const baseConfig = loadConfig();
   const modelSelection = resolveRequestedModel(baseConfig, model);
   const allowedTools = normalizeIncomingTools(tools);
-  const response = await runChatCompletionDetailed(modelSelection.resolvedConfig.executor, messages, allowedTools);
+  const toolRoundCount = countToolModeRounds(messages);
+  const lastMessage = messages[messages.length - 1];
+  const forceTextResponse = toolRoundCount >= MAX_TOOL_MODE_ROUNDS
+    || shouldForceTextResponseForToolMessage(lastMessage);
+  const effectiveTools = forceTextResponse ? undefined : allowedTools;
+
+  const response = await runChatCompletionDetailed(modelSelection.resolvedConfig.executor, messages, effectiveTools, undefined, requestOverrides);
 
   return {
     resolvedModel: modelSelection.exposed.id,
@@ -845,6 +1116,121 @@ async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise
   jsonResponse(res, payload.status === "ok" ? 200 : 503, payload);
 }
 
+async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  jsonResponse(res, 200, {
+    object: "list",
+    data: listStoredJobs(),
+  });
+}
+
+async function handleGetJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  jsonResponse(res, 200, buildJobResponse(record));
+}
+
+async function handleGetJobArtifacts(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  jsonResponse(res, 200, {
+    job_id: jobId,
+    count: record.artifacts.length,
+    artifacts: record.artifacts,
+  });
+}
+
+async function handleGetJobSteps(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  const steps = buildStepList(record);
+  jsonResponse(res, 200, {
+    job_id: jobId,
+    count: steps.length,
+    steps,
+  });
+}
+
+async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const active = getActiveJobSession(jobId);
+  const interrupted = cancelActiveJobSession(jobId, `Run cancelled via API for job ${jobId}.`);
+  const updated = updateJobControlState(jobId, {
+    cancellationRequestedAt: new Date().toISOString(),
+    cancelledAt: new Date().toISOString(),
+  });
+  if (!updated) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  jsonResponse(res, 200, {
+    ok: true,
+    job_id: jobId,
+    active: Boolean(active),
+    interrupted,
+    control: updated.control ?? {},
+  });
+}
+
+async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const retryResult = await executeTaskGoal(record.job.goal, undefined, false);
+  updateJobControlState(jobId, {
+    retriedAt: new Date().toISOString(),
+    retriedToJobId: retryResult.job.id,
+  });
+  const retriedRecord = updateJobControlState(retryResult.job.id, {
+    retryOf: jobId,
+  });
+
+  jsonResponse(res, 200, {
+    ok: true,
+    retried_from: jobId,
+    job: retryResult.job,
+    plan: retryResult.plan,
+    taskRuns: retryResult.taskRuns,
+    artifacts: retryResult.artifacts,
+    control: retriedRecord?.control ?? { retryOf: jobId },
+  });
+}
+
 async function handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<ChatCompletionRequest>(req);
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
@@ -854,14 +1240,24 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
       jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
       return;
     }
+    if (extractLatestOpenAIResearchReadCompletion(body.messages)) {
+      jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
+      return;
+    }
 
-    const toolResult = await runToolMode(normalizeOpenAIToolMessages(body.messages || []), body.model, body.tools);
+    const overrides: import("./providers/openai-compatible.js").CompletionOverrides = {};
+    if (body.temperature !== undefined) overrides.temperature = body.temperature;
+    if (body.max_tokens !== undefined) overrides.maxTokens = body.max_tokens;
+    if (body.top_p !== undefined) overrides.topP = body.top_p;
+    if (body.stop !== undefined) overrides.stop = body.stop;
+    if (body.tool_choice !== undefined) overrides.toolChoice = body.tool_choice;
+    const toolResult = await runToolMode(normalizeOpenAIToolMessages(body.messages || []), body.model, body.tools, overrides);
 
     if (!body.stream) {
       if (toolResult.toolCalls.length > 0) {
         jsonResponse(res, 200, buildToolChatCompletionResponse(toolResult.resolvedModel, toolResult.toolCalls));
       } else {
-        jsonResponse(res, 200, buildChatCompletionResponse(toolResult.resolvedModel, toolResult.content));
+        jsonResponse(res, 200, buildChatCompletionResponse(toolResult.resolvedModel, summarizeToolResultContent(toolResult.content) || toolResult.content));
       }
       return;
     }
@@ -874,25 +1270,38 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     const streamId = `chatcmpl-${Date.now()}`;
     sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, { role: "assistant", content: "" }, null));
     if (toolResult.toolCalls.length > 0) {
-      for (const toolCall of toolResult.toolCalls) {
-        sseWrite(res, buildToolChatCompletionChunk(toolResult.resolvedModel, streamId, toolCall, null));
+      for (let i = 0; i < toolResult.toolCalls.length; i++) {
+        sseWrite(res, buildToolChatCompletionChunk(toolResult.resolvedModel, streamId, toolResult.toolCalls[i], null, i));
       }
       sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, {}, "tool_calls"));
     } else {
-      for (const chunk of splitContentForStreaming(toolResult.content)) {
+      const finalText = summarizeToolResultContent(toolResult.content) || toolResult.content;
+      for (const chunk of splitContentForStreaming(finalText)) {
         sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, { content: chunk }, null));
       }
       sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, {}, "stop"));
     }
+    sseWrite(res, buildWorkflowEvent("workflow.completed", {
+      job: null,
+      plan: null,
+      taskRuns: [],
+      artifacts: [],
+    }, {
+      mode: "tool",
+      model: toolResult.resolvedModel,
+      toolCalls: toolResult.toolCalls,
+      content: toolResult.content,
+    }));
     res.end("data: [DONE]\n\n");
     return;
   }
 
   const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model).catch((error) => { throw error; });
   const requestedModel = resultForModel.resolvedModel;
+  const workflow = buildWorkflowPayload(resultForModel);
 
   if (!body.stream) {
-    jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content));
+    jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
     return;
   }
 
@@ -912,10 +1321,20 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     }
 
     sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, {}, "stop"));
+    sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
+      mode: "task",
+      model: requestedModel,
+      status: resultForModel.job.status,
+    }));
     res.end("data: [DONE]\n\n");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: `Error: ${message}` }, "stop"));
+    sseWrite(res, buildWorkflowEvent("workflow.failed", workflow, {
+      mode: "task",
+      model: requestedModel,
+      error: message,
+    }));
     res.end("data: [DONE]\n\n");
   }
 }
@@ -937,7 +1356,7 @@ function buildResponsesOutput(content: string): unknown[] {
   ];
 }
 
-function buildResponsesResponse(model: string, content: string): unknown {
+function buildResponsesResponse(model: string, content: string, workflow?: unknown): unknown {
   return {
     id: `resp_${Date.now()}`,
     object: "response",
@@ -947,6 +1366,7 @@ function buildResponsesResponse(model: string, content: string): unknown {
     output: buildResponsesOutput(content),
     output_text: content,
     error: null,
+    workflow,
   };
 }
 
@@ -954,9 +1374,10 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
   const body = await readJsonBody<ResponsesRequest>(req);
   const messages = normalizeResponsesInput(body.input, body.instructions);
   const result = await runTaskFromMessages(messages, body.model);
+  const workflow = buildWorkflowPayload(result);
 
   if (!body.stream) {
-    jsonResponse(res, 200, buildResponsesResponse(result.resolvedModel, result.content));
+    jsonResponse(res, 200, buildResponsesResponse(result.resolvedModel, result.content, workflow));
     return;
   }
 
@@ -971,10 +1392,15 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
     sseWrite(res, JSON.stringify({ type: "response.output_text.delta", delta: chunk }));
   }
   sseWrite(res, JSON.stringify({ type: "response.completed", response: { id: responseId, model: result.resolvedModel, status: "completed" } }));
+  sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
+    mode: "task",
+    model: result.resolvedModel,
+    status: result.job.status,
+  }));
   res.end("data: [DONE]\n\n");
 }
 
-function buildAnthropicMessageResponse(model: string, content: string): unknown {
+function buildAnthropicMessageResponse(model: string, content: string, workflow?: unknown): unknown {
   return {
     id: `msg_${Date.now()}`,
     type: "message",
@@ -992,6 +1418,7 @@ function buildAnthropicMessageResponse(model: string, content: string): unknown 
       input_tokens: 0,
       output_tokens: 0,
     },
+    workflow,
   };
 }
 
@@ -1003,6 +1430,10 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   if (toolMode) {
     if (extractLatestAnthropicWriteToolCompletion(body.messages)) {
       jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
+      return;
+    }
+    if (extractLatestAnthropicResearchReadCompletion(body.messages)) {
+      jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
       return;
     }
 
@@ -1038,7 +1469,8 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
           },
         });
       } else {
-        jsonResponse(res, 200, buildAnthropicMessageResponse(toolResult.resolvedModel, toolResult.content));
+        const finalText = summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
+        jsonResponse(res, 200, buildAnthropicMessageResponse(toolResult.resolvedModel, finalText));
       }
       return;
     }
@@ -1096,14 +1528,28 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         delta: { stop_reason: "tool_use", stop_sequence: null },
         usage: { output_tokens: 0 },
       }));
+      sseWrite(res, buildWorkflowEvent("workflow.completed", {
+        job: null,
+        plan: null,
+        taskRuns: [],
+        artifacts: [],
+      }, {
+        mode: "tool",
+        model: toolResult.resolvedModel,
+        toolCalls: toolResult.toolCalls,
+        content: toolResult.content,
+      }));
     } else {
+      const result = await runTaskFromMessages(messages, body.model);
+      const workflow = buildWorkflowPayload(result);
       res.write(`event: content_block_start\n`);
       sseWrite(res, JSON.stringify({
         type: "content_block_start",
         index: 0,
         content_block: { type: "text", text: "" },
       }));
-      for (const chunk of splitContentForStreaming(toolResult.content)) {
+      const finalText = summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
+      for (const chunk of splitContentForStreaming(finalText)) {
         res.write(`event: content_block_delta\n`);
         sseWrite(res, JSON.stringify({
           type: "content_block_delta",
@@ -1122,6 +1568,11 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         delta: { stop_reason: "end_turn", stop_sequence: null },
         usage: { output_tokens: 0 },
       }));
+      sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
+        mode: "task",
+        model: result.resolvedModel,
+        status: result.job.status,
+      }));
     }
     res.write(`event: message_stop\n`);
     sseWrite(res, JSON.stringify({ type: "message_stop" }));
@@ -1130,9 +1581,10 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   }
 
   const result = await runTaskFromMessages(messages, body.model);
+  const workflow = buildWorkflowPayload(result);
 
   if (!body.stream) {
-    jsonResponse(res, 200, buildAnthropicMessageResponse(result.resolvedModel, result.content));
+    jsonResponse(res, 200, buildAnthropicMessageResponse(result.resolvedModel, summarizeToolResultContent(result.content) || result.content, workflow));
     return;
   }
 
@@ -1162,7 +1614,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
     index: 0,
     content_block: { type: "text", text: "" },
   }));
-  for (const chunk of splitContentForStreaming(result.content)) {
+  for (const chunk of splitContentForStreaming(summarizeToolResultContent(result.content) || result.content)) {
     res.write(`event: content_block_delta\n`);
     sseWrite(res, JSON.stringify({
       type: "content_block_delta",
@@ -1177,9 +1629,15 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
     type: "message_delta",
     delta: { stop_reason: "end_turn", stop_sequence: null },
     usage: { output_tokens: 0 },
+    workflow,
   }));
   res.write(`event: message_stop\n`);
   sseWrite(res, JSON.stringify({ type: "message_stop" }));
+  sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
+    mode: "task",
+    model: result.resolvedModel,
+    status: result.job.status,
+  }));
   res.end();
 }
 
@@ -1200,6 +1658,41 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     if (method === "GET" && url.pathname === "/health") {
       await handleHealth(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/jobs") {
+      await handleListJobs(req, res);
+      return;
+    }
+
+    const jobMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
+    if (method === "GET" && jobMatch) {
+      await handleGetJob(req, res, decodeURIComponent(jobMatch[1]!));
+      return;
+    }
+
+    const jobStepsMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/steps$/);
+    if (method === "GET" && jobStepsMatch) {
+      await handleGetJobSteps(req, res, decodeURIComponent(jobStepsMatch[1]!));
+      return;
+    }
+
+    const jobArtifactsMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/artifacts$/);
+    if (method === "GET" && jobArtifactsMatch) {
+      await handleGetJobArtifacts(req, res, decodeURIComponent(jobArtifactsMatch[1]!));
+      return;
+    }
+
+    const jobCancelMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
+    if (method === "POST" && jobCancelMatch) {
+      await handleCancelJob(req, res, decodeURIComponent(jobCancelMatch[1]!));
+      return;
+    }
+
+    const jobRetryMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/retry$/);
+    if (method === "POST" && jobRetryMatch) {
+      await handleRetryJob(req, res, decodeURIComponent(jobRetryMatch[1]!));
       return;
     }
 
@@ -1230,26 +1723,118 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    jsonResponse(res, 500, {
+    const message = error instanceof Error ? error.message : String(error);
+    const isBadRequest = message.includes("must be a non-empty array")
+      || message.includes("Unable to derive")
+      || message.includes("Invalid JSON")
+      || message.includes("exceeds maximum size");
+
+    jsonResponse(res, isBadRequest ? 400 : 500, {
       error: {
-        message: error instanceof Error ? error.message : String(error),
-        type: "server_error",
+        message,
+        type: isBadRequest ? "invalid_request_error" : "server_error",
       },
     });
   }
 }
 
 function getPort(args: string[]): number {
-  const explicitPort = args[1] ? Number(args[1]) : Number(process.env.PORT ?? "8787");
-  return Number.isFinite(explicitPort) && explicitPort > 0 ? explicitPort : 8787;
+  const explicitPort = args[1] ? Number(args[1]) : Number(process.env.PORT ?? "9898");
+  return Number.isFinite(explicitPort) && explicitPort > 0 ? explicitPort : 9898;
+}
+
+function parseTeamCliArgs(args: string[]): { goal: string; planOnly: boolean } {
+  const planOnly = args[0] === "plan" || args.includes("--plan-only");
+  const goalArgs = args
+    .filter((arg, index) => !(index === 0 && arg === "plan") && arg !== "--plan-only" && arg !== "--");
+  return {
+    goal: goalArgs.join(" ").trim(),
+    planOnly,
+  };
+}
+
+function runConfigValidation(configPath?: string): void {
+  const resolvedPath = configPath?.trim() || "config/example.config.yml";
+  const config = loadConfig(resolvedPath);
+  const routing = loadTaskRoutingConfig(config.taskRoutingPath);
+
+  console.log(JSON.stringify({
+    ok: true,
+    config_path: resolvedPath,
+    planner_model: config.planner.model,
+    executor_model: config.executor.model,
+    task_routing_path: config.taskRoutingPath,
+    route_types: routing.map((route) => route.type),
+  }, null, 2));
 }
 
 async function runCliTask(task: string): Promise<void> {
-  const config = loadConfig();
   const logger = createRunLogger(task);
-  const result = await runOrchestrator(config, task, logger);
+  const baseConfig = loadConfig();
+  const routing = loadTaskRoutingConfig(baseConfig.taskRoutingPath);
+  const taskType = detectTaskType(task, routing);
+  const routePolicy = getRoutePolicy(taskType, routing);
+  const result = await runTask(baseConfig, task, routePolicy, logger);
   console.error(`Run log: ${logger.logPath}`);
-  console.log(JSON.stringify(result, null, 2));
+  console.log(JSON.stringify({
+    status: result.status,
+    output: result.output,
+    verified: result.verified,
+    executorHistory: result.executorHistory,
+    job: result.job,
+    plan: result.plan,
+    taskRuns: result.taskRuns,
+    artifacts: result.artifacts,
+  }, null, 2));
+}
+
+async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): Promise<void> {
+  const config = loadConfig();
+  const logger = createRunLogger(goal);
+  const tracer = new Tracer(logger);
+  const startedAt = new Date().toISOString();
+
+  // Parse agents from env or use defaults
+  const agentsRaw = process.env.TEAM_AGENTS?.trim();
+  let teamAgents: TeamAgent[];
+  if (agentsRaw) {
+    try {
+      const parsed = JSON.parse(agentsRaw) as unknown;
+      if (Array.isArray(parsed)) {
+        teamAgents = parsed
+          .filter((a): a is Record<string, unknown> => !!a && typeof a === "object" && typeof (a as Record<string, unknown>).name === "string")
+          .map((a) => ({ name: a.name as string, role: typeof a.role === "string" ? a.role : undefined }));
+      } else {
+        teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
+      }
+    } catch {
+      teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
+    }
+  } else {
+    teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
+  }
+
+  const result = await runTeam(config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
+
+  // Export dashboard
+  const dashData = buildDashboardData(logger.runId, goal, result.tasks, tracer.getEvents(), startedAt);
+  const jsonPath = exportDashboardJson(dashData);
+  const htmlPath = exportDashboardHtml(dashData);
+  console.error(`Run log: ${logger.logPath}`);
+  console.error(`Dashboard JSON: ${jsonPath}`);
+  console.error(`Dashboard HTML: ${htmlPath}`);
+
+  console.log(JSON.stringify({
+    goal: result.goal,
+    finalAnswer: result.finalAnswer,
+    taskResults: Object.fromEntries(result.taskResults),
+    memorySummary: result.memorySummary,
+    job: result.job,
+    plan: result.plan,
+    taskRuns: result.taskRuns,
+    artifacts: result.artifacts,
+    traceSummary: tracer.getSummary(),
+  }, null, 2));
 }
 
 function runServer(port: number): void {
@@ -1266,19 +1851,50 @@ function runServer(port: number): void {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] === "config" && args[1] === "validate") {
+    runConfigValidation(args[2]);
+    return;
+  }
+
+  if (args[0] === "doctor") {
+    runConfigValidation(args[1]);
+    return;
+  }
+
   if (args[0] === "serve") {
     runServer(getPort(args));
     return;
   }
 
+  if (args[0] === "team") {
+    const { goal, planOnly } = parseTeamCliArgs(args.slice(1));
+    if (!goal) {
+      throw new Error("Usage: node dist/index.js team [plan|--plan-only] \"your multi-agent goal here\"");
+    }
+    await runCliTeam(goal, { planOnly });
+    return;
+  }
+
   const userGoal = args.join(" ").trim();
   if (!userGoal) {
-    throw new Error("Usage: node dist/index.js \"your task here\" OR node dist/index.js serve [port]");
+    throw new Error("Usage: node dist/index.js \"your task here\" OR node dist/index.js serve [port] OR node dist/index.js team [plan|--plan-only] \"goal\" OR node dist/index.js config validate [path] OR node dist/index.js doctor [path]");
   }
 
   await runCliTask(userGoal);
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-});
+const entryHref = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
+if (import.meta.url === entryHref) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+  });
+}
+
+export const __testables = {
+  handleRequest,
+  parseTeamCliArgs,
+  buildJobResponse,
+  buildStepList,
+  setTaskExecutorForTests,
+  getActiveJobSession,
+};

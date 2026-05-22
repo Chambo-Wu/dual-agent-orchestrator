@@ -22,6 +22,36 @@ export interface OrchestratorConfig {
   taskRoutingPath?: string;
 }
 
+export interface RuntimeProfile {
+  platform: {
+    os: "windows" | "macos" | "linux" | "unknown";
+    shell: "powershell" | "cmd" | "bash" | "zsh" | "sh" | "unknown";
+    pathSeparator: "\\" | "/" | "";
+    defaultEncoding: "utf-8";
+  };
+  filesystem: {
+    workspaceRoot: string;
+    runtimeRoot: string;
+    writableRoots: string[];
+  };
+  network: {
+    enabled: boolean;
+    proxyMode: "direct" | "env";
+    proxyHealth: "ok" | "degraded";
+  };
+  executor: {
+    supportsNativeToolCalling: boolean;
+    supportsStructuredJson: boolean;
+    maxToolRounds: number;
+  };
+  tools: Array<{
+    name: string;
+    kind: "file" | "network" | "code" | "system";
+    safe: boolean;
+    fallbackOnly?: boolean;
+  }>;
+}
+
 export type TaskType = "research" | "web_search" | "code" | "data_analysis" | "file_ops" | "shell_ops" | "general";
 
 export interface RoutePolicy {
@@ -30,6 +60,9 @@ export interface RoutePolicy {
   plannerInstruction: string;
   enableRanking: boolean;
   requireEvidenceBeforeFinal: boolean;
+  minGroundedCandidates: number;
+  requireArtifactReadback: boolean;
+  requireNonEmptyArtifact: boolean;
   preferredTools: string[];
   artifactPriority: string[];
   completionChecklist: string[];
@@ -56,6 +89,8 @@ export interface PlannerOutput {
   clarification_question?: string;
 }
 
+export type OrchestratorStepState = "pending" | "planning" | "executing" | "completed" | "failed" | "blocked" | "finalized";
+
 export interface ExecutorToolCall {
   tool: string;
   arguments: Record<string, unknown>;
@@ -68,12 +103,61 @@ export interface ExecutorArtifact {
 }
 
 export interface ExecutorOutput {
-  status: "success" | "failed" | "blocked";
+  status: "success" | "partial_success" | "failed" | "blocked";
   summary: string;
   tool_calls_made: ExecutorToolCall[];
   artifacts: ExecutorArtifact[];
   raw_result: string;
   error?: string;
+  source?: "native_tool" | "model_text";
+}
+
+export type JobMode = "task" | "team";
+export type JobStatus = "completed" | "failed" | "blocked";
+export type TaskRunStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
+
+export interface Artifact {
+  id: string;
+  type: ExecutorArtifact["type"] | "summary";
+  path?: string;
+  contentPreview: string;
+  source: "executor" | "task_run" | "synthesis";
+  sourceTaskRunId?: string;
+}
+
+export interface TaskRun {
+  id: string;
+  title: string;
+  description: string;
+  status: TaskRunStatus;
+  assignee?: string;
+  dependsOn: readonly string[];
+  verified: boolean;
+  output: string;
+  artifacts: Artifact[];
+  attempts: number;
+  executorHistory?: readonly ExecutorOutput[];
+}
+
+export interface Plan {
+  id: string;
+  goal: string;
+  mode: JobMode;
+  taskRunIds: readonly string[];
+  summary?: string;
+}
+
+export interface Job {
+  id: string;
+  goal: string;
+  mode: JobMode;
+  status: JobStatus;
+  verified: boolean;
+  output: string;
+  plan: Plan;
+  taskRuns: readonly TaskRun[];
+  artifacts: readonly Artifact[];
+  memorySummary?: string;
 }
 
 export interface ToolDefinition {
@@ -101,4 +185,85 @@ export interface ModelResponse {
   reasoning: string;
   toolCalls: NativeToolCall[];
   raw: unknown;
+}
+
+export interface RunOptions {
+  abortSignal?: AbortSignal;
+  jobId?: string;
+  planId?: string;
+  taskRunId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+export interface MemoryEntry {
+  readonly key: string;
+  readonly value: string;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+  readonly createdAt: Date;
+  readonly expiresAtTurn?: number;
+}
+
+export interface MemoryStore {
+  get(key: string): Promise<MemoryEntry | null>;
+  set(key: string, value: string, metadata?: Record<string, unknown>): Promise<void>;
+  setWithExpiry?(key: string, value: string, expiresAtTurn: number, metadata?: Record<string, unknown>): Promise<void>;
+  list(): Promise<MemoryEntry[]>;
+  delete(key: string): Promise<void>;
+  clear(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Task
+// ---------------------------------------------------------------------------
+
+export type TaskStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
+
+export interface Task {
+  readonly id: string;
+  readonly title: string;
+  readonly description: string;
+  status: TaskStatus;
+  assignee?: string;
+  dependsOn?: readonly string[];
+  readonly memoryScope?: "dependencies" | "all";
+  result?: string;
+  verified?: boolean;
+  readonly createdAt: Date;
+  updatedAt: Date;
+  readonly maxRetries?: number;
+  readonly retryDelayMs?: number;
+  readonly retryBackoff?: number;
+}
+
+export interface TaskSpec {
+  title: string;
+  description: string;
+  assignee?: string;
+  dependsOn?: string[];
+  memoryScope?: "dependencies" | "all";
+  maxRetries?: number;
+  retryDelayMs?: number;
+  retryBackoff?: number;
+}
+
+export interface TeamConfig {
+  maxConcurrency?: number;
+  maxToolOutputChars?: number;
+  onApproval?: (tasks: readonly Task[]) => Promise<boolean>;
+  maxRounds?: number;
+  planOnly?: boolean;
+}
+
+export interface RunTaskResult {
+  status: "completed" | "failed" | "blocked";
+  output: string;
+  verified: boolean;
+  executorHistory: ExecutorOutput[];
+  job: Job;
+  plan: Plan;
+  taskRuns: TaskRun[];
+  artifacts: Artifact[];
 }

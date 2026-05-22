@@ -68,7 +68,13 @@ npm install
 npm run typecheck
 ```
 
-3. Run:
+3. Validate config before first run:
+
+```powershell
+npm run config:validate
+```
+
+4. Run:
 
 ```powershell
 npm run build
@@ -86,6 +92,12 @@ npm run serve
 Default address:
 
 - `http://127.0.0.1:8787`
+
+Quick config self-check:
+
+```powershell
+npm run doctor
+```
 
 Supported endpoints:
 

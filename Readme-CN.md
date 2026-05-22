@@ -69,13 +69,19 @@ npm install
 npm run typecheck
 ```
 
-3. 构建
+3. 首次运行前先校验配置
+
+```powershell
+npm run config:validate
+```
+
+4. 构建
 
 ```powershell
 npm run build
 ```
 
-4. 执行任务
+5. 执行任务
 
 ```powershell
 node --enable-source-maps dist/index.js "Write a markdown file named notes/todo.md with three deployment tasks."
@@ -92,6 +98,12 @@ npm run serve
 默认地址：
 
 - `http://127.0.0.1:8787`
+
+快速自检命令：
+
+```powershell
+npm run doctor
+```
 
 当前已实现端点：
 

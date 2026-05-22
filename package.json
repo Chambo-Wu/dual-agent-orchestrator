@@ -8,11 +8,18 @@
     "typecheck": "tsc --noEmit",
     "start": "node --enable-source-maps dist/index.js",
     "dev": "npm run build && node --enable-source-maps dist/index.js",
-    "serve": "npm run build && node --enable-source-maps dist/index.js serve"
+    "serve": "npm run build && node --enable-source-maps dist/index.js serve",
+    "config:validate": "npm run build && node --enable-source-maps dist/index.js config validate",
+    "doctor": "npm run build && node --enable-source-maps dist/index.js doctor",
+    "test": "node --import tsx --test test/unit/**/*.test.ts test/integration/**/*.test.ts test/e2e-lite/**/*.test.ts",
+    "test:unit": "node --import tsx --test test/unit/**/*.test.ts",
+    "test:integration": "node --import tsx --test test/integration/**/*.test.ts",
+    "test:e2e-lite": "node --import tsx --test test/e2e-lite/**/*.test.ts",
+    "test:regression": "node --import tsx test/regression.ts"
   },
-  "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.15.21",
+    "tsx": "^4.21.0",
     "typescript": "^5.8.3"
   }
 }

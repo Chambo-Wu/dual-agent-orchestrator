@@ -8,7 +8,13 @@ import type { RunLogger } from "./logger.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { RUNTIME_ROOT } from "./paths.js";
-import type { ExecutorOutput, OrchestratorConfig, PlannerExecutorRequest, PlannerOutput, RoutePolicy, TaskType } from "./types.js";
+import type { ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskType } from "./types.js";
+import { Tracer } from "./trace.js";
+import { LoopDetector } from "./loop-detector.js";
+import { compressJsonOutput } from "./compress.js";
+import { buildSingleTaskContract } from "./workflow-contract.js";
+import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
+import { buildRuntimeProfile } from "./runtime/profile.js";
 
 export class PlannerUnavailableError extends Error {
   readonly causeError?: Error;
@@ -18,6 +24,19 @@ export class PlannerUnavailableError extends Error {
     this.name = "PlannerUnavailableError";
     this.causeError = causeError;
   }
+}
+
+export class RunCancelledError extends Error {
+  constructor(message = "Run cancelled.") {
+    super(message);
+    this.name = "RunCancelledError";
+  }
+}
+
+function assertNotCancelled(options?: RunOptions): void {
+  if (!options?.abortSignal?.aborted) return;
+  const reason = options.abortSignal.reason;
+  throw reason instanceof Error ? reason : new RunCancelledError(typeof reason === "string" ? reason : undefined);
 }
 
 type RepoCandidate = {
@@ -42,16 +61,16 @@ function toolListText(): string {
   }).join("\n");
 }
 
+function runtimeProfileText(config: OrchestratorConfig): string {
+  return JSON.stringify(buildRuntimeProfile(config), null, 2);
+}
+
 function previewText(input: string, limit = 400): string {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) {
     return normalized;
   }
   return `${normalized.slice(0, limit)}...`;
-}
-
-function shouldReturnAfterSuccessfulTool(tool: string): boolean {
-  return tool === "write_file" || tool === "read_file" || tool === "list_files";
 }
 
 function safeReadTextFile(path: string): string {
@@ -115,12 +134,34 @@ function summarizeRecentArtifacts(executorHistory: ExecutorOutput[]): string {
   return artifacts.length > 0 ? artifacts.join("; ") : "none";
 }
 
+function hasUsefulExecutorProgress(conversation: {
+  executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>;
+  artifacts: ExecutorOutput["artifacts"];
+  lastSummary: string;
+  lastRawResult: string;
+  ok: boolean;
+}): boolean {
+  if (!conversation.ok) {
+    return false;
+  }
+  if (conversation.artifacts.length > 0) {
+    return true;
+  }
+  if (conversation.lastRawResult.trim()) {
+    return true;
+  }
+  if (conversation.executedCalls.length > 0 && conversation.lastSummary.trim()) {
+    return true;
+  }
+  return false;
+}
+
 function matchesGoal(goal: string, needle: string): boolean {
   const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`\\b${escaped}\\b`, "i").test(goal);
 }
 
-function detectTaskType(userGoal: string, routing: RoutePolicy[]): TaskType {
+export function detectTaskType(userGoal: string, routing: RoutePolicy[]): TaskType {
   const goal = userGoal.toLowerCase();
   for (const route of routing) {
     if (route.matchers.some((matcher) => matchesGoal(goal, matcher))) {
@@ -130,7 +171,7 @@ function detectTaskType(userGoal: string, routing: RoutePolicy[]): TaskType {
   return "general";
 }
 
-function getRoutePolicy(taskType: TaskType, routing: RoutePolicy[]): RoutePolicy {
+export function getRoutePolicy(taskType: TaskType, routing: RoutePolicy[]): RoutePolicy {
   return routing.find((route) => route.type === taskType) || routing[routing.length - 1];
 }
 
@@ -362,14 +403,32 @@ function extractScoredCandidates(executorHistory: ExecutorOutput[]): RepoCandida
     .slice(0, 8);
 }
 
+function getGroundedCandidateCount(executorHistory: ExecutorOutput[]): number {
+  return extractScoredCandidates(executorHistory).length;
+}
+
+function hasSufficientEvidenceForRoute(executorHistory: ExecutorOutput[], routePolicy: RoutePolicy): boolean {
+  if (routePolicy.requireArtifactReadback && !hasUsefulArtifactRead(executorHistory)) {
+    return false;
+  }
+  if (routePolicy.requireNonEmptyArtifact && !hasNonEmptyCommandArtifact(executorHistory)) {
+    return false;
+  }
+  if (routePolicy.minGroundedCandidates > 0 && getGroundedCandidateCount(executorHistory) < routePolicy.minGroundedCandidates) {
+    return false;
+  }
+  return true;
+}
+
 async function runExecutorConversation(
   config: OrchestratorConfig,
   request: PlannerOutput["executor_request"],
   allowedTools: typeof TOOL_DEFINITIONS,
   stepNumber: number,
-  logger?: RunLogger
+  logger?: RunLogger,
+  options?: RunOptions,
 ): Promise<{ response: Awaited<ReturnType<typeof runChatCompletionDetailed>>; executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>; artifacts: ExecutorOutput["artifacts"]; lastSummary: string; lastRawResult: string; lastError?: string; ok: boolean }> {
-  const messages = buildExecutorMessages(request);
+  const messages = buildExecutorMessages(config, request);
   const artifacts: ExecutorOutput["artifacts"] = [];
   const executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }> = [];
   let lastSummary = "";
@@ -378,7 +437,8 @@ async function runExecutorConversation(
   let ok = true;
 
   for (let toolRound = 0; toolRound <= config.policy.maxToolRetries; toolRound++) {
-    const executorResponse = await runChatCompletionDetailed(config.executor, messages, allowedTools);
+    assertNotCancelled(options);
+    const executorResponse = await runChatCompletionDetailed(config.executor, messages, allowedTools, options);
     emitReasoningTrace("executor", stepNumber, executorResponse.reasoning, logger);
     logger?.log("executor.response.raw", {
       step: stepNumber,
@@ -390,6 +450,38 @@ async function runExecutorConversation(
     });
 
     if (executorResponse.toolCalls.length === 0) {
+      const parsed = parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
+      const declaredCalls = parsed.tool_calls_made
+        .filter((call) => isNonEmptyString(call.tool))
+        .map((call) => ({
+          tool: call.tool,
+          arguments: isRecord(call.arguments) ? call.arguments : {},
+        }));
+
+      if (declaredCalls.length > 0) {
+        logger?.log("executor.declared_tool_calls_fallback", {
+          step: stepNumber,
+          tool_round: toolRound,
+          count: declaredCalls.length,
+          tools: declaredCalls.map((call) => call.tool),
+        });
+        const fallbackResult = await executeDeclaredToolCallsFallback(
+          declaredCalls,
+          request,
+          stepNumber,
+          logger,
+        );
+        return {
+          response: executorResponse,
+          executedCalls: fallbackResult.executedCalls,
+          artifacts: fallbackResult.artifacts,
+          lastSummary: fallbackResult.lastSummary,
+          lastRawResult: fallbackResult.lastRawResult,
+          lastError: fallbackResult.lastError,
+          ok: fallbackResult.ok,
+        };
+      }
+
       return {
         response: executorResponse,
         executedCalls,
@@ -415,12 +507,7 @@ async function runExecutorConversation(
     });
 
     for (const nativeCall of executorResponse.toolCalls) {
-      let argumentsObject: Record<string, unknown> = {};
-      try {
-        argumentsObject = JSON.parse(nativeCall.arguments) as Record<string, unknown>;
-      } catch {
-        argumentsObject = {};
-      }
+      const argumentsObject = tryParseToolArguments(nativeCall.arguments);
 
       const call = { tool: nativeCall.name, arguments: argumentsObject };
       executedCalls.push(call);
@@ -448,7 +535,7 @@ async function runExecutorConversation(
         tool: call.tool,
         arguments: call.arguments,
       });
-      const result = executeTool(call.tool, call.arguments);
+      const result = await executeTool(call.tool, call.arguments);
       logger?.log("tool.execution.finished", {
         step: stepNumber,
         tool: call.tool,
@@ -467,18 +554,6 @@ async function runExecutorConversation(
       if (!result.ok) {
         ok = false;
         lastError = result.error;
-      }
-
-      if (result.ok && shouldReturnAfterSuccessfulTool(call.tool)) {
-        return {
-          response: executorResponse,
-          executedCalls,
-          artifacts,
-          lastSummary: result.summary,
-          lastRawResult: result.rawResult,
-          lastError,
-          ok,
-        };
       }
 
       messages.push({
@@ -517,10 +592,76 @@ async function runExecutorConversation(
     },
     executedCalls,
     artifacts,
-    lastSummary: lastSummary || "Executor exceeded tool round limit.",
+    lastSummary: lastSummary || "Executor reached tool round limit with partial progress.",
     lastRawResult,
-    lastError: lastError || "Executor exceeded tool round limit",
-    ok: false,
+    lastError: hasUsefulExecutorProgress({ executedCalls, artifacts, lastSummary, lastRawResult, ok })
+      ? undefined
+      : (lastError || "Executor exceeded tool round limit"),
+    ok: hasUsefulExecutorProgress({ executedCalls, artifacts, lastSummary, lastRawResult, ok }),
+  };
+}
+
+function finalizeExecutorResult(
+  executorResponse: Awaited<ReturnType<typeof runChatCompletionDetailed>>,
+  conversation: {
+    executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>;
+    artifacts: ExecutorOutput["artifacts"];
+    lastSummary: string;
+    lastRawResult: string;
+    lastError?: string;
+    ok: boolean;
+  },
+): ExecutorOutput {
+  const usedNativeToolCalls = conversation.executedCalls.length > 0;
+  const usefulProgress = hasUsefulExecutorProgress(conversation);
+  const parsed = usedNativeToolCalls
+    ? {
+        status: usefulProgress && conversation.lastError ? "partial_success" as const : "success" as const,
+        summary: conversation.lastSummary || "Executor completed via native tool execution.",
+        tool_calls_made: [],
+        artifacts: [],
+        raw_result: conversation.lastRawResult,
+        error: conversation.lastError,
+      }
+    : parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
+  const declaredToolCallsWithoutExecution = !usedNativeToolCalls && parsed.tool_calls_made.length > 0;
+
+  const summary = usedNativeToolCalls
+    ? (conversation.lastSummary || parsed.summary)
+    : parsed.summary !== "Executor did not return valid JSON."
+      ? parsed.summary
+      : (conversation.lastSummary || parsed.summary);
+  const rawResult = usedNativeToolCalls
+    ? (conversation.lastRawResult || JSON.stringify(executorResponse.raw))
+    : parsed.raw_result && parsed.raw_result !== (executorResponse.content || executorResponse.reasoning || "")
+      ? parsed.raw_result
+      : (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw));
+  const error = usedNativeToolCalls
+    ? conversation.lastError
+    : (parsed.error || conversation.lastError);
+
+  const status = !conversation.ok
+    ? "failed"
+    : declaredToolCallsWithoutExecution
+      ? "blocked"
+      : usedNativeToolCalls && conversation.ok
+        ? (conversation.lastError ? "partial_success" : "success")
+        : parsed.status === "success" && !usedNativeToolCalls
+          ? "blocked"
+        : parsed.status;
+
+  return {
+    status,
+    summary,
+    tool_calls_made: usedNativeToolCalls ? conversation.executedCalls : [],
+    artifacts: usedNativeToolCalls ? conversation.artifacts : [],
+    raw_result: rawResult,
+    error: declaredToolCallsWithoutExecution
+      ? "Executor declared tool calls without actually executing any native tools."
+      : parsed.status === "success" && !usedNativeToolCalls
+        ? "Executor self-declared success without native tool execution."
+        : error,
+    source: usedNativeToolCalls ? "native_tool" : "model_text",
   };
 }
 
@@ -558,9 +699,10 @@ function persistRankingArtifact(executorHistory: ExecutorOutput[], logger?: RunL
   return path;
 }
 
-function hasNonEmptyCommandArtifact(executorHistory: ExecutorOutput[]): boolean {
+export function hasNonEmptyCommandArtifact(executorHistory: ExecutorOutput[]): boolean {
   return executorHistory.some((item) =>
-    item.artifacts.some((artifact) =>
+    item.source === "native_tool"
+    && item.artifacts.some((artifact) =>
       !!artifact.path
       && artifact.path.includes("command-results")
       && artifact.content_preview.trim().length > 0
@@ -569,18 +711,279 @@ function hasNonEmptyCommandArtifact(executorHistory: ExecutorOutput[]): boolean 
   );
 }
 
-function hasUsefulArtifactRead(history: ExecutorOutput[]): boolean {
+export function hasUsefulArtifactRead(history: ExecutorOutput[]): boolean {
   return history.some((item) =>
-    item.tool_calls_made.some((call) => call.tool === "read_file") &&
-    item.status === "success"
+    item.source === "native_tool"
+    && item.tool_calls_made.some((call) => call.tool === "read_file")
+    && item.status === "success"
   );
 }
 
-function hasSuccessfulWrite(history: ExecutorOutput[]): boolean {
+export function hasSuccessfulWrite(history: ExecutorOutput[]): boolean {
   return history.some((item) =>
-    item.status === "success"
+    item.source === "native_tool"
+    && item.status === "success"
     && item.tool_calls_made.some((call) => call.tool === "write_file")
   );
+}
+
+function checkGoalAchieved(history: ExecutorOutput[], routePolicy: RoutePolicy): { achieved: boolean; answer?: string } {
+  if (history.length === 0) return { achieved: false };
+  if (routePolicy.type === "file_ops" || routePolicy.type === "code") {
+    const lastStep = history[history.length - 1];
+    if (lastStep?.source === "native_tool"
+      && lastStep.status === "success"
+      && lastStep.tool_calls_made.some((call) => call.tool === "write_file")) {
+      return { achieved: true, answer: lastStep.summary || "File operation completed successfully." };
+    }
+  }
+  return { achieved: false };
+}
+
+function finalizeRunTaskResult(params: {
+  goal: string;
+  status: "completed" | "failed" | "blocked";
+  output: string;
+  verified: boolean;
+  executorHistory: ExecutorOutput[];
+  options?: RunOptions;
+}): RunTaskResult {
+  const contract = buildSingleTaskContract({
+    jobId: params.options?.jobId,
+    planId: params.options?.planId,
+    taskRunId: params.options?.taskRunId,
+    goal: params.goal,
+    status: params.status,
+    verified: params.verified,
+    output: params.output,
+    executorHistory: params.executorHistory,
+  });
+  return {
+    status: params.status,
+    output: params.output,
+    verified: params.verified,
+    executorHistory: params.executorHistory,
+    job: contract.job,
+    plan: contract.plan,
+    taskRuns: contract.taskRuns,
+    artifacts: contract.artifacts,
+  };
+}
+
+export async function runTask(
+  config: OrchestratorConfig,
+  taskPrompt: string,
+  routePolicy: RoutePolicy,
+  logger?: RunLogger,
+  deps?: Partial<RuntimeDeps>,
+  options?: RunOptions,
+): Promise<RunTaskResult> {
+  const runtimeDeps = mergeRuntimeDeps(deps);
+  const executorHistory: ExecutorOutput[] = [];
+  const loopDetector = new LoopDetector();
+  let replanCount = 0;
+  let degradedRetryWarningEmitted = false;
+
+  for (let step = 0; step < config.policy.maxSteps; step++) {
+    assertNotCancelled(options);
+    const planner = await runtimeDeps.runPlannerStep(config, taskPrompt, executorHistory, replanCount, routePolicy, step + 1, logger, runtimeDeps, options);
+
+    if (planner.status === "final" || planner.status === "clarify") {
+      return finalizeRunTaskResult({
+        goal: taskPrompt,
+        status: "completed",
+        output: planner.final_answer ?? planner.reasoning_summary ?? "",
+        verified: true,
+        executorHistory,
+        options,
+      });
+    }
+
+    if (!planner.executor_request) {
+      return finalizeRunTaskResult({
+        goal: taskPrompt,
+        status: "failed",
+        output: "Planner did not provide executor request.",
+        verified: false,
+        executorHistory,
+        options,
+      });
+    }
+
+    const currentRequestKey = normalizeRequestKey(planner.executor_request);
+    const loopResult = loopDetector.check(executorHistory, currentRequestKey);
+    if (loopResult.detected) {
+      return finalizeRunTaskResult({
+        goal: taskPrompt,
+        status: "blocked",
+        output: `Loop detected: ${loopResult.message}`,
+        verified: false,
+        executorHistory,
+        options,
+      });
+    }
+
+    assertNotCancelled(options);
+    const executorResult = await runtimeDeps.runExecutorStep(config, planner, step + 1, logger, runtimeDeps, options);
+    executorHistory.push(executorResult);
+
+    const goalCheck = checkGoalAchieved(executorHistory, routePolicy);
+    if (goalCheck.achieved) {
+      return finalizeRunTaskResult({
+        goal: taskPrompt,
+        status: "completed",
+        output: goalCheck.answer ?? "",
+        verified: true,
+        executorHistory,
+        options,
+      });
+    }
+
+    const postExecLoop = loopDetector.check(executorHistory);
+    if (postExecLoop.detected && postExecLoop.type !== "repeated_request") {
+      return finalizeRunTaskResult({
+        goal: taskPrompt,
+        status: "blocked",
+        output: `Loop detected: ${postExecLoop.message}`,
+        verified: false,
+        executorHistory,
+        options,
+      });
+    }
+
+    if (planner.audit.verdict === "retry") {
+      replanCount++;
+      if (replanCount > config.policy.maxReplans) {
+        replanCount = config.policy.maxReplans;
+        if (!degradedRetryWarningEmitted) {
+          degradedRetryWarningEmitted = true;
+          logger?.log("orchestrator.degraded", { step: step + 1, reason: "max_replans_reached" });
+        }
+      }
+    } else if (planner.audit.verdict === "approved" || planner.audit.verdict === "not_applicable") {
+      replanCount = 0;
+    }
+  }
+
+  return finalizeRunTaskResult({
+    goal: taskPrompt,
+    status: "blocked",
+    output: "Max steps reached.",
+    verified: false,
+    executorHistory,
+    options,
+  });
+}
+
+async function runPlannerStep(
+  config: OrchestratorConfig,
+  userGoal: string,
+  executorHistory: ExecutorOutput[],
+  replanCount: number,
+  routePolicy: RoutePolicy,
+  stepNumber: number,
+  logger?: RunLogger,
+  deps?: Partial<RuntimeDeps>,
+  options?: RunOptions,
+): Promise<PlannerOutput> {
+  const runtimeDeps = mergeRuntimeDeps(deps);
+  assertNotCancelled(options);
+  const rankingArtifactPath = routePolicy.enableRanking ? persistRankingArtifact(executorHistory, logger) : undefined;
+  const candidateRankingText = routePolicy.enableRanking ? buildCandidateRankingText(executorHistory) : undefined;
+  const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText);
+
+  logger?.log("planner.request", { step: stepNumber, replan_count: replanCount });
+
+  let plannerRaw: string;
+  try {
+    const plannerResponse = await runtimeDeps.runChatCompletionDetailed(config.planner, plannerMessages, undefined, options);
+    emitReasoningTrace("planner", stepNumber, plannerResponse.reasoning, logger);
+    plannerRaw = plannerResponse.content || plannerResponse.reasoning || "";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new PlannerUnavailableError(`Planner request failed: ${message}`, error instanceof Error ? error : undefined);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = parseModelJson<Record<string, unknown>>(plannerRaw);
+  } catch (parseError) {
+    logger?.log("planner.parse_error", {
+      step: stepNumber,
+      raw_preview: plannerRaw.slice(0, 500),
+      error: parseError instanceof Error ? parseError.message : String(parseError),
+    });
+    return {
+      goal: userGoal,
+      status: "need_executor",
+      reasoning_summary: "Planner output was not valid JSON. Retrying.",
+      next_step: "Retry with clearer instructions.",
+      audit: { verdict: "retry", notes: `Planner output could not be parsed as JSON: ${parseError instanceof Error ? parseError.message.slice(0, 100) : "unknown error"}` },
+      executor_request: executorHistory.length > 0
+        ? { instruction: "Repeat the last successful tool operation to confirm the result.", allowed_tools: ["read_file", "list_files"], expected_output: "Confirmation of the previous result." }
+        : undefined,
+    };
+  }
+  const parsedAudit = isRecord(parsed.audit) ? parsed.audit : undefined;
+  const parsedExecutorRequest = parsePlannerExecutorRequest(parsed.executor_request);
+  const planner: PlannerOutput = {
+    goal: userGoal,
+    status: parsed.status === "need_executor" || parsed.status === "final" || parsed.status === "clarify"
+      ? parsed.status
+      : "clarify",
+    reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
+    next_step: typeof parsed.step === "string" ? parsed.step : "",
+    audit: parsedAudit
+      ? {
+          verdict: parsedAudit.verdict === "approved" || parsedAudit.verdict === "retry" || parsedAudit.verdict === "blocked" || parsedAudit.verdict === "not_applicable"
+            ? parsedAudit.verdict
+            : "not_applicable",
+          notes: typeof parsedAudit.notes === "string" ? parsedAudit.notes : "",
+        }
+      : { verdict: executorHistory.length > 0 ? "approved" : "not_applicable", notes: "" },
+    executor_request: parsedExecutorRequest,
+    final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
+    clarification_question: typeof parsed.question === "string" ? parsed.question : undefined,
+  };
+
+  // Protocol: final with executor_request but no answer
+  if (planner.status === "final" && planner.executor_request && !isNonEmptyString(planner.final_answer)) {
+    planner.status = "need_executor";
+    planner.audit = { verdict: "retry", notes: "Protocol corrected: final with executor_request and no answer." };
+  }
+
+  // R4+: Research finalization requires actual evidence, even if a markdown file was already written.
+  if (planner.status === "final" && routePolicy.requireEvidenceBeforeFinal) {
+    if (routePolicy.requireArtifactReadback
+      && !hasUsefulArtifactRead(executorHistory)
+      && executorHistory.some((i) => i.artifacts.some((a) => a.path?.includes("command-results")))) {
+      planner.status = "need_executor";
+      planner.audit = { verdict: "retry", notes: "Research: search results exist but were not read back." };
+      planner.executor_request = {
+        instruction: "Read the most relevant recent file under runtime/command-results and extract the strongest candidates.",
+        allowed_tools: ["list_files", "read_file"],
+        expected_output: "Structured summary of candidates.",
+      };
+      planner.final_answer = undefined;
+    } else if (!hasSufficientEvidenceForRoute(executorHistory, routePolicy)) {
+      planner.status = "need_executor";
+      planner.audit = {
+        verdict: "retry",
+        notes: `Insufficient evidence for final answer. Candidate count=${getGroundedCandidateCount(executorHistory)}; required minimum=${routePolicy.minGroundedCandidates}; readback=${routePolicy.requireArtifactReadback}; non_empty_artifact=${routePolicy.requireNonEmptyArtifact}.`,
+      };
+      planner.executor_request = {
+        instruction: rankingArtifactPath
+          ? `Read the ranking artifact at ${rankingArtifactPath} and the strongest non-empty search result artifact, then produce a grounded ranking with inclusion reasons and concerns. Do not invent projects that are not present in the evidence.`
+          : "List and read the strongest non-empty search result artifact, then produce a grounded ranking with inclusion reasons and concerns. Do not invent projects that are not present in the evidence.",
+        allowed_tools: rankingArtifactPath ? ["read_file"] : ["list_files", "read_file"],
+        expected_output: `Structured evidence summary with at least ${routePolicy.minGroundedCandidates} grounded candidate projects when candidate comparison applies, each including full_name, url, stars when available, inclusion reason, and concerns.`,
+      };
+      planner.final_answer = undefined;
+    }
+  }
+
+  logger?.log("planner.response.parsed", { step: stepNumber, parsed: planner });
+  return planner;
 }
 
 function formatReasoningTrace(label: string, stepNumber: number, reasoning: string): string {
@@ -626,7 +1029,7 @@ function buildPlannerHistoryText(config: OrchestratorConfig, executorHistory: Ex
   const hiddenCount = executorHistory.length - visibleHistory.length;
   const historyLines = visibleHistory.map((item, idx) => {
     const actualStep = hiddenCount + idx + 1;
-    const rawPreview = item.raw_result ? ` result=${previewText(item.raw_result, previewLimit)}` : "";
+    const rawPreview = item.raw_result ? ` result=${compressJsonOutput(item.raw_result, previewLimit)}` : "";
     const errorText = item.error ? ` error=${previewText(item.error, previewLimit)}` : "";
     return `step ${actualStep}: status=${item.status}; summary=${item.summary}; tools=${formatToolCalls(item)}; artifacts=${formatArtifacts(item, previewLimit)};${rawPreview}${errorText}`;
   });
@@ -658,7 +1061,7 @@ function buildPlannerMessages(
   ].join("\n");
 
   return [
-    { role: "system", content: `${PLANNER_PROMPT}\n\nAvailable tools:\n${toolListText()}` },
+    { role: "system", content: `${PLANNER_PROMPT}\n\nRuntime profile:\n${runtimeProfileText(config)}\n\nAvailable tools:\n${toolListText()}` },
     {
       role: "user",
       content: `Goal: ${userGoal}\n${routePolicyBlock}\nReplan budget remaining: ${remainingReplans}\nWorker history:\n${historyText}${routePolicy.enableRanking ? `\n\nDeterministic candidate ranking:\n${rankingText || "none"}` : ""}`,
@@ -666,9 +1069,9 @@ function buildPlannerMessages(
   ];
 }
 
-function buildExecutorMessages(request: PlannerOutput["executor_request"]): ChatMessage[] {
+function buildExecutorMessages(config: OrchestratorConfig, request: PlannerOutput["executor_request"]): ChatMessage[] {
   return [
-    { role: "system", content: `${EXECUTOR_PROMPT}\n\nAvailable tools:\n${toolListText()}` },
+    { role: "system", content: `${EXECUTOR_PROMPT}\n\nRuntime profile:\n${runtimeProfileText(config)}\n\nAvailable tools:\n${toolListText()}` },
     {
       role: "user",
       content: JSON.stringify(request),
@@ -676,12 +1079,104 @@ function buildExecutorMessages(request: PlannerOutput["executor_request"]): Chat
   ];
 }
 
-async function runExecutorStep(
+function tryParseToolArguments(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function executeDeclaredToolCallsFallback(
+  declaredCalls: Array<{ tool: string; arguments: Record<string, unknown> }>,
+  request: PlannerOutput["executor_request"],
+  stepNumber: number,
+  logger?: RunLogger,
+): Promise<{
+  executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>;
+  artifacts: ExecutorOutput["artifacts"];
+  lastSummary: string;
+  lastRawResult: string;
+  lastError?: string;
+  ok: boolean;
+}> {
+  const artifacts: ExecutorOutput["artifacts"] = [];
+  const executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }> = [];
+  let lastSummary = "";
+  let lastRawResult = "";
+  let lastError: string | undefined;
+  let ok = true;
+
+  for (const call of declaredCalls) {
+    if (!request?.allowed_tools.includes(call.tool)) {
+      logger?.log("tool.blocked", {
+        step: stepNumber,
+        tool: call.tool,
+        arguments: call.arguments,
+        reason: "Declared tool not allowed for this step",
+      });
+      return {
+        executedCalls,
+        artifacts,
+        lastSummary: `Executor declared disallowed tool ${call.tool}`,
+        lastRawResult,
+        lastError: `Tool ${call.tool} is not allowed for this step`,
+        ok: false,
+      };
+    }
+
+    logger?.log("tool.execution.started", {
+      step: stepNumber,
+      tool: call.tool,
+      arguments: call.arguments,
+      source: "declared_tool_calls_fallback",
+    });
+    const result = await executeTool(call.tool, call.arguments);
+    logger?.log("tool.execution.finished", {
+      step: stepNumber,
+      tool: call.tool,
+      ok: result.ok,
+      summary: result.summary,
+      error: result.error,
+      artifact: result.artifact,
+      raw_result_preview: result.rawResult.slice(0, 500),
+      source: "declared_tool_calls_fallback",
+    });
+
+    executedCalls.push(call);
+    if (result.artifact) {
+      artifacts.push(result.artifact);
+    }
+    lastSummary = result.summary;
+    lastRawResult = result.rawResult;
+    if (!result.ok) {
+      ok = false;
+      lastError = result.error;
+      break;
+    }
+  }
+
+  return {
+    executedCalls,
+    artifacts,
+    lastSummary,
+    lastRawResult,
+    lastError,
+    ok,
+  };
+}
+
+export async function runExecutorStep(
   config: OrchestratorConfig,
   planner: PlannerOutput,
   stepNumber: number,
-  logger?: RunLogger
+  logger?: RunLogger,
+  deps?: Partial<RuntimeDeps>,
+  options?: RunOptions,
 ): Promise<ExecutorOutput> {
+  void deps;
+  assertNotCancelled(options);
   if (!planner.executor_request) {
     throw new Error("Planner requested executor but did not provide executor_request");
   }
@@ -697,58 +1192,59 @@ async function runExecutorStep(
     planner.executor_request,
     allowedTools,
     stepNumber,
-    logger
+    logger,
+    options,
   );
   const executorResponse = conversation.response;
-  const parsed = parseExecutorOutput(executorResponse.content || executorResponse.reasoning || "");
+  const finalized = finalizeExecutorResult(executorResponse, conversation);
   logger?.log("executor.response.parsed", {
     step: stepNumber,
-    parsed,
-    used_native_tool_calls: conversation.executedCalls.length > 0,
+    parsed: finalized,
+    used_native_tool_calls: finalized.source === "native_tool",
+    declared_tool_calls_without_execution: finalized.error === "Executor declared tool calls without actually executing any native tools.",
   });
-
-  const toolCallsMade = parsed.tool_calls_made.length > 0
-    ? parsed.tool_calls_made
-    : conversation.executedCalls;
-  const artifacts = parsed.artifacts.length > 0
-    ? [...conversation.artifacts, ...parsed.artifacts]
-    : conversation.artifacts;
-  const summary = parsed.summary !== "Executor did not return valid JSON."
-    ? parsed.summary
-    : (conversation.lastSummary || parsed.summary);
-  const rawResult = parsed.raw_result && parsed.raw_result !== (executorResponse.content || executorResponse.reasoning || "")
-    ? parsed.raw_result
-    : (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw));
-  const error = parsed.error || conversation.lastError;
-  const status = !conversation.ok
-    ? "failed"
-    : (toolCallsMade.length > 0 && parsed.status === "failed" && parsed.error === "Unable to parse executor output as JSON")
-      ? "success"
-      : parsed.status;
-
-  return {
-    status,
-    summary,
-    tool_calls_made: toolCallsMade,
-    artifacts,
-    raw_result: rawResult,
-    error,
-  };
+  return finalized;
 }
 
 export async function runOrchestrator(
   config: OrchestratorConfig,
   userGoal: string,
-  logger?: RunLogger
+  logger?: RunLogger,
+  deps?: Partial<RuntimeDeps>,
+  options?: RunOptions,
 ): Promise<PlannerOutput> {
+  const runtimeDeps = mergeRuntimeDeps(deps);
+  assertNotCancelled(options);
   const executorHistory: ExecutorOutput[] = [];
   const routing = loadTaskRoutingConfig(config.taskRoutingPath);
   const taskType = detectTaskType(userGoal, routing);
   const routePolicy = getRoutePolicy(taskType, routing);
   let replanCount = 0;
   let degradedRetryWarningEmitted = false;
-  let lastExecutorRequestKey = "";
-  let repeatedExecutorRequestCount = 0;
+  const loopDetector = new LoopDetector();
+  let stepState: OrchestratorStepState = "pending";
+  const allowedTransitions: Record<OrchestratorStepState, OrchestratorStepState[]> = {
+    pending: ["planning"],
+    planning: ["executing", "finalized", "blocked"],
+    executing: ["planning", "finalized", "failed"],
+    completed: [],
+    failed: [],
+    blocked: [],
+    finalized: [],
+  };
+  function transitionTo(next: OrchestratorStepState, reason: string): void {
+    const allowed = allowedTransitions[stepState];
+    if (!allowed.includes(next)) {
+      logger?.log("orchestrator.state_machine.violation", {
+        from: stepState,
+        to: next,
+        reason,
+        step: executorHistory.length + 1,
+      });
+    }
+    logger?.log("orchestrator.state_transition", { from: stepState, to: next, reason });
+    stepState = next;
+  }
   logger?.log("orchestrator.config", {
     planner_model: config.planner.model,
     executor_model: config.executor.model,
@@ -762,6 +1258,7 @@ export async function runOrchestrator(
   });
 
   for (let step = 0; step < config.policy.maxSteps; step++) {
+    transitionTo("planning", `step ${step + 1} starting`);
     const rankingArtifactPath = routePolicy.enableRanking ? persistRankingArtifact(executorHistory, logger) : undefined;
     const candidateRankingText = routePolicy.enableRanking ? buildCandidateRankingText(executorHistory) : undefined;
     const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText);
@@ -776,7 +1273,7 @@ export async function runOrchestrator(
     });
     let plannerRaw: string;
     try {
-      const plannerResponse = await runChatCompletionDetailed(config.planner, plannerMessages);
+      const plannerResponse = await runtimeDeps.runChatCompletionDetailed(config.planner, plannerMessages, undefined, options);
       emitReasoningTrace("planner", step + 1, plannerResponse.reasoning, logger);
       plannerRaw = plannerResponse.content || plannerResponse.reasoning || "";
       logger?.log("planner.response.raw", {
@@ -793,7 +1290,18 @@ export async function runOrchestrator(
       });
       throw new PlannerUnavailableError(`Planner request failed: ${message}`, error instanceof Error ? error : undefined);
     }
-    const parsed = parseModelJson<Record<string, unknown>>(plannerRaw);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseModelJson<Record<string, unknown>>(plannerRaw);
+    } catch (parseError) {
+      logger?.log("planner.parse_error", {
+        step: step + 1,
+        raw_preview: plannerRaw.slice(0, 500),
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+      });
+      // Treat parse failure as retry — the planner will be called again
+      continue;
+    }
     const parsedAudit = isRecord(parsed.audit) ? parsed.audit : undefined;
     const parsedExecutorRequest = parsePlannerExecutorRequest(parsed.executor_request);
     const planner: PlannerOutput = {
@@ -888,47 +1396,33 @@ export async function runOrchestrator(
       planner.final_answer = undefined;
     }
 
-    if (planner.status === "need_executor" && planner.executor_request) {
-      const requestKey = normalizeRequestKey(planner.executor_request);
-      if (requestKey && requestKey === lastExecutorRequestKey) {
-        repeatedExecutorRequestCount += 1;
-      } else {
-        repeatedExecutorRequestCount = 0;
-        lastExecutorRequestKey = requestKey;
-      }
-    } else {
-      repeatedExecutorRequestCount = 0;
-      lastExecutorRequestKey = "";
-    }
+    const currentRequestKey = planner.status === "need_executor" && planner.executor_request
+      ? normalizeRequestKey(planner.executor_request)
+      : undefined;
 
     logger?.log("planner.response.parsed", {
       step: step + 1,
       parsed: planner,
-      repeated_executor_request_count: repeatedExecutorRequestCount,
     });
 
-    if (planner.status === "need_executor" && repeatedExecutorRequestCount > config.policy.maxRepeatedExecutorRequests) {
+    // Unified loop detection
+    const loopResult = loopDetector.check(executorHistory, currentRequestKey);
+    if (loopResult.detected) {
+      transitionTo("blocked", loopResult.type ?? "unknown_loop");
       const result: PlannerOutput = {
         goal: userGoal,
         status: "final",
-        reasoning_summary: "Stopped because the manager kept issuing repeated executor requests.",
+        reasoning_summary: `Stopped: ${loopResult.message}`,
         next_step: "",
-        audit: {
-          verdict: "blocked",
-          notes: `Repeated executor request detected. Recent artifacts: ${summarizeRecentArtifacts(executorHistory)}`,
-        },
-        final_answer: `The orchestrator detected a repeated execution loop. Recent artifact files are: ${summarizeRecentArtifacts(executorHistory)}.`,
+        audit: { verdict: "blocked", notes: loopResult.message ?? "Loop detected." },
+        final_answer: `The orchestrator stopped: ${loopResult.message} Recent artifacts: ${summarizeRecentArtifacts(executorHistory)}.`,
       };
-      logger?.log("orchestrator.loop_detected", {
-        step: step + 1,
-        repeated_executor_request_count: repeatedExecutorRequestCount,
-        request: planner.executor_request,
-        result,
-      });
+      logger?.log("orchestrator.loop_detected", { step: step + 1, type: loopResult.type, result });
       return result;
     }
 
     if (planner.status === "final" || planner.status === "clarify") {
+      transitionTo("finalized", `planner returned ${planner.status}`);
       logger?.log("orchestrator.finished", {
         step: step + 1,
         result: planner,
@@ -953,15 +1447,50 @@ export async function runOrchestrator(
       replanCount = 0;
     }
 
-    const executorResult = await runExecutorStep(config, planner, step + 1, logger);
+    transitionTo("executing", `executor step ${step + 1}`);
+    assertNotCancelled(options);
+    const executorResult = await runtimeDeps.runExecutorStep(config, planner, step + 1, logger, runtimeDeps, options);
     executorHistory.push(executorResult);
     logger?.log("executor.step.finished", {
       step: step + 1,
       result: executorResult,
       replan_count: replanCount,
     });
+
+    // P0-2: Goal achieved short-circuit — if write_file succeeded, stop immediately
+    const goalCheck = checkGoalAchieved(executorHistory, routePolicy);
+    if (goalCheck.achieved) {
+      transitionTo("finalized", "goal_achieved");
+      const result: PlannerOutput = {
+        goal: userGoal,
+        status: "final",
+        reasoning_summary: "Goal achieved: verified native tool result satisfies the objective.",
+        next_step: "",
+        audit: { verdict: "approved", notes: "Write tool succeeded with verified native execution." },
+        final_answer: goalCheck.answer,
+      };
+      logger?.log("orchestrator.goal_achieved", { step: step + 1, result });
+      return result;
+    }
+
+    // P0-4 + P2-2: Unified loop detection after executor step
+    const postExecLoop = loopDetector.check(executorHistory);
+    if (postExecLoop.detected && postExecLoop.type !== "repeated_request") {
+      transitionTo("blocked", postExecLoop.type ?? "unknown_loop");
+      const result: PlannerOutput = {
+        goal: userGoal,
+        status: "final",
+        reasoning_summary: `Stopped: ${postExecLoop.message}`,
+        next_step: "",
+        audit: { verdict: "blocked", notes: postExecLoop.message ?? "Loop detected after executor step." },
+        final_answer: `The orchestrator stopped: ${postExecLoop.message}`,
+      };
+      logger?.log("orchestrator.loop_detected_post_exec", { step: step + 1, type: postExecLoop.type, result });
+      return result;
+    }
   }
 
+  transitionTo("finalized", "max_steps_reached");
   const result: PlannerOutput = {
     goal: userGoal,
     status: "final",
@@ -979,3 +1508,10 @@ export async function runOrchestrator(
   });
   return result;
 }
+
+export const __testables = {
+  runPlannerStep,
+  finalizeExecutorResult,
+  buildPlannerMessages,
+  buildExecutorMessages,
+};

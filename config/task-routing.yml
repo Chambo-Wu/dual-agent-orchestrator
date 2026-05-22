@@ -3,6 +3,9 @@ research:
   planner_instruction: "Task type: research. Gather evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion."
   enable_ranking: true
   require_evidence_before_final: true
+  min_grounded_candidates: 3
+  require_artifact_readback: true
+  require_non_empty_artifact: true
   preferred_tools: "shell_command, list_files, read_file"
   artifact_priority: "ranking artifact, search result artifact, structured JSON output"
   completion_checklist: "collect external evidence, read back at least one artifact, compare candidates with reasons and concerns, final answer cites the strongest artifacts"
@@ -13,6 +16,9 @@ web_search:
   planner_instruction: "Task type: web_search. Use external lookup, summarize evidence, and cite sources or artifacts when available."
   enable_ranking: true
   require_evidence_before_final: true
+  min_grounded_candidates: 2
+  require_artifact_readback: true
+  require_non_empty_artifact: true
   preferred_tools: "shell_command, list_files, read_file"
   artifact_priority: "search result artifact, ranking artifact, captured page content"
   completion_checklist: "perform external lookup, preserve non-empty artifacts, read back the strongest artifact before finalizing, state conclusions with evidence"
@@ -23,6 +29,9 @@ code:
   planner_instruction: "Task type: code. Prefer concrete diagnostics, code changes, validation, and concise technical conclusions."
   enable_ranking: false
   require_evidence_before_final: false
+  min_grounded_candidates: 0
+  require_artifact_readback: false
+  require_non_empty_artifact: false
   preferred_tools: "list_files, read_file, shell_command, write_file"
   artifact_priority: "relevant source files, test output, diff-worthy edits"
   completion_checklist: "identify the relevant file or failing area, apply the minimal effective change, run validation when feasible, summarize the behavioral effect, not just the file touched"
@@ -33,6 +42,9 @@ data_analysis:
   planner_instruction: "Task type: data_analysis. Prefer structured extraction, aggregation, and concise findings backed by artifacts."
   enable_ranking: false
   require_evidence_before_final: false
+  min_grounded_candidates: 1
+  require_artifact_readback: true
+  require_non_empty_artifact: true
   preferred_tools: "read_file, shell_command, write_file"
   artifact_priority: "source dataset, derived summary artifact, analysis notes"
   completion_checklist: "inspect the source data shape, produce a structured summary or aggregation, separate findings from assumptions, report any missing or dirty data limitations"
@@ -43,6 +55,9 @@ file_ops:
   planner_instruction: "Task type: file_ops. Favor direct file reads and writes, verify the result, and avoid unnecessary exploration."
   enable_ranking: false
   require_evidence_before_final: false
+  min_grounded_candidates: 0
+  require_artifact_readback: false
+  require_non_empty_artifact: false
   preferred_tools: "list_files, read_file, write_file"
   artifact_priority: "target file, neighboring config or schema files"
   completion_checklist: "find the intended file quickly, make the requested edit directly, read back or validate the resulting content, avoid unrelated detours"
@@ -53,6 +68,9 @@ shell_ops:
   planner_instruction: "Task type: shell_ops. Favor direct command execution, inspect output artifacts, and verify success concisely."
   enable_ranking: false
   require_evidence_before_final: false
+  min_grounded_candidates: 0
+  require_artifact_readback: true
+  require_non_empty_artifact: true
   preferred_tools: "shell_command, read_file"
   artifact_priority: "command output artifact, generated report file, stderr or failure details"
   completion_checklist: "run the narrowest useful command, inspect the actual output artifact, treat empty output as a signal to retry or adjust, finish with the command result, not speculation"
@@ -63,6 +81,9 @@ general:
   planner_instruction: "Task type: general. Use the simplest viable route and avoid unnecessary branching."
   enable_ranking: false
   require_evidence_before_final: false
+  min_grounded_candidates: 0
+  require_artifact_readback: false
+  require_non_empty_artifact: false
   preferred_tools: "list_files, read_file, shell_command"
   artifact_priority: "most directly relevant artifact"
   completion_checklist: "pick the simplest path, gather only the evidence needed, avoid over-planning, end once the user goal is satisfied"

@@ -6,7 +6,8 @@ declare module "node:fs" {
     options?: string | { encoding?: string; flag?: string }
   ): void;
   export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
-  export function readdirSync(path: string, options?: { withFileTypes?: boolean }): Array<{ name: string }>;
+  export function readdirSync(path: string): string[];
+  export function readdirSync(path: string, options: { withFileTypes: true }): Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
 }
 
 declare module "node:path" {
