@@ -10,6 +10,7 @@ import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, Plan, TaskRun } from "./types.js";
+import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
@@ -75,6 +76,18 @@ interface ChatCompletionRequest {
   top_p?: number;
   stop?: string | string[];
   stream_options?: { include_usage?: boolean };
+}
+
+interface CreateJobRequest {
+  goal?: string;
+  mode?: "task" | "team";
+  model_route?: string;
+  policy?: {
+    allow_network?: boolean;
+    allow_shell?: boolean;
+    approval_mode?: string;
+    async?: boolean;
+  };
 }
 
 interface ResponseInputItem {
@@ -740,6 +753,118 @@ function latestExecutorStatus(record: StoredJobRecord): ExecutorOutput["status"]
   return history.at(-1)?.status ?? null;
 }
 
+function buildJobEvents(record: StoredJobRecord): unknown[] {
+  const events: Array<Record<string, unknown>> = [
+    {
+      id: `${record.job.id}:job:persisted`,
+      type: "job.persisted",
+      created_at: record.savedAt,
+      job_id: record.job.id,
+      data: {
+        status: record.job.status,
+        mode: record.job.mode,
+        goal: record.job.goal,
+      },
+    },
+    {
+      id: `${record.job.id}:plan:${record.plan.id}`,
+      type: "plan.created",
+      created_at: record.savedAt,
+      job_id: record.job.id,
+      plan_id: record.plan.id,
+      data: {
+        mode: record.plan.mode,
+        summary: record.plan.summary ?? "",
+        task_run_ids: record.plan.taskRunIds,
+      },
+    },
+  ];
+
+  for (const taskRun of record.taskRuns) {
+    events.push({
+      id: `${record.job.id}:step:${taskRun.id}`,
+      type: `step.${taskRun.status}`,
+      created_at: record.savedAt,
+      job_id: record.job.id,
+      plan_id: record.plan.id,
+      step_id: taskRun.id,
+      data: {
+        title: taskRun.title,
+        verified: taskRun.verified,
+        attempts: taskRun.attempts,
+        artifact_count: taskRun.artifacts.length,
+      },
+    });
+
+    for (const [index, executorOutput] of (taskRun.executorHistory ?? []).entries()) {
+      events.push({
+        id: `${record.job.id}:step:${taskRun.id}:executor:${index + 1}`,
+        type: `executor.${executorOutput.status}`,
+        created_at: record.savedAt,
+        job_id: record.job.id,
+        plan_id: record.plan.id,
+        step_id: taskRun.id,
+        data: {
+          summary: executorOutput.summary,
+          source: executorOutput.source ?? null,
+          error: executorOutput.error ?? null,
+          artifact_count: executorOutput.artifacts.length,
+          tool_call_count: executorOutput.tool_calls_made.length,
+        },
+      });
+    }
+  }
+
+  for (const artifact of record.artifacts) {
+    events.push({
+      id: `${record.job.id}:artifact:${artifact.id}`,
+      type: "artifact.created",
+      created_at: record.savedAt,
+      job_id: record.job.id,
+      step_id: artifact.sourceTaskRunId ?? null,
+      data: artifact,
+    });
+  }
+
+  if (record.control?.cancelledAt) {
+    events.push({
+      id: `${record.job.id}:control:cancelled`,
+      type: "job.cancelled",
+      created_at: record.control.cancelledAt,
+      job_id: record.job.id,
+      data: {
+        cancellation_requested_at: record.control.cancellationRequestedAt ?? null,
+      },
+    });
+  }
+
+  if (record.control?.retriedAt) {
+    events.push({
+      id: `${record.job.id}:control:retried`,
+      type: "job.retried",
+      created_at: record.control.retriedAt,
+      job_id: record.job.id,
+      data: {
+        retried_to_job_id: record.control.retriedToJobId ?? null,
+      },
+    });
+  }
+
+  if (record.control?.retryOf) {
+    events.push({
+      id: `${record.job.id}:control:retry-of`,
+      type: "job.retry_created",
+      created_at: record.savedAt,
+      job_id: record.job.id,
+      data: {
+        retry_of: record.control.retryOf,
+      },
+    });
+  }
+
+  return events;
+}
+
 function buildJobResponse(record: StoredJobRecord): unknown {
   const latestStep = record.taskRuns.at(-1);
   return {
@@ -1123,6 +1248,61 @@ async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promi
   });
 }
 
+async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody<CreateJobRequest>(req);
+  const goal = typeof body.goal === "string" ? body.goal.trim() : "";
+  if (!goal) {
+    jsonResponse(res, 400, {
+      error: {
+        message: "`goal` must be a non-empty string.",
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  if (body.mode !== undefined && body.mode !== "task") {
+    jsonResponse(res, 400, {
+      error: {
+        message: "`POST /v1/jobs` currently supports mode \"task\". Team mode will use the same control-plane contract in a later milestone.",
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  if (body.policy?.async === true) {
+    jsonResponse(res, 400, {
+      error: {
+        message: "Asynchronous job creation is not available yet; omit policy.async or set it to false.",
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  const modelRoute = typeof body.model_route === "string" && body.model_route.trim()
+    ? body.model_route.trim()
+    : undefined;
+  const result = await executeTaskGoal(goal, modelRoute, true);
+  const record = readJobRecord(result.job.id);
+
+  jsonResponse(res, 201, {
+    object: "job",
+    job_id: result.job.id,
+    resolved_model: result.resolvedModel,
+    log_path: result.logPath,
+    workflow: buildWorkflowPayload(result),
+    ...(record ? buildJobResponse(record) as Record<string, unknown> : {
+      job: result.job,
+      plan: result.plan,
+      taskRuns: result.taskRuns,
+      artifacts: result.artifacts,
+      control: {},
+    }),
+  });
+}
+
 async function handleGetJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
@@ -1171,6 +1351,44 @@ async function handleGetJobSteps(_req: IncomingMessage, res: ServerResponse, job
     job_id: jobId,
     count: steps.length,
     steps,
+  });
+}
+
+async function handleGetJobRuntimeProfile(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  const config = loadConfig();
+  jsonResponse(res, 200, {
+    job_id: jobId,
+    generated_at: new Date().toISOString(),
+    runtime_profile: buildRuntimeProfile(config),
+  });
+}
+
+async function handleGetJobEvents(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  const events = buildJobEvents(record);
+  jsonResponse(res, 200, {
+    job_id: jobId,
+    count: events.length,
+    events,
   });
 }
 
@@ -1666,6 +1884,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    if (method === "POST" && url.pathname === "/v1/jobs") {
+      await handleCreateJob(req, res);
+      return;
+    }
+
     const jobMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
     if (method === "GET" && jobMatch) {
       await handleGetJob(req, res, decodeURIComponent(jobMatch[1]!));
@@ -1681,6 +1904,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const jobArtifactsMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/artifacts$/);
     if (method === "GET" && jobArtifactsMatch) {
       await handleGetJobArtifacts(req, res, decodeURIComponent(jobArtifactsMatch[1]!));
+      return;
+    }
+
+    const jobRuntimeProfileMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/runtime-profile$/);
+    if (method === "GET" && jobRuntimeProfileMatch) {
+      await handleGetJobRuntimeProfile(req, res, decodeURIComponent(jobRuntimeProfileMatch[1]!));
+      return;
+    }
+
+    const jobEventsMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/events$/);
+    if (method === "GET" && jobEventsMatch) {
+      await handleGetJobEvents(req, res, decodeURIComponent(jobEventsMatch[1]!));
       return;
     }
 
@@ -1895,6 +2130,7 @@ export const __testables = {
   parseTeamCliArgs,
   buildJobResponse,
   buildStepList,
+  buildJobEvents,
   setTaskExecutorForTests,
   getActiveJobSession,
 };
