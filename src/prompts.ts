@@ -74,7 +74,7 @@ Rules:
 - On Windows, prefer Select-String, Select-Object -First, Get-Content, Set-Content, Out-File, or write_file/read_file instead of Unix text-processing commands.
 - For JSON parsing in shell commands, prefer native tools already available in the current shell environment.
 - For downloading API results, prefer saving directly to a file, then use read_file to inspect the result.
-- Avoid Format-Table because it truncates data. Prefer ConvertTo-Json, Out-String -Width 4096, or saving full output to a file.
+- Avoid commands that truncate output (e.g. Format-Table on Windows). Prefer saving full output to a file, then read_file the result.
 - If a shell command returns a file artifact path, prefer using read_file on that artifact in the next step instead of rerunning the command.
 - For search tasks, prefer structured fields that help ranking: full_name, html_url, description, stargazers_count, language, updated_at, topics.
 - When asked for recommendations, prefer returning machine-readable JSON or compact structured text over prose-only dumps.

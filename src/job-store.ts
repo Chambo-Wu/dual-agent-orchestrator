@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, type Dirent } from "node:fs";
 import { resolve } from "node:path";
 import { RUNTIME_ROOT } from "./paths.js";
-import type { Artifact, Job, Plan, TaskRun } from "./types.js";
+import type { ApprovalRequest, Artifact, Job, Plan, TaskRun } from "./types.js";
 
 export interface JobControlState {
   cancellationRequestedAt?: string;
@@ -9,6 +9,11 @@ export interface JobControlState {
   retryOf?: string;
   retriedAt?: string;
   retriedToJobId?: string;
+  pendingApprovalId?: string;
+  approvalStatus?: "pending" | "approved" | "denied";
+  resumedAt?: string;
+  resumedToJobId?: string;
+  resumeOf?: string;
 }
 
 export interface StoredJobRecord {
@@ -18,6 +23,7 @@ export interface StoredJobRecord {
   taskRuns: TaskRun[];
   artifacts: Artifact[];
   control?: JobControlState;
+  approvalRequests?: ApprovalRequest[];
 }
 
 function jobsRoot(): string {
@@ -92,6 +98,53 @@ export function updateJobControlState(jobId: string, update: Partial<JobControlS
     control: {
       ...record.control,
       ...update,
+    },
+  };
+  writeFileSync(jobRecordPath(jobId), JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+export function persistApprovalRequest(jobId: string, request: ApprovalRequest): StoredJobRecord | null {
+  const record = readJobRecord(jobId);
+  if (!record) return null;
+  const next: StoredJobRecord = {
+    ...record,
+    approvalRequests: [...(record.approvalRequests ?? []), request],
+    control: {
+      ...record.control,
+      pendingApprovalId: request.id,
+      approvalStatus: "pending",
+    },
+  };
+  writeFileSync(jobRecordPath(jobId), JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+export function resolveApprovalRequest(
+  jobId: string,
+  approvalId: string,
+  decision: "approved" | "denied",
+  note?: string,
+): StoredJobRecord | null {
+  const record = readJobRecord(jobId);
+  if (!record) return null;
+  const requests = record.approvalRequests ?? [];
+  const idx = requests.findIndex((r) => r.id === approvalId);
+  if (idx < 0) return null;
+  const updated = [...requests];
+  updated[idx] = {
+    ...updated[idx]!,
+    status: decision,
+    respondedAt: new Date().toISOString(),
+    ...(note ? { responseNote: note } : {}),
+  };
+  const next: StoredJobRecord = {
+    ...record,
+    approvalRequests: updated,
+    control: {
+      ...record.control,
+      pendingApprovalId: undefined,
+      approvalStatus: decision,
     },
   };
   writeFileSync(jobRecordPath(jobId), JSON.stringify(next, null, 2), "utf8");

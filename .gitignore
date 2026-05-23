@@ -2,7 +2,7 @@ node_modules
 dist
 notes/
 .env
-runtime
+/runtime
 *.bat
 *.pyc
 __pycache__/

@@ -116,6 +116,17 @@ export type JobMode = "task" | "team";
 export type JobStatus = "completed" | "failed" | "blocked";
 export type TaskRunStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
 
+export interface ApprovalRequest {
+  id: string;
+  jobId: string;
+  taskIds: string[];
+  reason: string;
+  status: "pending" | "approved" | "denied" | "expired";
+  createdAt: string;
+  respondedAt?: string;
+  responseNote?: string;
+}
+
 export interface Artifact {
   id: string;
   type: ExecutorArtifact["type"] | "summary";

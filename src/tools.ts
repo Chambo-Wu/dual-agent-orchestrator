@@ -36,7 +36,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: "shell_command",
-    description: "Run a PowerShell command inside the current project workspace.",
+    description: "Run a shell command inside the current project workspace. Auto-detects PowerShell, cmd, or POSIX shell.",
     parameters: {
       type: "object",
       properties: {
@@ -61,6 +61,70 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     name: "git_command",
     description: "Run a read-only git command. Supports: status, diff, log, show, blame.",
     parameters: { type: "object", properties: { subcommand: { type: "string" }, args: { type: "string" } }, required: ["subcommand"] },
+  },
+  {
+    name: "http_request",
+    description: "Make an HTTP request (GET, POST, etc.) and return status + body.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        method: { type: "string" },
+        headers: { type: "object" },
+        body: { type: "string" },
+        timeout_ms: { type: "number" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "extract_text",
+    description: "Extract readable text from HTML or raw content.",
+    parameters: {
+      type: "object",
+      properties: {
+        content: { type: "string" },
+        format: { type: "string" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "parse_json",
+    description: "Parse JSON and optionally extract a value by dot-path (e.g. data.results.0.title).",
+    parameters: {
+      type: "object",
+      properties: {
+        content: { type: "string" },
+        path: { type: "string" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "parse_csv",
+    description: "Parse CSV content into structured rows. First row is used as headers.",
+    parameters: {
+      type: "object",
+      properties: {
+        content: { type: "string" },
+        delimiter: { type: "string" },
+        max_rows: { type: "number" },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "summarize_artifact",
+    description: "Read an artifact file and produce a truncated summary.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        max_chars: { type: "number" },
+      },
+      required: ["path"],
+    },
   },
 ];
 
@@ -397,6 +461,130 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     const output = ((result.stdout || "") + (result.stderr || "")).trim();
     const ok = result.status === 0;
     return { ok, summary: ok ? `git ${sub} ok` : `git ${sub} failed`, rawResult: output, error: ok ? undefined : (result.stderr || "").trim() };
+  }
+
+  if (name === "http_request") {
+    const url = typeof args.url === "string" ? args.url.trim() : "";
+    if (!url) return { ok: false, summary: "http_request requires url.", rawResult: "", error: "url required" };
+    const method = typeof args.method === "string" ? args.method.trim().toUpperCase() : "GET";
+    const headers = args.headers && typeof args.headers === "object" ? args.headers as Record<string, string> : undefined;
+    const body = typeof args.body === "string" ? args.body : undefined;
+    const timeoutMs = typeof args.timeout_ms === "number" ? args.timeout_ms : 15_000;
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers: { "User-Agent": "dual-agent-orchestrator", ...headers },
+        body: method !== "GET" && method !== "HEAD" ? body : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "follow",
+      });
+      const respBody = await resp.text();
+      const respHeaders: Record<string, string> = {};
+      resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+      const result = { status: resp.status, headers: respHeaders, body: respBody.slice(0, 32_000) };
+      const raw = JSON.stringify(result, null, 2);
+      const outPath = saveJsonArtifact("http-response", result);
+      return {
+        ok: resp.ok,
+        summary: `HTTP ${method} ${url} -> ${resp.status}`,
+        artifact: { type: "json", path: outPath, content_preview: raw.slice(0, 200) },
+        rawResult: raw,
+        error: resp.ok ? undefined : `HTTP ${resp.status}: ${resp.statusText}`,
+      };
+    } catch (e) {
+      return { ok: false, summary: `HTTP ${method} ${url} failed`, rawResult: "", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  if (name === "extract_text") {
+    const content = typeof args.content === "string" ? args.content : "";
+    if (!content) return { ok: false, summary: "extract_text requires content.", rawResult: "", error: "content required" };
+    const format = typeof args.format === "string" ? args.format : "auto";
+    let text = content;
+    if (format === "html" || (format === "auto" && /<html|<body|<div/i.test(content.slice(0, 500)))) {
+      text = content
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<\/li>/gi, "\n")
+        .replace(/<\/h[1-6]>/gi, "\n")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, " ")
+        .replace(/ \n/g, "\n")
+        .trim();
+    }
+    return { ok: true, summary: `Extracted ${text.length} chars`, rawResult: text };
+  }
+
+  if (name === "parse_json") {
+    const content = typeof args.content === "string" ? args.content : "";
+    if (!content) return { ok: false, summary: "parse_json requires content.", rawResult: "", error: "content required" };
+    try {
+      let value: unknown = JSON.parse(content);
+      const path = typeof args.path === "string" ? args.path.trim() : "";
+      if (path) {
+        for (const segment of path.split(".")) {
+          if (value == null || typeof value !== "object") {
+            return { ok: false, summary: `Path segment "${segment}" not found.`, rawResult: "", error: `Cannot traverse "${segment}" on non-object` };
+          }
+          const idx = Number(segment);
+          if (Number.isInteger(idx) && Array.isArray(value)) {
+            value = (value as unknown[])[idx];
+          } else {
+            value = (value as Record<string, unknown>)[segment];
+          }
+        }
+      }
+      const raw = JSON.stringify(value, null, 2);
+      return { ok: true, summary: `Parsed JSON${path ? ` at "${path}"` : ""}`, rawResult: raw };
+    } catch (e) {
+      return { ok: false, summary: "Invalid JSON", rawResult: "", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  if (name === "parse_csv") {
+    const content = typeof args.content === "string" ? args.content : "";
+    if (!content) return { ok: false, summary: "parse_csv requires content.", rawResult: "", error: "content required" };
+    const delimiter = typeof args.delimiter === "string" && args.delimiter ? args.delimiter : ",";
+    const maxRows = typeof args.max_rows === "number" ? args.max_rows : 100;
+    const lines = content.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length === 0) return { ok: false, summary: "Empty CSV", rawResult: "[]", error: "No rows found" };
+    const headers = lines[0]!.split(delimiter).map((h) => h.trim().replace(/^"|"$/g, ""));
+    const rows: Record<string, string>[] = [];
+    for (let i = 1; i < lines.length && rows.length < maxRows; i++) {
+      const cells = lines[i]!.split(delimiter).map((c) => c.trim().replace(/^"|"$/g, ""));
+      const row: Record<string, string> = {};
+      for (let j = 0; j < headers.length; j++) {
+        row[headers[j]!] = cells[j] ?? "";
+      }
+      rows.push(row);
+    }
+    const raw = JSON.stringify(rows, null, 2);
+    return { ok: true, summary: `Parsed ${rows.length} rows with ${headers.length} columns`, rawResult: raw };
+  }
+
+  if (name === "summarize_artifact") {
+    const path = safePath(args.path);
+    const maxChars = typeof args.max_chars === "number" ? args.max_chars : 2000;
+    try {
+      const content = readFileSync(path, "utf8");
+      const summary = content.slice(0, maxChars);
+      return {
+        ok: true,
+        summary: `Read ${content.length} chars, summarized to ${summary.length}`,
+        artifact: { type: "file", path, content_preview: summary.slice(0, 200) },
+        rawResult: summary,
+      };
+    } catch (e) {
+      return { ok: false, summary: `Failed to read: ${path}`, rawResult: "", error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   return {

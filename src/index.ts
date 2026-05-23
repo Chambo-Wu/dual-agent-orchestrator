@@ -14,8 +14,10 @@ import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
-import { listStoredJobs, persistJobRecord, readJobRecord, updateJobControlState, type StoredJobRecord } from "./job-store.js";
-import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, unregisterActiveJobSession } from "./job-runtime.js";
+import { runVerifiers, verificationPassed, type VerificationContext } from "./verification.js";
+import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
+import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, type StoredJobRecord } from "./job-store.js";
+import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
@@ -1154,6 +1156,23 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
     }
 
     const content = result.output || "";
+
+    // Run system-level verification
+    const verificationContext: VerificationContext = {
+      jobId,
+      goal: userGoal,
+      executorHistory: result.executorHistory,
+      artifacts: result.artifacts,
+      taskRuns: result.taskRuns,
+      workspaceRoot: WORKSPACE_ROOT,
+      runtimeRoot: RUNTIME_ROOT,
+    };
+    const verificationResults = await runVerifiers(verificationContext);
+    const allPassed = verificationPassed(verificationResults);
+    if (!allPassed) {
+      result.job = { ...result.job, verified: false };
+    }
+
     const jobRecordPath = persistWorkflowPayload({
       job: result.job,
       plan: result.plan,
@@ -1446,6 +1465,99 @@ async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId:
     taskRuns: retryResult.taskRuns,
     artifacts: retryResult.artifacts,
     control: retriedRecord?.control ?? { retryOf: jobId },
+  });
+}
+
+async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const body = await readJsonBody<{ approval_id?: string; decision?: string; note?: string }>(req);
+  if (!body.approval_id || !body.decision) {
+    jsonResponse(res, 400, {
+      error: {
+        message: "approval_id and decision are required.",
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+  if (body.decision !== "approved" && body.decision !== "denied") {
+    jsonResponse(res, 400, {
+      error: {
+        message: 'decision must be "approved" or "denied".',
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: { message: `Job not found: ${jobId}`, type: "not_found_error" },
+    });
+    return;
+  }
+
+  const updated = resolveApprovalRequest(jobId, body.approval_id, body.decision, body.note);
+  if (!updated) {
+    jsonResponse(res, 400, {
+      error: { message: `Approval not found: ${body.approval_id}`, type: "invalid_request_error" },
+    });
+    return;
+  }
+
+  const signaled = resolvePendingApproval(jobId, body.decision);
+
+  jsonResponse(res, 200, {
+    ok: true,
+    job_id: jobId,
+    approval_id: body.approval_id,
+    decision: body.decision,
+    signaled,
+    control: updated.control ?? {},
+  });
+}
+
+async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: { message: `Job not found: ${jobId}`, type: "not_found_error" },
+    });
+    return;
+  }
+
+  if (record.job.status === "completed") {
+    jsonResponse(res, 400, {
+      error: { message: "Cannot resume a completed job.", type: "invalid_request_error" },
+    });
+    return;
+  }
+
+  const active = getActiveJobSession(jobId);
+  if (active) {
+    jsonResponse(res, 409, {
+      error: { message: "Job is currently running.", type: "conflict_error" },
+    });
+    return;
+  }
+
+  const resumeResult = await executeTaskGoal(record.job.goal, undefined, false);
+  updateJobControlState(jobId, {
+    resumedAt: new Date().toISOString(),
+    resumedToJobId: resumeResult.job.id,
+  });
+  const resumedRecord = updateJobControlState(resumeResult.job.id, {
+    resumeOf: jobId,
+  });
+
+  jsonResponse(res, 200, {
+    ok: true,
+    resumed_from: jobId,
+    job: resumeResult.job,
+    plan: resumeResult.plan,
+    taskRuns: resumeResult.taskRuns,
+    artifacts: resumeResult.artifacts,
+    control: resumedRecord?.control ?? { resumeOf: jobId },
   });
 }
 
@@ -1928,6 +2040,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const jobRetryMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/retry$/);
     if (method === "POST" && jobRetryMatch) {
       await handleRetryJob(req, res, decodeURIComponent(jobRetryMatch[1]!));
+      return;
+    }
+
+    const jobApproveMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/approve$/);
+    if (method === "POST" && jobApproveMatch) {
+      await handleApproveJob(req, res, decodeURIComponent(jobApproveMatch[1]!));
+      return;
+    }
+
+    const jobResumeMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/resume$/);
+    if (method === "POST" && jobResumeMatch) {
+      await handleResumeJob(req, res, decodeURIComponent(jobResumeMatch[1]!));
       return;
     }
 

@@ -3,6 +3,7 @@ type ActiveJobSession = {
   goal: string;
   startedAt: string;
   controller: AbortController;
+  approvalResolver?: (decision: "approved" | "denied") => void;
 };
 
 const activeSessions = new Map<string, ActiveJobSession>();
@@ -33,4 +34,18 @@ export function cancelActiveJobSession(jobId: string, reason = "Run cancelled by
 
 export function unregisterActiveJobSession(jobId: string): void {
   activeSessions.delete(jobId);
+}
+
+export function resolvePendingApproval(jobId: string, decision: "approved" | "denied"): boolean {
+  const session = activeSessions.get(jobId);
+  if (!session?.approvalResolver) return false;
+  session.approvalResolver(decision);
+  return true;
+}
+
+export function setApprovalResolver(jobId: string, resolver: (decision: "approved" | "denied") => void): boolean {
+  const session = activeSessions.get(jobId);
+  if (!session) return false;
+  session.approvalResolver = resolver;
+  return true;
 }
