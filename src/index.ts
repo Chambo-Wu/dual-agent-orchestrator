@@ -9,7 +9,7 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEventCallback, Plan, TaskRun } from "./types.js";
+import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, TaskRun } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
@@ -75,6 +75,7 @@ interface ChatCompletionRequest {
   messages?: OpenAIMessage[];
   stream?: boolean;
   include_workflow_events?: boolean;
+  include_progress_updates?: boolean;
   tools?: unknown[];
   tool_choice?: unknown;
   temperature?: number;
@@ -353,6 +354,10 @@ function shouldIncludeWorkflowEvents(req: IncomingMessage, requested?: boolean):
   }
   return isTruthyFlag(getHeaderValue(req, "x-dual-agent-workflow-events"))
     || isTruthyFlag(getHeaderValue(req, "x-workflow-events"));
+}
+
+function shouldMirrorProgressToContent(requested?: boolean): boolean {
+  return requested !== false;
 }
 
 function isAuthorized(req: IncomingMessage): boolean {
@@ -1237,6 +1242,42 @@ function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id:
   });
 }
 
+function formatProgressUpdate(event: OrchestratorEvent): string | null {
+  switch (event.type) {
+    case "workflow.step.start":
+      return `\n[Progress] Planner started step ${event.step ?? 1}.\n`;
+    case "workflow.planner.decision": {
+      const summary = typeof event.data.reasoning_summary === "string" && event.data.reasoning_summary.trim()
+        ? event.data.reasoning_summary.trim()
+        : typeof event.data.next_step === "string"
+          ? event.data.next_step.trim()
+          : "";
+      return summary ? `\n[Progress] Planner: ${summary}\n` : null;
+    }
+    case "workflow.executor.start": {
+      const instruction = typeof event.data.instruction === "string" ? event.data.instruction.trim() : "";
+      return instruction ? `\n[Progress] Executor: ${truncateToolResultContent(instruction)}\n` : "\n[Progress] Executor started working.\n";
+    }
+    case "workflow.executor.result": {
+      const summary = typeof event.data.summary === "string" ? event.data.summary.trim() : "";
+      return summary ? `\n[Progress] Executor result: ${summary}\n` : null;
+    }
+    case "workflow.tool.start": {
+      const tool = typeof event.data.tool === "string" ? event.data.tool : "tool";
+      return `\n[Progress] Calling ${tool}.\n`;
+    }
+    case "workflow.tool.result": {
+      const tool = typeof event.data.tool === "string" ? event.data.tool : "tool";
+      const summary = typeof event.data.summary === "string" ? event.data.summary.trim() : "";
+      return summary
+        ? `\n[Progress] ${tool}: ${summary}\n`
+        : `\n[Progress] ${tool} returned.\n`;
+    }
+    default:
+      return null;
+  }
+}
+
 function sseWrite(res: ServerResponse, payload: string): void {
   res.write(`data: ${payload}\n\n`);
 }
@@ -2104,6 +2145,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const body = await readJsonBody<ChatCompletionRequest>(req);
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
+  const mirrorProgressToContent = body.stream && !toolMode && shouldMirrorProgressToContent(body.include_progress_updates);
 
   if (toolMode) {
     if (extractLatestOpenAIWriteToolCompletion(body.messages)) {
@@ -2191,12 +2233,33 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
           }
         }
       : undefined;
+    let emittedProgressChunks = false;
+    const emitProgressChunk = (event: OrchestratorEvent) => {
+      if (!mirrorProgressToContent) {
+        return;
+      }
+      const progressText = formatProgressUpdate(event);
+      if (!progressText) {
+        return;
+      }
+      emittedProgressChunks = true;
+      for (const chunk of splitContentForStreaming(progressText)) {
+        sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { content: chunk }, null));
+      }
+    };
+    const combinedOnEvent: OrchestratorEventCallback | undefined = (event) => {
+      emitProgressChunk(event);
+      onEvent?.(event);
+    };
 
     try {
-      const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model, onEvent);
+      const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model, combinedOnEvent);
       const requestedModel = resultForModel.resolvedModel;
       const workflow = buildWorkflowPayload(resultForModel);
 
+      if (mirrorProgressToContent && emittedProgressChunks) {
+        sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: "\n[Final Answer]\n" }, null));
+      }
       const chunks = splitContentForStreaming(resultForModel.content);
       for (const chunk of chunks) {
         sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: chunk }, null));

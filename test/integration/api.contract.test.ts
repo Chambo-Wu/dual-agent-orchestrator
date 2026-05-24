@@ -120,3 +120,95 @@ test("chat completions stream omits workflow SSE events by default", async () =>
     __testables.setTaskExecutorForTests(null);
   }
 });
+
+test("chat completions stream mirrors planner and executor progress into text deltas", async () => {
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_stream_progress",
+    title: "Primary Task",
+    description: "Research progress",
+    status: "completed",
+    verified: true,
+    output: "Final synthesized answer.",
+    attempts: 1,
+    artifacts: [],
+  });
+  const plan = createPlanRecord({
+    id: "plan_stream_progress",
+    goal: "Research progress",
+    mode: "task",
+    taskRunIds: [taskRun.id],
+  });
+  const job = createJobRecord({
+    id: "job_stream_progress",
+    goal: "Research progress",
+    mode: "task",
+    status: "completed",
+    verified: true,
+    output: "Final synthesized answer.",
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  });
+
+  __testables.setTaskExecutorForTests(async (_goal, _model, _requirePlannerCircuit, context) => {
+    context?.emitEvent?.({
+      type: "workflow.step.start",
+      step: 1,
+      data: { replan_count: 0 },
+    });
+    context?.emitEvent?.({
+      type: "workflow.planner.decision",
+      step: 1,
+      data: {
+        status: "need_executor",
+        reasoning_summary: "Gather evidence from the web before writing the final summary.",
+        next_step: "Run web search",
+        verdict: "not_applicable",
+      },
+    });
+    context?.emitEvent?.({
+      type: "workflow.executor.result",
+      step: 1,
+      data: {
+        status: "success",
+        summary: "Collected 3 useful artifacts.",
+        artifact_count: 3,
+      },
+    });
+    return {
+      content: "Final synthesized answer.",
+      logPath: "runtime/logs/test-progress.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const req = buildAuthorizedJsonRequest("/v1/chat/completions", {
+      model: "dual-agent-orchestrator",
+      stream: true,
+      messages: [{ role: "user", content: "Show me progress" }],
+    });
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+
+    await __testables.handleRequest(req, res);
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.includes("\"content\":\"[Progress] \""), true);
+    assert.equal(res.body.includes("\"content\":\"Planner \""), true);
+    assert.equal(res.body.includes("\"content\":\"started \""), true);
+    assert.equal(res.body.includes("\"content\":\"Executor \""), true);
+    assert.equal(res.body.includes("\"content\":\"result: \""), true);
+    assert.equal(res.body.includes("\"content\":\"artifacts.\""), true);
+    assert.equal(res.body.includes("[Final Answer]"), true);
+    assert.equal(res.body.includes("\"content\":\"Final \""), true);
+    assert.equal(res.body.includes("\"content\":\"synthesized \""), true);
+    assert.equal(res.body.includes("\"content\":\"answer.\""), true);
+    assert.equal(res.body.includes("event: workflow."), false);
+  } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
