@@ -272,3 +272,8 @@ For custom apps:
 - subscribe to `/v1/jobs/:id/stream`
 - fetch `/v1/jobs/:id/events` for replay or refresh
 - open `/v1/jobs/:id/timeline` for a built-in visualization
+
+## Acknowledgments
+
+- [Linux.do](https://linux.do/) — Where possible begins
+- [Xiaomi MiMo Orbit](https://100t.xiaomimimo.com/) — 百万亿Token 创造者激励计划

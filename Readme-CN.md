@@ -293,3 +293,8 @@ npm run test:e2e-lite
 - 订阅 `/v1/jobs/:id/stream`
 - 刷新时读 `/v1/jobs/:id/events`
 - 需要可视化时直接打开 `/v1/jobs/:id/timeline`
+
+## 致谢
+
+- [Linux.do](https://linux.do/) — Where possible begins
+- [Xiaomi MiMo Orbit](https://100t.xiaomimimo.com/) — 百万亿Token 创造者激励计划
