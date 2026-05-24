@@ -70,10 +70,10 @@ export function parseExecutorOutput(rawText: string): ExecutorOutput {
 
   return {
     status: "failed",
-    summary: "Executor did not return valid JSON.",
+    summary: "AI 返回的格式异常，请重试或更换模型",
     tool_calls_made: [],
     artifacts: [],
     raw_result: rawText,
-    error: "Unable to parse executor output as JSON",
+    error: "Unable to parse executor output as JSON. The model may have returned mixed text and JSON.",
   };
 }

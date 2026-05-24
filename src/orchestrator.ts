@@ -660,8 +660,9 @@ function finalizeExecutorResult(
   const usedNativeToolCalls = conversation.executedCalls.length > 0;
   const usefulProgress = hasUsefulExecutorProgress(conversation);
   const parsed = parseExecutorOutput(rawExecutorText);
-  const modelReturnedStructuredJson = parsed.summary !== "Executor did not return valid JSON."
-    || parsed.error !== "Unable to parse executor output as JSON";
+  const isFormatError = parsed.summary === "AI 返回的格式异常，请重试或更换模型"
+    || parsed.error?.startsWith("Unable to parse executor output as JSON");
+  const modelReturnedStructuredJson = !isFormatError;
   const honorModelTerminalAssessment = usedNativeToolCalls
     && modelReturnedStructuredJson
     && (parsed.status === "failed" || parsed.status === "blocked");
@@ -671,7 +672,7 @@ function finalizeExecutorResult(
     ? parsed.summary
     : usedNativeToolCalls
       ? (conversation.lastSummary || parsed.summary)
-    : parsed.summary !== "Executor did not return valid JSON."
+    : !isFormatError
       ? parsed.summary
       : (conversation.lastSummary || parsed.summary);
   const rawResult = honorModelTerminalAssessment

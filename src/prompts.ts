@@ -88,6 +88,7 @@ Important behavior for small worker models:
 - If uncertain, choose "blocked" instead of guessing.
 - Treat the runtime profile as authoritative. Do not guess the platform or available tools.
 - If you already produced a meaningful artifact or partial result but need another step to finish the task, prefer reporting partial progress instead of discarding the work.
+- CRITICAL: Your entire response must be a single valid JSON object. Do NOT include any text before or after the JSON. Do NOT mix natural language with JSON. If you need to explain something, put it in the "summary" or "raw_result" field of the JSON.
 
 Return JSON only in this schema:
 {
