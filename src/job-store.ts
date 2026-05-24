@@ -104,6 +104,19 @@ export function updateJobControlState(jobId: string, update: Partial<JobControlS
   return next;
 }
 
+export function updateStoredJobRecord(
+  jobId: string,
+  updater: (record: StoredJobRecord) => StoredJobRecord,
+): StoredJobRecord | null {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    return null;
+  }
+  const next = updater(record);
+  writeFileSync(jobRecordPath(jobId), JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
 export function persistApprovalRequest(jobId: string, request: ApprovalRequest): StoredJobRecord | null {
   const record = readJobRecord(jobId);
   if (!record) return null;

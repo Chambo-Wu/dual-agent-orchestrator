@@ -16,7 +16,7 @@ import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./
 import { Tracer } from "./trace.js";
 import { runVerifiers, verificationPassed, type VerificationContext } from "./verification.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
-import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, type StoredJobRecord } from "./job-store.js";
+import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, updateStoredJobRecord, type StoredJobRecord } from "./job-store.js";
 import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
@@ -168,6 +168,12 @@ interface TaskExecutionContext {
   taskRunId: string;
   signal: AbortSignal;
   emitEvent?: OrchestratorEventCallback;
+}
+
+interface FixedTaskIds {
+  jobId: string;
+  planId: string;
+  taskRunId: string;
 }
 
 let injectedTaskExecutor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null = null;
@@ -945,13 +951,22 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
     }));
   }
 
+  const stateSummary = record.job.status === "running"
+    ? "Job is currently running."
+    : record.job.status === "queued"
+      ? "Job is queued."
+      : record.job.status === "awaiting_approval"
+        ? "Job is waiting for approval."
+        : record.job.status === "cancelled"
+          ? "Job was cancelled."
+          : `Job finished with status ${record.job.status}.`;
   push(createLifecycleEvent({
     jobId: record.job.id,
     seq,
     time: record.savedAt,
     type: mapJobFinalType(record.job.status),
     title: "Job state recorded",
-    summary: `Job finished with status ${record.job.status}.`,
+    summary: stateSummary,
     status: mapJobStatus(record.job.status),
     meta: {
       verified: record.job.verified,
@@ -1009,10 +1024,17 @@ function mapExecutorHistoryType(status: ExecutorOutput["status"]): string {
 
 function mapJobStatus(status: Job["status"]): WorkflowUiEvent["status"] {
   switch (status) {
+    case "queued":
+    case "running":
+      return "running";
+    case "awaiting_approval":
+      return "awaiting_approval";
     case "completed":
       return "completed";
     case "failed":
       return "failed";
+    case "cancelled":
+      return "blocked";
     case "blocked":
     default:
       return "blocked";
@@ -1021,10 +1043,18 @@ function mapJobStatus(status: Job["status"]): WorkflowUiEvent["status"] {
 
 function mapJobFinalType(status: Job["status"]): string {
   switch (status) {
+    case "queued":
+      return "job.queued";
+    case "running":
+      return "job.started";
+    case "awaiting_approval":
+      return "job.awaiting_approval";
     case "completed":
       return "job.completed";
     case "failed":
       return "job.failed";
+    case "cancelled":
+      return "job.cancelled";
     case "blocked":
     default:
       return "job.blocked";
@@ -1284,10 +1314,16 @@ function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
   });
 }
 
-async function executeTaskGoal(userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
-  const jobId = `job_${randomUUID()}`;
-  const planId = `plan_${randomUUID()}`;
-  const taskRunId = `taskrun_${randomUUID()}`;
+async function executeTaskGoal(
+  userGoal: string,
+  model: string | undefined,
+  requirePlannerCircuit: boolean,
+  onEvent?: OrchestratorEventCallback,
+  fixedIds?: FixedTaskIds,
+): Promise<TaskExecutionPayload> {
+  const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
+  const planId = fixedIds?.planId ?? `plan_${randomUUID()}`;
+  const taskRunId = fixedIds?.taskRunId ?? `taskrun_${randomUUID()}`;
   const abortController = new AbortController();
   const emitUiEvent = (event: WorkflowUiEvent) => {
     appendEvent(event);
@@ -1339,7 +1375,7 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
     id: jobId,
     goal: userGoal,
     mode: "task",
-    status: "blocked",
+    status: "running",
     verified: false,
     output: "Running...",
     plan: pendingPlan,
@@ -1459,9 +1495,31 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    emitLifecycle("job.failed", "Job failed", truncateToolResultContent(message || "Job failed."), "failed", {
-      error: message,
-    }, "final");
+    const cancelledRecord = readJobRecord(jobId);
+    const wasCancelled = Boolean(cancelledRecord?.control?.cancelledAt);
+    updateStoredJobRecord(jobId, (record) => ({
+      ...record,
+      savedAt: new Date().toISOString(),
+      job: {
+        ...record.job,
+        status: record.control?.cancelledAt ? "cancelled" : "failed",
+        verified: false,
+        output: message,
+      },
+      taskRuns: record.taskRuns.map((taskRun) => ({
+        ...taskRun,
+        status: record.control?.cancelledAt ? "blocked" : "failed",
+        output: taskRun.output || message,
+      })),
+    }));
+    emitLifecycle(
+      wasCancelled ? "job.cancelled" : "job.failed",
+      wasCancelled ? "Job cancelled" : "Job failed",
+      truncateToolResultContent(message || (wasCancelled ? "Job cancelled." : "Job failed.")),
+      wasCancelled ? "blocked" : "failed",
+      { error: message },
+      "final",
+    );
     throw error;
   } finally {
     unregisterActiveJobSession(jobId);
@@ -1562,19 +1620,42 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
+  const modelRoute = typeof body.model_route === "string" && body.model_route.trim()
+    ? body.model_route.trim()
+    : undefined;
   if (body.policy?.async === true) {
-    jsonResponse(res, 400, {
-      error: {
-        message: "Asynchronous job creation is not available yet; omit policy.async or set it to false.",
-        type: "invalid_request_error",
-      },
+    const fixedIds: FixedTaskIds = {
+      jobId: `job_${randomUUID()}`,
+      planId: `plan_${randomUUID()}`,
+      taskRunId: `taskrun_${randomUUID()}`,
+    };
+    void executeTaskGoal(goal, modelRoute, true, undefined, fixedIds).catch(() => {
+      // Failure state is already persisted inside executeTaskGoal.
+    });
+    const record = readJobRecord(fixedIds.jobId);
+
+    jsonResponse(res, 202, {
+      object: "job",
+      job_id: fixedIds.jobId,
+      status: record?.job.status ?? "running",
+      accepted: true,
+      stream_url: `/v1/jobs/${fixedIds.jobId}/stream`,
+      events_url: `/v1/jobs/${fixedIds.jobId}/events`,
+      timeline_url: `/v1/jobs/${fixedIds.jobId}/timeline`,
+      ...(record ? buildJobResponse(record) as Record<string, unknown> : {
+        job: {
+          id: fixedIds.jobId,
+          goal,
+          mode: "task",
+          status: "running",
+          verified: false,
+          output: "Running...",
+        },
+      }),
     });
     return;
   }
 
-  const modelRoute = typeof body.model_route === "string" && body.model_route.trim()
-    ? body.model_route.trim()
-    : undefined;
   const result = await executeTaskGoal(goal, modelRoute, true);
   const record = readJobRecord(result.job.id);
 
@@ -1777,10 +1858,21 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
 async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const active = getActiveJobSession(jobId);
   const interrupted = cancelActiveJobSession(jobId, `Run cancelled via API for job ${jobId}.`);
-  const updated = updateJobControlState(jobId, {
-    cancellationRequestedAt: new Date().toISOString(),
-    cancelledAt: new Date().toISOString(),
-  });
+  const cancelledAt = new Date().toISOString();
+  const updated = updateStoredJobRecord(jobId, (record) => ({
+    ...record,
+    savedAt: cancelledAt,
+    job: {
+      ...record.job,
+      status: "cancelled",
+      output: "Run cancelled.",
+    },
+    control: {
+      ...record.control,
+      cancellationRequestedAt: cancelledAt,
+      cancelledAt,
+    },
+  }));
   if (!updated) {
     jsonResponse(res, 404, {
       error: {

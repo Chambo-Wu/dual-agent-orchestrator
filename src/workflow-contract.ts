@@ -5,6 +5,23 @@ function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
 
+function mapJobStatusToTaskRunStatus(status: JobStatus): TaskRunStatus {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "blocked":
+    case "cancelled":
+      return "blocked";
+    case "queued":
+    case "running":
+    case "awaiting_approval":
+    default:
+      return "pending";
+  }
+}
+
 function mapExecutorArtifact(artifact: ExecutorArtifact, sourceTaskRunId?: string): Artifact {
   return {
     id: createId("artifact"),
@@ -110,7 +127,7 @@ export function buildSingleTaskContract(params: {
     id: taskRunId,
     title: params.title ?? params.goal,
     description: params.description ?? params.goal,
-    status: params.status,
+    status: mapJobStatusToTaskRunStatus(params.status),
     assignee: params.assignee,
     verified: params.verified,
     output: params.output,

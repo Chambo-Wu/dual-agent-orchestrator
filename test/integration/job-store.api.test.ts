@@ -295,6 +295,122 @@ test("job create endpoint runs task mode through the control plane", async () =>
   }
 });
 
+test("job create endpoint supports async start for realtime clients", async () => {
+  __testables.setTaskExecutorForTests(async (goal, model, requirePlannerCircuit, context) => {
+    assert.equal(goal, "Create an async control-plane job");
+    assert.equal(model, "dual-agent-orchestrator");
+    assert.equal(requirePlannerCircuit, true);
+    context?.emitEvent?.({
+      type: "workflow.step.start",
+      step: 1,
+      data: { replan_count: 0 },
+    });
+    context?.emitEvent?.({
+      type: "workflow.planner.decision",
+      step: 1,
+      data: {
+        status: "need_executor",
+        reasoning_summary: "Search first, then summarize.",
+        next_step: "Run web search",
+        verdict: "not_applicable",
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const taskRun = createTaskRunRecord({
+      id: context?.taskRunId,
+      title: "Async Job Task",
+      description: goal,
+      status: "completed",
+      verified: true,
+      output: "async job done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "task",
+      taskRunIds: [taskRun.id],
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "task",
+      status: "completed",
+      verified: true,
+      output: "async job done",
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    });
+    return {
+      content: "async job done",
+      logPath: "runtime/logs/create-job-async.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Create an async control-plane job",
+      mode: "task",
+      model_route: "dual-agent-orchestrator",
+      policy: {
+        async: true,
+      },
+    }), res);
+    const body = JSON.parse(res.body) as {
+      object: string;
+      job_id: string;
+      status: string;
+      accepted: boolean;
+      stream_url: string;
+      events_url: string;
+      timeline_url: string;
+      job: { id: string; status: string };
+    };
+
+    assert.equal(res.statusCode, 202);
+    assert.equal(body.object, "job");
+    assert.equal(body.accepted, true);
+    assert.equal(body.job.status, "running");
+    assert.equal(body.stream_url, `/v1/jobs/${body.job_id}/stream`);
+    assert.equal(body.events_url, `/v1/jobs/${body.job_id}/events`);
+    assert.equal(body.timeline_url, `/v1/jobs/${body.job_id}/timeline`);
+
+    const streamRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(body.stream_url), streamRes);
+    assert.equal(streamRes.statusCode, 200);
+    assert.equal(streamRes.body.includes("event: job.snapshot"), true);
+    assert.equal(streamRes.body.includes("\"type\":\"job.created\""), true);
+    streamRes.end();
+
+    let completedRecord = readJobRecord(body.job_id);
+    for (let i = 0; i < 30 && completedRecord?.job.status !== "completed"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      completedRecord = readJobRecord(body.job_id);
+    }
+
+    assert.equal(completedRecord?.job.status, "completed");
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(body.events_url), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as {
+      events: Array<{ type: string }>;
+    };
+    assert.equal(eventsBody.events.some((event) => event.type === "planner.start"), true);
+    assert.equal(eventsBody.events.some((event) => event.type === "planner.decision"), true);
+  } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
+
 test("job runtime profile endpoint exposes platform and tool capabilities", async () => {
   const okRes = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/runtime-profile"), okRes);

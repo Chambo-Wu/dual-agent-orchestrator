@@ -143,7 +143,7 @@ export interface ExecutorOutput {
 }
 
 export type JobMode = "task" | "team";
-export type JobStatus = "completed" | "failed" | "blocked";
+export type JobStatus = "queued" | "running" | "awaiting_approval" | "completed" | "failed" | "blocked" | "cancelled";
 export type TaskRunStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
 
 export interface ApprovalRequest {
@@ -228,11 +228,20 @@ export interface ModelResponse {
   raw: unknown;
 }
 
+export interface OrchestratorEvent {
+  type: string;
+  step?: number;
+  data: Record<string, unknown>;
+}
+
+export type OrchestratorEventCallback = (event: OrchestratorEvent) => void;
+
 export interface RunOptions {
   abortSignal?: AbortSignal;
   jobId?: string;
   planId?: string;
   taskRunId?: string;
+  onEvent?: OrchestratorEventCallback;
 }
 
 // ---------------------------------------------------------------------------
