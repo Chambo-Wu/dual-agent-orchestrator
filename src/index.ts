@@ -9,7 +9,7 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, Plan, TaskRun } from "./types.js";
+import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEventCallback, Plan, TaskRun } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
@@ -71,6 +71,7 @@ interface ChatCompletionRequest {
   model?: string;
   messages?: OpenAIMessage[];
   stream?: boolean;
+  include_workflow_events?: boolean;
   tools?: unknown[];
   tool_choice?: unknown;
   temperature?: number;
@@ -102,6 +103,7 @@ interface ResponsesRequest {
   input?: string | ResponseInputItem[];
   instructions?: string;
   stream?: boolean;
+  include_workflow_events?: boolean;
 }
 
 interface AnthropicContentBlock {
@@ -124,6 +126,7 @@ interface AnthropicMessagesRequest {
   system?: string | AnthropicContentBlock[];
   messages?: AnthropicMessage[];
   stream?: boolean;
+  include_workflow_events?: boolean;
   tools?: Array<{ name?: string; description?: string; input_schema?: Record<string, unknown> }>;
   tool_choice?: unknown;
   max_tokens?: number;
@@ -328,6 +331,18 @@ function getHeaderValue(req: IncomingMessage, name: string): string {
     return raw[0] ?? "";
   }
   return raw ?? "";
+}
+
+function isTruthyFlag(value: string | undefined): boolean {
+  return typeof value === "string" && /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+function shouldIncludeWorkflowEvents(req: IncomingMessage, requested?: boolean): boolean {
+  if (requested === true) {
+    return true;
+  }
+  return isTruthyFlag(getHeaderValue(req, "x-dual-agent-workflow-events"))
+    || isTruthyFlag(getHeaderValue(req, "x-workflow-events"));
 }
 
 function isAuthorized(req: IncomingMessage): boolean {
@@ -1005,6 +1020,10 @@ function sseWrite(res: ServerResponse, payload: string): void {
   res.write(`data: ${payload}\n\n`);
 }
 
+function sseWriteEvent(res: ServerResponse, eventName: string, payload: string): void {
+  res.write(`event: ${eventName}\ndata: ${payload}\n\n`);
+}
+
 function normalizeIncomingTools(tools: unknown): typeof TOOL_DEFINITIONS {
   if (!Array.isArray(tools) || tools.length === 0) {
     return TOOL_DEFINITIONS;
@@ -1074,7 +1093,7 @@ function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
   });
 }
 
-async function executeTaskGoal(userGoal: string, model: string | undefined, requirePlannerCircuit: boolean): Promise<TaskExecutionPayload> {
+async function executeTaskGoal(userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
   const jobId = `job_${randomUUID()}`;
   const planId = `plan_${randomUUID()}`;
   const taskRunId = `taskrun_${randomUUID()}`;
@@ -1144,6 +1163,7 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
         jobId,
         planId,
         taskRunId,
+        onEvent,
       });
       if (requirePlannerCircuit) {
         markPlannerSuccess();
@@ -1210,7 +1230,7 @@ async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExec
   return executeTaskGoal(userGoal, body.model, false);
 }
 
-async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined): Promise<TaskExecutionPayload> {
+async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
   }
@@ -1221,7 +1241,7 @@ async function runTaskFromMessages(messages: OpenAIMessage[], model: string | un
     throw new Error("Unable to derive a user goal from the provided messages.");
   }
 
-  return executeTaskGoal(userGoal, model, true);
+  return executeTaskGoal(userGoal, model, true, onEvent);
 }
 
 async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown, requestOverrides?: import("./providers/openai-compatible.js").CompletionOverrides): Promise<{
@@ -1564,6 +1584,7 @@ async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId
 async function handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<ChatCompletionRequest>(req);
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
+  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
 
   if (toolMode) {
     if (extractLatestOpenAIWriteToolCompletion(body.messages)) {
@@ -1611,62 +1632,86 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
       }
       sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, {}, "stop"));
     }
-    sseWrite(res, buildWorkflowEvent("workflow.completed", {
-      job: null,
-      plan: null,
-      taskRuns: [],
-      artifacts: [],
-    }, {
-      mode: "tool",
-      model: toolResult.resolvedModel,
-      toolCalls: toolResult.toolCalls,
-      content: toolResult.content,
-    }));
+    if (includeWorkflowEvents) {
+      sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", {
+        job: null,
+        plan: null,
+        taskRuns: [],
+        artifacts: [],
+      }, {
+        mode: "tool",
+        model: toolResult.resolvedModel,
+        toolCalls: toolResult.toolCalls,
+        content: toolResult.content,
+      }));
+    }
     res.end("data: [DONE]\n\n");
     return;
   }
 
+  // For streaming, set up SSE headers first so events can be sent in real-time
+  if (body.stream) {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    const streamId = `chatcmpl-${Date.now()}`;
+    sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { role: "assistant", content: "" }, null));
+
+    // Create callback to forward orchestrator events to SSE
+    const onEvent: OrchestratorEventCallback | undefined = includeWorkflowEvents
+      ? (event) => {
+          try {
+            sseWriteEvent(res, event.type, JSON.stringify({
+              type: event.type,
+              step: event.step,
+              ...event.data,
+            }));
+          } catch {
+            // Ignore write errors (client may have disconnected)
+          }
+        }
+      : undefined;
+
+    try {
+      const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model, onEvent);
+      const requestedModel = resultForModel.resolvedModel;
+      const workflow = buildWorkflowPayload(resultForModel);
+
+      const chunks = splitContentForStreaming(resultForModel.content);
+      for (const chunk of chunks) {
+        sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: chunk }, null));
+      }
+
+      sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, {}, "stop"));
+      if (includeWorkflowEvents) {
+        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
+          mode: "task",
+          model: requestedModel,
+          status: resultForModel.job.status,
+        }));
+      }
+      res.end("data: [DONE]\n\n");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { content: `Error: ${message}` }, "stop"));
+      if (includeWorkflowEvents) {
+        sseWriteEvent(res, "workflow.failed", buildWorkflowEvent("workflow.failed", {}, {
+          mode: "task",
+          error: message,
+        }));
+      }
+      res.end("data: [DONE]\n\n");
+    }
+    return;
+  }
+
+  // Non-streaming path
   const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model).catch((error) => { throw error; });
   const requestedModel = resultForModel.resolvedModel;
   const workflow = buildWorkflowPayload(resultForModel);
-
-  if (!body.stream) {
-    jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
-    return;
-  }
-
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-
-  const streamId = `chatcmpl-${Date.now()}`;
-  sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { role: "assistant", content: "" }, null));
-
-  try {
-    const chunks = splitContentForStreaming(resultForModel.content);
-
-    for (const chunk of chunks) {
-      sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: chunk }, null));
-    }
-
-    sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, {}, "stop"));
-    sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
-      mode: "task",
-      model: requestedModel,
-      status: resultForModel.job.status,
-    }));
-    res.end("data: [DONE]\n\n");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: `Error: ${message}` }, "stop"));
-    sseWrite(res, buildWorkflowEvent("workflow.failed", workflow, {
-      mode: "task",
-      model: requestedModel,
-      error: message,
-    }));
-    res.end("data: [DONE]\n\n");
-  }
+  jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
 }
 
 function buildResponsesOutput(content: string): unknown[] {
@@ -1702,6 +1747,7 @@ function buildResponsesResponse(model: string, content: string, workflow?: unkno
 
 async function handleResponses(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<ResponsesRequest>(req);
+  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
   const messages = normalizeResponsesInput(body.input, body.instructions);
   const result = await runTaskFromMessages(messages, body.model);
   const workflow = buildWorkflowPayload(result);
@@ -1722,11 +1768,13 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
     sseWrite(res, JSON.stringify({ type: "response.output_text.delta", delta: chunk }));
   }
   sseWrite(res, JSON.stringify({ type: "response.completed", response: { id: responseId, model: result.resolvedModel, status: "completed" } }));
-  sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
-    mode: "task",
-    model: result.resolvedModel,
-    status: result.job.status,
-  }));
+  if (includeWorkflowEvents) {
+    sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
+      mode: "task",
+      model: result.resolvedModel,
+      status: result.job.status,
+    }));
+  }
   res.end("data: [DONE]\n\n");
 }
 
@@ -1756,6 +1804,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   const body = await readJsonBody<AnthropicMessagesRequest>(req);
   const messages = normalizeAnthropicMessages(body.messages, body.system);
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
+  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
 
   if (toolMode) {
     if (extractLatestAnthropicWriteToolCompletion(body.messages)) {
@@ -1858,17 +1907,19 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         delta: { stop_reason: "tool_use", stop_sequence: null },
         usage: { output_tokens: 0 },
       }));
-      sseWrite(res, buildWorkflowEvent("workflow.completed", {
-        job: null,
-        plan: null,
-        taskRuns: [],
-        artifacts: [],
-      }, {
-        mode: "tool",
-        model: toolResult.resolvedModel,
-        toolCalls: toolResult.toolCalls,
-        content: toolResult.content,
-      }));
+      if (includeWorkflowEvents) {
+        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", {
+          job: null,
+          plan: null,
+          taskRuns: [],
+          artifacts: [],
+        }, {
+          mode: "tool",
+          model: toolResult.resolvedModel,
+          toolCalls: toolResult.toolCalls,
+          content: toolResult.content,
+        }));
+      }
     } else {
       const result = await runTaskFromMessages(messages, body.model);
       const workflow = buildWorkflowPayload(result);
@@ -1898,11 +1949,13 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         delta: { stop_reason: "end_turn", stop_sequence: null },
         usage: { output_tokens: 0 },
       }));
-      sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
-        mode: "task",
-        model: result.resolvedModel,
-        status: result.job.status,
-      }));
+      if (includeWorkflowEvents) {
+        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
+          mode: "task",
+          model: result.resolvedModel,
+          status: result.job.status,
+        }));
+      }
     }
     res.write(`event: message_stop\n`);
     sseWrite(res, JSON.stringify({ type: "message_stop" }));
@@ -1963,11 +2016,13 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   }));
   res.write(`event: message_stop\n`);
   sseWrite(res, JSON.stringify({ type: "message_stop" }));
-  sseWrite(res, buildWorkflowEvent("workflow.completed", workflow, {
-    mode: "task",
-    model: result.resolvedModel,
-    status: result.job.status,
-  }));
+  if (includeWorkflowEvents) {
+    sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
+      mode: "task",
+      model: result.resolvedModel,
+      status: result.job.status,
+    }));
+  }
   res.end();
 }
 
