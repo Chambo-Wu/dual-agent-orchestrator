@@ -8,9 +8,39 @@ export interface ModelConfig {
   temperature: number;
 }
 
+// ---------------------------------------------------------------------------
+// Search Provider
+// ---------------------------------------------------------------------------
+
+export type SearchProviderType = "bing_html" | "searxng" | "serpapi" | "bing_api" | "google_cse" | "url_template" | "mcp";
+
+export interface SearchConfig {
+  provider: SearchProviderType;
+  fallbackEnabled: boolean;
+  apiKey: string;
+  timeoutMs: number;
+  providers: Record<string, Record<string, unknown>>;
+}
+
+export interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+export interface SearchRequest {
+  url: string;
+  headers?: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator Config
+// ---------------------------------------------------------------------------
+
 export interface OrchestratorConfig {
   planner: ModelConfig;
   executor: ModelConfig;
+  search?: SearchConfig;
   policy: {
     maxSteps: number;
     maxReplans: number;

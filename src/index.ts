@@ -8,7 +8,7 @@ import { createRunLogger } from "./logger.js";
 import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getRoutePolicy } from "./orchestrator.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
-import { TOOL_DEFINITIONS } from "./tools.js";
+import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
 import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, Plan, TaskRun } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
@@ -2130,6 +2130,7 @@ function runConfigValidation(configPath?: string): void {
 async function runCliTask(task: string): Promise<void> {
   const logger = createRunLogger(task);
   const baseConfig = loadConfig();
+  configureSearchTools(baseConfig.search);
   const routing = loadTaskRoutingConfig(baseConfig.taskRoutingPath);
   const taskType = detectTaskType(task, routing);
   const routePolicy = getRoutePolicy(taskType, routing);
@@ -2149,6 +2150,7 @@ async function runCliTask(task: string): Promise<void> {
 
 async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): Promise<void> {
   const config = loadConfig();
+  configureSearchTools(config.search);
   const logger = createRunLogger(goal);
   const tracer = new Tracer(logger);
   const startedAt = new Date().toISOString();
@@ -2198,6 +2200,7 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
 
 function runServer(port: number): void {
   const config = loadConfig();
+  configureSearchTools(config.search);
   const server = createServer((req, res) => {
     void handleRequest(req, res);
   });

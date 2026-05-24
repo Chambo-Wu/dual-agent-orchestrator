@@ -22,3 +22,28 @@ policy:
   planner_history_preview_chars: 180
   max_repeated_executor_requests: 2
   task_routing_path: "config/task-routing.yml"
+
+# Search provider configuration (optional)
+# Defaults to Bing HTML scraping when absent.
+# Supported providers: bing_html, searxng, serpapi, bing_api, google_cse, url_template, mcp
+# search:
+#   provider: bing_html
+#   fallback_enabled: true
+#   api_key: "env:SEARCH_API_KEY"
+#   timeout_ms: 15000
+#   bing_html:
+#     url_template: "https://www.bing.com/search?q={query}"
+#   searxng:
+#     base_url: "http://localhost:8888"
+#   serpapi:
+#     engine: google
+#   bing_api:
+#     endpoint: "https://api.bing.microsoft.com/v7.0/search"
+#     market: "en-US"
+#   google_cse:
+#     cx: "env:GOOGLE_CSE_ID"
+#     endpoint: "https://www.googleapis.com/customsearch/v1"
+#   mcp:
+#     server_url: "http://127.0.0.1:3000"
+#     tool_name: "web_search"
+#     timeout_ms: 30000

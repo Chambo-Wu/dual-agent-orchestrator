@@ -135,6 +135,82 @@ export const CONFIG_SCHEMA: Record<string, ConfigFieldSchema> = {
     required: false,
     description: "Path to task routing YAML config",
   },
+  "search.provider": {
+    type: "string",
+    required: false,
+    description: "Active search provider: bing_html, searxng, serpapi, bing_api, google_cse, url_template, mcp",
+    default: "bing_html",
+  },
+  "search.api_key": {
+    type: "string",
+    required: false,
+    description: "Shared API key for search providers (or env:VAR_NAME reference)",
+  },
+  "search.timeout_ms": {
+    type: "number",
+    required: false,
+    description: "Search request timeout in milliseconds",
+    default: 15000,
+    constraints: { integer: true, min: 1000, max: 60000 },
+  },
+  "search.fallback_enabled": {
+    type: "boolean",
+    required: false,
+    description: "Fall back to Bing HTML scraping if the active provider fails",
+    default: true,
+  },
+  "search.bing_html.url_template": {
+    type: "string",
+    required: false,
+    description: "Bing search URL template with {query} placeholder",
+    default: "https://www.bing.com/search?q={query}",
+  },
+  "search.searxng.base_url": {
+    type: "string",
+    required: false,
+    description: "SearXNG instance base URL",
+  },
+  "search.serpapi.engine": {
+    type: "string",
+    required: false,
+    description: "SerpAPI search engine (google, bing, etc.)",
+    default: "google",
+  },
+  "search.bing_api.endpoint": {
+    type: "string",
+    required: false,
+    description: "Bing Web Search API endpoint",
+    default: "https://api.bing.microsoft.com/v7.0/search",
+  },
+  "search.google_cse.cx": {
+    type: "string",
+    required: false,
+    description: "Google Custom Search Engine ID (or env:VAR_NAME reference)",
+  },
+  "search.google_cse.endpoint": {
+    type: "string",
+    required: false,
+    description: "Google Custom Search API endpoint",
+    default: "https://www.googleapis.com/customsearch/v1",
+  },
+  "search.mcp.server_url": {
+    type: "string",
+    required: false,
+    description: "MCP server URL for search tool (e.g. Cherry Studio)",
+  },
+  "search.mcp.tool_name": {
+    type: "string",
+    required: false,
+    description: "MCP tool name to call for search",
+    default: "web_search",
+  },
+  "search.mcp.timeout_ms": {
+    type: "number",
+    required: false,
+    description: "MCP call timeout in milliseconds",
+    default: 30000,
+    constraints: { integer: true, min: 1000 },
+  },
 };
 
 export function lookupFieldSchema(fieldPath: string): ConfigFieldSchema | undefined {

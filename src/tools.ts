@@ -1,8 +1,20 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import type { ToolDefinition, ToolExecutionResult } from "./types.js";
+import type { SearchConfig, ToolDefinition, ToolExecutionResult } from "./types.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
+import { createSearchProvider } from "./search/providers.js";
+import { mcpCallTool } from "./search/mcp-client.js";
+
+let activeSearchConfig: SearchConfig | undefined;
+
+export function configureSearchTools(config: SearchConfig | undefined): void {
+  activeSearchConfig = config;
+}
+
+export function getActiveSearchProvider(): string {
+  return activeSearchConfig?.provider || "bing_html (legacy)";
+}
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const POWERSHELL_CANDIDATES = [
@@ -438,23 +450,62 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     const query = typeof args.query === "string" ? args.query.trim() : "";
     if (!query) return { ok: false, summary: "web_search requires query.", rawResult: "", error: "query required" };
     const count = Math.min(Math.max(typeof args.count === "number" ? args.count : 5, 1), 10);
-    const searchUrl = buildWebSearchUrl(query);
-    const fetchResult = await fetchUrlText(searchUrl, DEFAULT_COMMAND_TIMEOUT_MS);
-    if (!fetchResult.ok) {
-      return {
-        ok: false,
-        summary: `Web search failed for query: ${query}`,
-        rawResult: fetchResult.body,
-        error: fetchResult.error || "web search failed",
-      };
+
+    let results: Array<{ title: string; url: string; snippet: string }> = [];
+    let providerUsed = "legacy";
+
+    // MCP provider path
+    if (activeSearchConfig?.provider === "mcp") {
+      const mcpConfig = activeSearchConfig.providers.mcp || {};
+      const serverUrl = typeof mcpConfig.server_url === "string" ? mcpConfig.server_url : "http://127.0.0.1:3000";
+      const toolName = typeof mcpConfig.tool_name === "string" ? mcpConfig.tool_name : "web_search";
+      const mcpTimeout = typeof mcpConfig.timeout_ms === "number" ? mcpConfig.timeout_ms : 30000;
+      try {
+        results = await mcpCallTool(serverUrl, toolName, { query, count }, mcpTimeout);
+        providerUsed = "mcp";
+      } catch (err) {
+        if (!activeSearchConfig.fallbackEnabled) {
+          return { ok: false, summary: "MCP search failed", rawResult: "", error: err instanceof Error ? err.message : String(err) };
+        }
+        // fall through to legacy
+      }
     }
-    const results = parseSearchResults(fetchResult.body, count);
+
+    // Configured provider path (non-MCP)
+    if (results.length === 0 && activeSearchConfig && activeSearchConfig.provider !== "mcp") {
+      try {
+        const provider = createSearchProvider(activeSearchConfig);
+        const request = provider.buildRequest(query, count);
+        const timeoutMs = activeSearchConfig.timeoutMs || DEFAULT_COMMAND_TIMEOUT_MS;
+        const fetchResult = await fetchUrlText(request.url, timeoutMs);
+        if (fetchResult.ok) {
+          results = provider.parseResults(fetchResult.body, count);
+          providerUsed = activeSearchConfig.provider;
+        } else if (!activeSearchConfig.fallbackEnabled) {
+          return { ok: false, summary: `Search failed (${activeSearchConfig.provider})`, rawResult: fetchResult.body, error: fetchResult.error || "search failed" };
+        }
+      } catch {
+        // fall through to legacy
+      }
+    }
+
+    // Legacy fallback (no config or fallback enabled)
+    if (results.length === 0) {
+      const searchUrl = buildWebSearchUrl(query);
+      const fetchResult = await fetchUrlText(searchUrl, DEFAULT_COMMAND_TIMEOUT_MS);
+      if (!fetchResult.ok) {
+        return { ok: false, summary: `Web search failed for query: ${query}`, rawResult: fetchResult.body, error: fetchResult.error || "web search failed" };
+      }
+      results = parseSearchResults(fetchResult.body, count);
+      providerUsed = "legacy";
+    }
+
     const artifactPath = saveJsonArtifact("web-search", results);
     const raw = JSON.stringify(results, null, 2);
     if (results.length === 0) {
       return {
         ok: false,
-        summary: `Web search returned no parsed results; raw output saved to ${artifactPath}`,
+        summary: `Web search returned no parsed results (${providerUsed}); raw output saved to ${artifactPath}`,
         artifact: { type: "json", path: artifactPath, content_preview: raw.slice(0, 200) },
         rawResult: raw,
         error: "No search results could be parsed from the fetched page.",
@@ -462,7 +513,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     }
     return {
       ok: true,
-      summary: `Found ${results.length} results`,
+      summary: `Found ${results.length} results (${providerUsed})`,
       artifact: { type: "json", path: artifactPath, content_preview: raw.slice(0, 200) },
       rawResult: raw,
     };
