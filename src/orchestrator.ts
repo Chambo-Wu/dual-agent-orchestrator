@@ -7,7 +7,7 @@ import { parseExecutorOutput } from "./executor-adapter.js";
 import type { RunLogger } from "./logger.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
-import { RUNTIME_ROOT } from "./paths.js";
+import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 import type { ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskType } from "./types.js";
 import { Tracer } from "./trace.js";
 import { LoopDetector } from "./loop-detector.js";
@@ -92,6 +92,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizePathForComparison(value: string): string {
+  return value.replace(/[\\/]+/g, "/").toLowerCase();
+}
+
+function extractRequestedOutputPath(goal: string): string | undefined {
+  const absoluteMatch = goal.match(/[A-Za-z]:\\[^\r\n"“”]+?\.(md|markdown|txt|json|csv)/i);
+  if (absoluteMatch?.[0]) {
+    return resolve(absoluteMatch[0]);
+  }
+
+  const quotedMatch = goal.match(/[“"]([^"”]+?\.(md|markdown|txt|json|csv))[”"]/i);
+  if (quotedMatch?.[1]) {
+    return resolve(WORKSPACE_ROOT, quotedMatch[1]);
+  }
+
+  const bareNameMatch = goal.match(/\b([^\s\\/]+?\.(md|markdown|txt|json|csv))\b/i);
+  if (bareNameMatch?.[1] && /(写入本地|write\s+to\s+local|save\s+to\s+local|写入文件|write.*file)/i.test(goal)) {
+    return resolve(WORKSPACE_ROOT, bareNameMatch[1]);
+  }
+
+  return undefined;
 }
 
 function parsePlannerExecutorRequest(value: unknown): PlannerExecutorRequest | undefined {
@@ -514,6 +537,7 @@ async function runExecutorConversation(
           request,
           stepNumber,
           logger,
+          options,
         );
         return {
           response: executorResponse,
@@ -579,6 +603,11 @@ async function runExecutorConversation(
         tool: call.tool,
         arguments: call.arguments,
       });
+      options?.onEvent?.({
+        type: "workflow.tool.start",
+        step: stepNumber,
+        data: { tool: call.tool, arguments: call.arguments },
+      });
       const result = await executeTool(call.tool, call.arguments);
       logger?.log("tool.execution.finished", {
         step: stepNumber,
@@ -588,6 +617,11 @@ async function runExecutorConversation(
         error: result.error,
         artifact: result.artifact,
         raw_result_preview: result.rawResult.slice(0, 500),
+      });
+      options?.onEvent?.({
+        type: "workflow.tool.result",
+        step: stepNumber,
+        data: { tool: call.tool, ok: result.ok, summary: result.summary },
       });
 
       if (result.artifact) {
@@ -777,6 +811,34 @@ export function hasSuccessfulWrite(history: ExecutorOutput[]): boolean {
   );
 }
 
+function hasSuccessfulWriteToPath(history: ExecutorOutput[], requestedPath: string | undefined): boolean {
+  if (!requestedPath) {
+    return hasSuccessfulWrite(history);
+  }
+
+  const normalizedRequested = normalizePathForComparison(resolve(requestedPath));
+  return history.some((item) =>
+    item.source === "native_tool"
+    && item.status === "success"
+    && item.tool_calls_made.some((call) =>
+      call.tool === "write_file"
+      && typeof call.arguments.path === "string"
+      && normalizePathForComparison(resolve(String(call.arguments.path))) === normalizedRequested)
+  );
+}
+
+function buildRequiredWriteExecutorRequest(targetPath: string, finalAnswer?: string): PlannerExecutorRequest {
+  const answerHint = isNonEmptyString(finalAnswer)
+    ? `Base the markdown content on this finalized summary if it is helpful: ${finalAnswer.trim()}`
+    : "Base the markdown content on the strongest evidence already gathered in recent artifacts.";
+
+  return {
+    instruction: `Write the requested deliverable to ${targetPath}. First inspect the most relevant recent local artifacts if needed, then call write_file with the complete final markdown content. ${answerHint} Return a concise confirmation that includes the exact written path.`,
+    allowed_tools: ["list_files", "read_file", "write_file"],
+    expected_output: `A markdown file written successfully to ${targetPath}, plus a brief confirmation of the exact path.`,
+  };
+}
+
 function checkGoalAchieved(history: ExecutorOutput[], routePolicy: RoutePolicy): { achieved: boolean; answer?: string } {
   if (history.length === 0) return { achieved: false };
   if (routePolicy.type === "file_ops" || routePolicy.type === "code") {
@@ -831,12 +893,29 @@ export async function runTask(
   const runtimeDeps = mergeRuntimeDeps(deps);
   const executorHistory: ExecutorOutput[] = [];
   const loopDetector = new LoopDetector();
+  const requestedOutputPath = extractRequestedOutputPath(taskPrompt);
   let replanCount = 0;
   let degradedRetryWarningEmitted = false;
 
   for (let step = 0; step < config.policy.maxSteps; step++) {
     assertNotCancelled(options);
     const planner = await runtimeDeps.runPlannerStep(config, taskPrompt, executorHistory, replanCount, routePolicy, step + 1, logger, runtimeDeps, options);
+
+    if (planner.status === "final" && requestedOutputPath && !hasSuccessfulWriteToPath(executorHistory, requestedOutputPath)) {
+      logger?.log("planner.protocol_violation", {
+        step: step + 1,
+        reason: "final_without_required_file_write",
+        requested_output_path: requestedOutputPath,
+        parsed: planner,
+      });
+      planner.status = "need_executor";
+      planner.audit = {
+        verdict: "retry",
+        notes: `Protocol corrected: the task requested a local output file at ${requestedOutputPath}, but no successful write_file call created it.`,
+      };
+      planner.executor_request = buildRequiredWriteExecutorRequest(requestedOutputPath, planner.final_answer);
+      planner.final_answer = undefined;
+    }
 
     if (planner.status === "final" || planner.status === "clarify") {
       return finalizeRunTaskResult({
@@ -877,7 +956,12 @@ export async function runTask(
     const executorResult = await runtimeDeps.runExecutorStep(config, planner, step + 1, logger, runtimeDeps, options);
     executorHistory.push(executorResult);
 
-    const goalCheck = checkGoalAchieved(executorHistory, routePolicy);
+    const goalCheck = requestedOutputPath
+      ? {
+          achieved: hasSuccessfulWriteToPath(executorHistory, requestedOutputPath),
+          answer: executorHistory.at(-1)?.summary || `File written successfully to ${requestedOutputPath}.`,
+        }
+      : checkGoalAchieved(executorHistory, routePolicy);
     if (goalCheck.achieved) {
       return finalizeRunTaskResult({
         goal: taskPrompt,
@@ -943,6 +1027,7 @@ async function runPlannerStep(
   const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText);
 
   logger?.log("planner.request", { step: stepNumber, replan_count: replanCount });
+  options?.onEvent?.({ type: "workflow.step.start", step: stepNumber, data: { replan_count: replanCount } });
 
   let plannerRaw: string;
   try {
@@ -1052,6 +1137,16 @@ async function runPlannerStep(
   }
 
   logger?.log("planner.response.parsed", { step: stepNumber, parsed: planner });
+  options?.onEvent?.({
+    type: "workflow.planner.decision",
+    step: stepNumber,
+    data: {
+      status: planner.status,
+      reasoning_summary: planner.reasoning_summary,
+      next_step: planner.next_step,
+      verdict: planner.audit?.verdict,
+    },
+  });
   return planner;
 }
 
@@ -1116,7 +1211,8 @@ function buildPlannerMessages(
   executorHistory: ExecutorOutput[],
   replanCount: number,
   routePolicy: RoutePolicy,
-  rankingText?: string
+  rankingText?: string,
+  currentStep?: number
 ): ChatMessage[] {
   const historyText = buildPlannerHistoryText(config, executorHistory);
   const remainingReplans = Math.max(0, config.policy.maxReplans - replanCount);
@@ -1129,11 +1225,30 @@ function buildPlannerMessages(
     `Fallback rule: ${routePolicy.fallbackRule}`,
   ].join("\n");
 
+  // Build step budget guidance
+  let stepBudgetBlock = "";
+  if (currentStep !== undefined) {
+    const remaining = config.policy.maxSteps - currentStep - 1;
+    let budgetGuidance = "";
+
+    if (remaining <= 0) {
+      budgetGuidance = "⚠️ CRITICAL: This is your FINAL step. You MUST return status 'final' with an answer based on current evidence. Do not request more executor steps.";
+    } else if (remaining === 1) {
+      budgetGuidance = "⚠️ WARNING: Only 1 step remaining after this. If you request executor work now, you will have ONE more chance to finalize. Consider returning 'final' now if you have sufficient evidence.";
+    } else if (remaining <= 2) {
+      budgetGuidance = `⚠️ NOTICE: Only ${remaining} steps remaining. Start consolidating findings. Avoid exploring new directions unless critical.`;
+    } else {
+      budgetGuidance = `${remaining} steps remaining. Continue normal planning.`;
+    }
+
+    stepBudgetBlock = `\nStep budget: ${currentStep + 1}/${config.policy.maxSteps} (${remaining} remaining)\n${budgetGuidance}`;
+  }
+
   return [
     { role: "system", content: `${PLANNER_PROMPT}\n\nRuntime profile:\n${runtimeProfileText(config)}\n\nAvailable tools:\n${toolListText()}` },
     {
       role: "user",
-      content: `Goal: ${userGoal}\n${routePolicyBlock}\nReplan budget remaining: ${remainingReplans}\nWorker history:\n${historyText}${routePolicy.enableRanking ? `\n\nDeterministic candidate ranking:\n${rankingText || "none"}` : ""}`,
+      content: `Goal: ${userGoal}\n${routePolicyBlock}\nReplan budget remaining: ${remainingReplans}${stepBudgetBlock}\nWorker history:\n${historyText}${routePolicy.enableRanking ? `\n\nDeterministic candidate ranking:\n${rankingText || "none"}` : ""}`,
     },
   ];
 }
@@ -1162,6 +1277,7 @@ async function executeDeclaredToolCallsFallback(
   request: PlannerOutput["executor_request"],
   stepNumber: number,
   logger?: RunLogger,
+  options?: RunOptions,
 ): Promise<{
   executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }>;
   artifacts: ExecutorOutput["artifacts"];
@@ -1201,6 +1317,11 @@ async function executeDeclaredToolCallsFallback(
       arguments: call.arguments,
       source: "declared_tool_calls_fallback",
     });
+    options?.onEvent?.({
+      type: "workflow.tool.start",
+      step: stepNumber,
+      data: { tool: call.tool, arguments: call.arguments },
+    });
     const result = await executeTool(call.tool, call.arguments);
     logger?.log("tool.execution.finished", {
       step: stepNumber,
@@ -1211,6 +1332,11 @@ async function executeDeclaredToolCallsFallback(
       artifact: result.artifact,
       raw_result_preview: result.rawResult.slice(0, 500),
       source: "declared_tool_calls_fallback",
+    });
+    options?.onEvent?.({
+      type: "workflow.tool.result",
+      step: stepNumber,
+      data: { tool: call.tool, ok: result.ok, summary: result.summary },
     });
 
     executedCalls.push(call);
@@ -1256,6 +1382,14 @@ export async function runExecutorStep(
     request: planner.executor_request,
     allowed_tools: allowedTools.map((tool) => tool.name),
   });
+  options?.onEvent?.({
+    type: "workflow.executor.start",
+    step: stepNumber,
+    data: {
+      instruction: planner.executor_request?.instruction,
+      allowed_tools: allowedTools.map((tool) => tool.name),
+    },
+  });
   const conversation = await runExecutorConversation(
     config,
     planner.executor_request,
@@ -1272,6 +1406,15 @@ export async function runExecutorStep(
     used_native_tool_calls: finalized.source === "native_tool",
     declared_tool_calls_without_execution: finalized.error === "Executor declared tool calls without actually executing any native tools.",
   });
+  options?.onEvent?.({
+    type: "workflow.executor.result",
+    step: stepNumber,
+    data: {
+      status: finalized.status,
+      summary: finalized.summary,
+      artifact_count: finalized.artifacts.length,
+    },
+  });
   return finalized;
 }
 
@@ -1285,6 +1428,7 @@ export async function runOrchestrator(
   const runtimeDeps = mergeRuntimeDeps(deps);
   assertNotCancelled(options);
   const executorHistory: ExecutorOutput[] = [];
+  const requestedOutputPath = extractRequestedOutputPath(userGoal);
   const routing = loadTaskRoutingConfig(config.taskRoutingPath);
   const taskType = detectTaskType(userGoal, routing);
   const routePolicy = getRoutePolicy(taskType, routing);
@@ -1330,7 +1474,7 @@ export async function runOrchestrator(
     transitionTo("planning", `step ${step + 1} starting`);
     const rankingArtifactPath = routePolicy.enableRanking ? persistRankingArtifact(executorHistory, logger) : undefined;
     const candidateRankingText = routePolicy.enableRanking ? buildCandidateRankingText(executorHistory) : undefined;
-    const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText);
+    const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText, step);
     logger?.log("planner.request", {
       step: step + 1,
       messages: plannerMessages,
@@ -1412,6 +1556,26 @@ export async function runOrchestrator(
           ? `${planner.audit.notes} Protocol corrected: planner returned final with executor_request and no answer.`
           : "Protocol corrected: planner returned final with executor_request and no answer.",
       };
+    }
+
+    if (
+      planner.status === "final"
+      && requestedOutputPath
+      && !hasSuccessfulWriteToPath(executorHistory, requestedOutputPath)
+    ) {
+      logger?.log("planner.protocol_violation", {
+        step: step + 1,
+        reason: "final_without_required_file_write",
+        requested_output_path: requestedOutputPath,
+        parsed: planner,
+      });
+      planner.status = "need_executor";
+      planner.audit = {
+        verdict: "retry",
+        notes: `Protocol corrected: the task requested a local output file at ${requestedOutputPath}, but no successful write_file call created it.`,
+      };
+      planner.executor_request = buildRequiredWriteExecutorRequest(requestedOutputPath, planner.final_answer);
+      planner.final_answer = undefined;
     }
 
     if (
@@ -1527,7 +1691,12 @@ export async function runOrchestrator(
     });
 
     // P0-2: Goal achieved short-circuit — if write_file succeeded, stop immediately
-    const goalCheck = checkGoalAchieved(executorHistory, routePolicy);
+    const goalCheck = requestedOutputPath
+      ? {
+          achieved: hasSuccessfulWriteToPath(executorHistory, requestedOutputPath),
+          answer: executorHistory.at(-1)?.summary || `File written successfully to ${requestedOutputPath}.`,
+        }
+      : checkGoalAchieved(executorHistory, routePolicy);
     if (goalCheck.achieved) {
       transitionTo("finalized", "goal_achieved");
       const result: PlannerOutput = {
@@ -1560,20 +1729,50 @@ export async function runOrchestrator(
   }
 
   transitionTo("finalized", "max_steps_reached");
+
+  // Extract partial results from executor history
+  const artifacts = executorHistory.flatMap(h => h.artifacts || []);
+  const hasEvidence = artifacts.length > 0;
+  const failurePatterns = {
+    http403: executorHistory.filter(h => h.error?.includes("403")).length,
+    searchPoor: executorHistory.filter(h => h.tool_calls_made?.some(t => t.tool === "web_search")).length,
+    missingFiles: executorHistory.filter(h => h.error?.includes("ENOENT") || h.error?.includes("no such file")).length,
+  };
+
+  let suggestions = "";
+  if (failurePatterns.http403 > 2) {
+    suggestions += "\n- Many websites blocked access (HTTP 403). Consider using alternative data sources or APIs.";
+  }
+  if (failurePatterns.searchPoor > 3 && artifacts.length < 3) {
+    suggestions += "\n- Web search results were limited. Try: (1) more specific search terms, (2) alternative search tools, or (3) direct URL fetching.";
+  }
+  if (failurePatterns.missingFiles > 2) {
+    suggestions += "\n- Multiple file access errors. Verify file paths and naming conventions.";
+  }
+
   const result: PlannerOutput = {
     goal: userGoal,
     status: "final",
-    reasoning_summary: "Stopped because max_steps was reached.",
+    reasoning_summary: hasEvidence
+      ? "Reached step limit. Summarizing available evidence."
+      : "Reached step limit without sufficient evidence.",
     next_step: "",
     audit: {
-      verdict: executorHistory.length > 0 ? "approved" : "not_applicable",
-      notes: "",
+      verdict: hasEvidence ? "approved" : "blocked",
+      notes: hasEvidence
+        ? "Task incomplete but partial results available"
+        : "Task incomplete, insufficient evidence gathered",
     },
-    final_answer: "The orchestrator stopped after reaching the maximum number of steps.",
+    final_answer: hasEvidence
+      ? `Task reached the ${config.policy.maxSteps}-step limit. Based on available evidence:\n\n${artifacts.slice(0, 3).map((a, i) => `${i + 1}. ${a.type} artifact: ${a.path}\n   Preview: ${previewText(a.content_preview || "", 200)}`).join("\n\n")}\n\nNote: This is a partial result due to step budget constraints.${suggestions ? `\n\nSuggestions for better results:${suggestions}` : ""}`
+      : `The task could not be completed within the ${config.policy.maxSteps}-step budget. No sufficient evidence was gathered.${suggestions ? `\n\nSuggestions:${suggestions}` : ""}`,
   };
   logger?.log("orchestrator.finished", {
     step: config.policy.maxSteps,
     result,
+    has_evidence: hasEvidence,
+    artifact_count: artifacts.length,
+    failure_patterns: failurePatterns,
   });
   return result;
 }

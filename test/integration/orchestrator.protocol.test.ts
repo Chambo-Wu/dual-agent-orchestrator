@@ -150,3 +150,59 @@ test("research degrades to artifact-only summary after repeated url_fetch access
   assert.equal(result.executorHistory.length, 3);
   assert.equal(executorCalls, 3);
 });
+
+test("final answer claiming a local markdown write is corrected into a required write_file step", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "research",
+    requireEvidenceBeforeFinal: false,
+  });
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "final",
+      step: "write final report",
+      audit: { verdict: "approved", notes: "" },
+      answer: "已写入报告文件：D:\\Android\\dual-agent-orchestrator\\国产Ai大模型报告20260524-0100.md",
+    }),
+  ]);
+
+  let executorCalls = 0;
+  const result = await runTask(
+    config,
+    "检索小米大模型mimo v2.5 pro的功能特点，归纳总结一份“国产Ai大模型报告20260524-0100.md” 写入本地",
+    routePolicy,
+    undefined,
+    {
+      runChatCompletionDetailed: fakeChat.runner,
+      runExecutorStep: async (_config, planner) => {
+        executorCalls += 1;
+        assert.equal(planner.executor_request?.allowed_tools.includes("write_file"), true);
+        assert.equal(planner.executor_request?.instruction.includes("国产Ai大模型报告20260524-0100.md"), true);
+        return executorSuccess({
+          status: "success",
+          summary: "Wrote file D:\\Android\\dual-agent-orchestrator\\国产Ai大模型报告20260524-0100.md",
+          tool_calls_made: [{
+            tool: "write_file",
+            arguments: {
+              path: "D:\\Android\\dual-agent-orchestrator\\国产Ai大模型报告20260524-0100.md",
+              content: "# 报告\n\n内容",
+            },
+          }],
+          artifacts: [{
+            type: "file",
+            path: "D:\\Android\\dual-agent-orchestrator\\国产Ai大模型报告20260524-0100.md",
+            content_preview: "# 报告\n\n内容",
+          }],
+          raw_result: "# 报告\n\n内容",
+          source: "native_tool",
+        });
+      },
+    },
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.output, "Wrote file D:\\Android\\dual-agent-orchestrator\\国产Ai大模型报告20260524-0100.md");
+  assert.equal(result.executorHistory.length, 1);
+  assert.equal(executorCalls, 1);
+  assert.equal(fakeChat.calls.length, 1);
+});
