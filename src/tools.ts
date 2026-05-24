@@ -187,13 +187,19 @@ function prefersPowerShell(command: string): boolean {
     || /@\{/.test(command);
 }
 
-function saveShellOutput(output: string): string {
+let artifactCounter = 0;
+
+export function resetArtifactCounter(): void {
+  artifactCounter = 0;
+}
+
+function saveShellOutput(output: string, prefix = "output"): string {
   const dir = resolve(RUNTIME_ROOT, "command-results");
   mkdirSync(dir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const seq = String(++artifactCounter).padStart(3, "0");
   const trimmed = output.trim();
   const extension = trimmed.startsWith("{") || trimmed.startsWith("[") ? "json" : "txt";
-  const path = resolve(dir, `${timestamp}-${Math.random().toString(36).slice(2, 8)}.${extension}`);
+  const path = resolve(dir, `${seq}-${prefix}.${extension}`);
   writeFileSync(path, output, "utf8");
   return path;
 }
@@ -201,8 +207,8 @@ function saveShellOutput(output: string): string {
 function saveJsonArtifact(prefix: string, payload: unknown): string {
   const dir = resolve(RUNTIME_ROOT, "command-results");
   mkdirSync(dir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const path = resolve(dir, `${timestamp}-${prefix}-${Math.random().toString(36).slice(2, 8)}.json`);
+  const seq = String(++artifactCounter).padStart(3, "0");
+  const path = resolve(dir, `${seq}-${prefix}.json`);
   writeFileSync(path, JSON.stringify(payload, null, 2), "utf8");
   return path;
 }
@@ -422,7 +428,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
     const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
     const combined = [stdout, stderr].filter(Boolean).join("\n");
-    const outputPath = saveShellOutput(combined || "(no output)");
+    const outputPath = saveShellOutput(combined || "(no output)", "shell");
 
     if (result.error) {
       return {
@@ -530,7 +536,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       text = text.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
     }
     const trunc = text.slice(0, maxChars);
-    const outPath = saveShellOutput(trunc);
+    const outPath = saveShellOutput(trunc, "url-fetch");
     return { ok: true, summary: `Fetched ${url} (${text.length} chars)`, artifact: { type: "file", path: outPath, content_preview: trunc.slice(0, 200) }, rawResult: trunc };
   }
 
