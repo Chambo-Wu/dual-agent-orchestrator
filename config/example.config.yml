@@ -7,9 +7,15 @@ planner:
   temperature: 0.2
 
 executor:
-  base_url: "http://192.168.1.161:3001/v1"
+  # Replace with your worker-model endpoint.
+  # Examples:
+  # - local LM Studio / compatible gateway: "http://127.0.0.1:1234/v1"
+  # - local vLLM / OpenAI-compatible server: "http://127.0.0.1:8000/v1"
+  base_url: "http://127.0.0.1:1234/v1"
   api_key: "env:EXECUTOR_API_KEY"
-  model: "Qwen/Qwen3-8B"
+  # Use any smaller / cheaper worker model that supports your OpenAI-compatible endpoint.
+  # Examples: "qwen/qwen3-4b-2507", "Qwen/Qwen3-8B", "deepseek-chat"
+  model: "qwen/qwen3-4b-2507"
   timeout_ms: 60000
   max_tokens: 8192
   temperature: 0
