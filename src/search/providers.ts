@@ -32,6 +32,24 @@ class BingHtmlProvider implements SearchProvider {
   }
 }
 
+function cleanBingTitle(title: string, url: string): string {
+  // Remove URL prefix that Bing sometimes adds to titles
+  // Pattern: "domain.com https://www.example.com › path › ..."
+  const urlMatch = url.match(/^https?:\/\/([^/]+)/);
+  if (urlMatch) {
+    const domain = urlMatch[1];
+    // Remove domain prefix and URL from title
+    const cleaned = title
+      .replace(new RegExp(`^${domain.replace(/\./g, "\\.")}\\s+`, "i"), "")
+      .replace(/https?:\/\/[^\s›]+/g, "")
+      .replace(/›/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return cleaned || title;
+  }
+  return title;
+}
+
 function parseBingHtml(html: string, count: number): SearchResult[] {
   const results: SearchResult[] = [];
   const bingPatterns = [
@@ -43,8 +61,9 @@ function parseBingHtml(html: string, count: number): SearchResult[] {
     for (const m of html.matchAll(re)) {
       if (results.length >= count) break;
       const url = m[1] || "";
-      const title = stripHtmlTags(m[2] || "");
+      const rawTitle = stripHtmlTags(m[2] || "");
       const snippet = stripHtmlTags(m[3] || m[4] || "");
+      const title = cleanBingTitle(rawTitle, url);
       if (url && title && url.startsWith("http")) results.push({ title, url, snippet });
     }
     if (results.length > 0) return results;
