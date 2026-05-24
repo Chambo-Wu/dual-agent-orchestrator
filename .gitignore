@@ -15,3 +15,8 @@ server32124.bat
 *search_results*.txt
 open-multi-agent/
 .claude/
+.cao-tasks/
+.tmp_patch.txt
+review_findings.txt
+yubao*.md
+国产AI大模型报告*.md

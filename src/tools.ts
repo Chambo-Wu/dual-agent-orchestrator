@@ -265,24 +265,40 @@ function parseSearchResults(body: string, count: number): Array<{ title: string;
     } catch { /* fall through */ }
   }
 
-  // Bing HTML: <li class="b_algo"><h2><a href="URL">TITLE</a></h2><p>SNIPPET</p>
   const html = body;
-  const bingResults: Array<{ title: string; url: string; snippet: string }> = [];
-  // Use RegExp constructor to avoid regex literal escaping issues
-  const bingRe = new RegExp(
-    '<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?(?:<p[^>]*>([\\s\\S]*?)</p>)?',
-    "gi"
-  );
-  for (const m of html.matchAll(bingRe)) {
-    if (bingResults.length >= count) break;
-    const url = m[1] || "";
-    const title = stripHtmlTags(m[2] || "");
-    const snippet = stripHtmlTags(m[3] || "");
-    if (url && title && url.startsWith("http")) {
-      bingResults.push({ title, url, snippet });
+  const results: Array<{ title: string; url: string; snippet: string }> = [];
+
+  // Bing HTML: multiple patterns for different Bing layouts
+  const bingPatterns = [
+    // Standard: <li class="b_algo">...<a href="URL">TITLE</a>...<p>SNIPPET</p> or <span class="b_lineclamp">SNIPPET</span>
+    new RegExp(
+      '<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?(?:<p[^>]*>([\\s\\S]*?)</p>|<span[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\\s\\S]*?)</span>)',
+      "gi"
+    ),
+    // With caption div
+    new RegExp(
+      '<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?<div[^>]*class="[^"]*b_caption[^"]*"[^>]*>[\\s\\S]*?(?:<p[^>]*>([\\s\\S]*?)</p>|<span[^>]*>([\\s\\S]*?)</span>)',
+      "gi"
+    ),
+    // With cite element
+    new RegExp(
+      '<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?<cite[^>]*>([\\s\\S]*?)</cite>',
+      "gi"
+    ),
+  ];
+
+  for (const bingRe of bingPatterns) {
+    for (const m of html.matchAll(bingRe)) {
+      if (results.length >= count) break;
+      const url = m[1] || "";
+      const title = stripHtmlTags(m[2] || "");
+      const snippet = stripHtmlTags(m[3] || m[4] || "");
+      if (url && title && url.startsWith("http")) {
+        results.push({ title, url, snippet });
+      }
     }
+    if (results.length > 0) return results;
   }
-  if (bingResults.length > 0) return bingResults;
 
   // DuckDuckGo fallback
   const ddgRe = new RegExp(
@@ -290,17 +306,33 @@ function parseSearchResults(body: string, count: number): Array<{ title: string;
     "gi"
   );
   const ddgSRe = new RegExp(
-    '<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\\s\\S]*?)</a>',
+    '<(?:a|span)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\\s\\S]*?)</(?:a|span)>',
     "gi"
   );
   const ddgMatches = [...html.matchAll(ddgRe)];
   const ddgSnippets = [...html.matchAll(ddgSRe)].map((m) => stripHtmlTags(m[1] || ""));
-  const results: Array<{ title: string; url: string; snippet: string }> = [];
   for (let i = 0; i < ddgMatches.length && results.length < count; i++) {
     const href = ddgMatches[i]?.[1] ?? "";
     const title = stripHtmlTags(ddgMatches[i]?.[2] ?? "");
     if (!href || !title) continue;
     results.push({ title, url: href.startsWith("//") ? `https:${href}` : href, snippet: ddgSnippets[i] ?? "" });
+  }
+  if (results.length > 0) return results;
+
+  // Generic fallback: extract any <a> tags with http href
+  const genericRe = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const seen = new Set<string>();
+  for (const m of html.matchAll(genericRe)) {
+    if (results.length >= count) break;
+    const url = m[1] || "";
+    const title = stripHtmlTags(m[2] || "");
+    if (!url || !title || seen.has(url)) continue;
+    if (title.length < 5 || /^(sign in|log in|register|home|about|contact|privacy|terms)$/i.test(title)) continue;
+    seen.add(url);
+    const afterLink = html.slice(m.index + m[0].length, m.index + m[0].length + 500);
+    const snippetMatch = afterLink.match(/<(?:p|span|div)[^>]*>([\s\S]*?)<\/(?:p|span|div)>/);
+    const snippet = snippetMatch ? stripHtmlTags(snippetMatch[1] || "") : "";
+    results.push({ title, url, snippet });
   }
   return results;
 }
