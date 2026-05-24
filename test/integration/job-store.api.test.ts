@@ -16,6 +16,11 @@ class MockResponse extends EventEmitter {
     return this;
   }
 
+  write(chunk: unknown): boolean {
+    this.body += String(chunk);
+    return true;
+  }
+
   end(chunk?: unknown): this {
     if (chunk !== undefined) {
       this.body += String(chunk);
@@ -325,17 +330,20 @@ test("job events endpoint reconstructs job timeline from persisted state", async
   const okBody = JSON.parse(okRes.body) as {
     job_id: string;
     count: number;
-    events: Array<{ type: string; job_id: string; step_id?: string | null; data?: Record<string, unknown> }>;
+    snapshot: null | { job_id: string; event_count: number };
+    events: Array<{ type: string; jobId: string; taskRunId?: string; agent: string; status: string; meta?: Record<string, unknown> }>;
   };
 
   assert.equal(okRes.statusCode, 200);
   assert.equal(okBody.job_id, "job_steps_test");
   assert.equal(okBody.count, okBody.events.length);
-  assert.equal(okBody.events.some((event) => event.type === "job.persisted"), true);
+  assert.equal(okBody.events.some((event) => event.type === "job.created"), true);
   assert.equal(okBody.events.some((event) => event.type === "plan.created"), true);
-  assert.equal(okBody.events.some((event) => event.type === "step.blocked" && event.step_id === "taskrun_steps_test"), true);
-  assert.equal(okBody.events.some((event) => event.type === "executor.partial_success" && event.step_id === "taskrun_steps_test"), true);
-  assert.equal(okBody.events.some((event) => event.type === "artifact.created" && event.step_id === "taskrun_steps_test"), true);
+  assert.equal(okBody.events.some((event) => event.type === "step.blocked" && event.taskRunId === "taskrun_steps_test"), true);
+  assert.equal(okBody.events.some((event) => event.type === "executor.partial_success" && event.taskRunId === "taskrun_steps_test"), true);
+  assert.equal(okBody.events.some((event) => event.type === "artifact.created" && event.taskRunId === "taskrun_steps_test"), true);
+  assert.equal(okBody.events.every((event) => typeof event.jobId === "string" && typeof event.agent === "string"), true);
+  assert.equal(okBody.snapshot?.job_id, "job_steps_test");
 
   const cancelRes = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest({
@@ -355,6 +363,19 @@ test("job events endpoint reconstructs job timeline from persisted state", async
 
   assert.equal(missingRes.statusCode, 404);
   assert.equal(missingBody.error?.type, "not_found_error");
+});
+
+test("job stream endpoint replays standardized timeline events and snapshot", async () => {
+  const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/stream"), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(String(res.headers.get("content-type")).includes("text/event-stream"), true);
+  assert.equal(res.body.includes("event: job.snapshot"), true);
+  assert.equal(res.body.includes("event: job.event"), true);
+  assert.equal(res.body.includes("\"type\":\"executor.partial_success\""), true);
+
+  res.end();
 });
 
 test("job cancel endpoint updates control metadata", async () => {

@@ -19,6 +19,9 @@ import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, type StoredJobRecord } from "./job-store.js";
 import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
+import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
+import { appendEvent, getEvents, getLatestSnapshot, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
+import { renderTimelineHtml } from "./timeline.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
@@ -164,6 +167,7 @@ interface TaskExecutionContext {
   planId: string;
   taskRunId: string;
   signal: AbortSignal;
+  emitEvent?: OrchestratorEventCallback;
 }
 
 let injectedTaskExecutor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null = null;
@@ -770,116 +774,303 @@ function latestExecutorStatus(record: StoredJobRecord): ExecutorOutput["status"]
   return history.at(-1)?.status ?? null;
 }
 
-function buildJobEvents(record: StoredJobRecord): unknown[] {
-  const events: Array<Record<string, unknown>> = [
-    {
-      id: `${record.job.id}:job:persisted`,
-      type: "job.persisted",
-      created_at: record.savedAt,
-      job_id: record.job.id,
-      data: {
-        status: record.job.status,
-        mode: record.job.mode,
-        goal: record.job.goal,
-      },
-    },
-    {
-      id: `${record.job.id}:plan:${record.plan.id}`,
-      type: "plan.created",
-      created_at: record.savedAt,
-      job_id: record.job.id,
+function createLifecycleEvent(input: {
+  jobId: string;
+  seq: number;
+  time: string;
+  type: string;
+  title: string;
+  summary: string;
+  status: WorkflowUiEvent["status"];
+  phase?: WorkflowUiEvent["phase"];
+  step?: number;
+  taskRunId?: string;
+  meta?: Record<string, unknown>;
+}): WorkflowUiEvent {
+  return createUiEvent({
+    jobId: input.jobId,
+    seq: input.seq,
+    time: input.time,
+    agent: "system",
+    phase: input.phase ?? "result",
+    type: input.type,
+    title: input.title,
+    summary: input.summary,
+    status: input.status,
+    step: input.step,
+    taskRunId: input.taskRunId,
+    meta: input.meta ?? {},
+  });
+}
+
+function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
+  const events: WorkflowUiEvent[] = [];
+  let seq = 1;
+  const push = (event: WorkflowUiEvent) => {
+    events.push(event);
+    seq += 1;
+  };
+
+  push(createLifecycleEvent({
+    jobId: record.job.id,
+    seq,
+    time: record.savedAt,
+    type: "job.created",
+    title: "Job created",
+    summary: "A control-plane job record was created.",
+    status: "running",
+    meta: {
+      mode: record.job.mode,
+      goal: record.job.goal,
       plan_id: record.plan.id,
-      data: {
-        mode: record.plan.mode,
-        summary: record.plan.summary ?? "",
-        task_run_ids: record.plan.taskRunIds,
-      },
     },
-  ];
+  }));
+
+  push(createLifecycleEvent({
+    jobId: record.job.id,
+    seq,
+    time: record.savedAt,
+    type: "plan.created",
+    title: "Plan created",
+    summary: record.plan.summary || "A plan was attached to the job.",
+    status: "running",
+    meta: {
+      mode: record.plan.mode,
+      task_run_ids: record.plan.taskRunIds,
+    },
+  }));
 
   for (const taskRun of record.taskRuns) {
-    events.push({
-      id: `${record.job.id}:step:${taskRun.id}`,
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.savedAt,
       type: `step.${taskRun.status}`,
-      created_at: record.savedAt,
-      job_id: record.job.id,
-      plan_id: record.plan.id,
-      step_id: taskRun.id,
-      data: {
+      title: "Task step recorded",
+      summary: `${taskRun.title} is currently ${taskRun.status}.`,
+      status: mapTaskRunStatus(taskRun.status),
+      taskRunId: taskRun.id,
+      meta: {
         title: taskRun.title,
         verified: taskRun.verified,
         attempts: taskRun.attempts,
         artifact_count: taskRun.artifacts.length,
       },
-    });
+    }));
 
     for (const [index, executorOutput] of (taskRun.executorHistory ?? []).entries()) {
-      events.push({
-        id: `${record.job.id}:step:${taskRun.id}:executor:${index + 1}`,
-        type: `executor.${executorOutput.status}`,
-        created_at: record.savedAt,
-        job_id: record.job.id,
-        plan_id: record.plan.id,
-        step_id: taskRun.id,
-        data: {
-          summary: executorOutput.summary,
+      push(createLifecycleEvent({
+        jobId: record.job.id,
+        seq,
+        time: record.savedAt,
+        type: mapExecutorHistoryType(executorOutput.status),
+        title: "Executor result recorded",
+        summary: executorOutput.summary,
+        status: mapExecutorHistoryStatus(executorOutput.status),
+        taskRunId: taskRun.id,
+        step: index + 1,
+        meta: {
           source: executorOutput.source ?? null,
           error: executorOutput.error ?? null,
           artifact_count: executorOutput.artifacts.length,
           tool_call_count: executorOutput.tool_calls_made.length,
         },
-      });
+      }));
     }
   }
 
   for (const artifact of record.artifacts) {
-    events.push({
-      id: `${record.job.id}:artifact:${artifact.id}`,
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.savedAt,
       type: "artifact.created",
-      created_at: record.savedAt,
-      job_id: record.job.id,
-      step_id: artifact.sourceTaskRunId ?? null,
-      data: artifact,
-    });
+      title: "Artifact created",
+      summary: artifact.path
+        ? `Artifact saved to ${artifact.path}.`
+        : `Artifact ${artifact.id} was created.`,
+      status: "success",
+      taskRunId: artifact.sourceTaskRunId,
+      meta: {
+        artifact_id: artifact.id,
+        artifact_type: artifact.type,
+        path: artifact.path ?? null,
+        source: artifact.source,
+      },
+    }));
   }
 
   if (record.control?.cancelledAt) {
-    events.push({
-      id: `${record.job.id}:control:cancelled`,
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.control.cancelledAt,
       type: "job.cancelled",
-      created_at: record.control.cancelledAt,
-      job_id: record.job.id,
-      data: {
+      title: "Job cancelled",
+      summary: "The job was cancelled.",
+      status: "blocked",
+      meta: {
         cancellation_requested_at: record.control.cancellationRequestedAt ?? null,
       },
-    });
+    }));
   }
 
   if (record.control?.retriedAt) {
-    events.push({
-      id: `${record.job.id}:control:retried`,
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.control.retriedAt,
       type: "job.retried",
-      created_at: record.control.retriedAt,
-      job_id: record.job.id,
-      data: {
+      title: "Job retried",
+      summary: `A retry job was created: ${record.control.retriedToJobId ?? "unknown"}.`,
+      status: "success",
+      meta: {
         retried_to_job_id: record.control.retriedToJobId ?? null,
       },
-    });
+    }));
   }
 
   if (record.control?.retryOf) {
-    events.push({
-      id: `${record.job.id}:control:retry-of`,
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.savedAt,
       type: "job.retry_created",
-      created_at: record.savedAt,
-      job_id: record.job.id,
-      data: {
+      title: "Retry job created",
+      summary: `This job is a retry of ${record.control.retryOf}.`,
+      status: "running",
+      meta: {
         retry_of: record.control.retryOf,
       },
-    });
+    }));
   }
 
+  push(createLifecycleEvent({
+    jobId: record.job.id,
+    seq,
+    time: record.savedAt,
+    type: mapJobFinalType(record.job.status),
+    title: "Job state recorded",
+    summary: `Job finished with status ${record.job.status}.`,
+    status: mapJobStatus(record.job.status),
+    meta: {
+      verified: record.job.verified,
+      output_preview: record.job.output.slice(0, 200),
+    },
+  }));
+
   return events;
+}
+
+function mapTaskRunStatus(status: TaskRun["status"]): WorkflowUiEvent["status"] {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "blocked":
+      return "blocked";
+    case "in_progress":
+    case "pending":
+    case "skipped":
+    default:
+      return "running";
+  }
+}
+
+function mapExecutorHistoryStatus(status: ExecutorOutput["status"]): WorkflowUiEvent["status"] {
+  switch (status) {
+    case "success":
+      return "success";
+    case "partial_success":
+      return "partial_success";
+    case "failed":
+      return "failed";
+    case "blocked":
+      return "blocked";
+    default:
+      return "running";
+  }
+}
+
+function mapExecutorHistoryType(status: ExecutorOutput["status"]): string {
+  switch (status) {
+    case "partial_success":
+      return "executor.partial_success";
+    case "failed":
+      return "executor.failed";
+    case "blocked":
+      return "executor.blocked";
+    case "success":
+    default:
+      return "executor.result";
+  }
+}
+
+function mapJobStatus(status: Job["status"]): WorkflowUiEvent["status"] {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "blocked":
+    default:
+      return "blocked";
+  }
+}
+
+function mapJobFinalType(status: Job["status"]): string {
+  switch (status) {
+    case "completed":
+      return "job.completed";
+    case "failed":
+      return "job.failed";
+    case "blocked":
+    default:
+      return "job.blocked";
+  }
+}
+
+function buildEventSnapshot(jobId: string, events: WorkflowUiEvent[]): Record<string, unknown> | null {
+  if (events.length === 0) {
+    return null;
+  }
+
+  const latestByAgent = (agent: WorkflowUiEvent["agent"]) => [...events].reverse().find((event) => event.agent === agent) ?? null;
+  return {
+    job_id: jobId,
+    seq: events.at(-1)?.seq ?? 0,
+    event_count: events.length,
+    latest_planner: latestByAgent("planner"),
+    latest_executor: latestByAgent("executor"),
+    latest_tool: latestByAgent("tool"),
+    latest_system: latestByAgent("system"),
+  };
+}
+
+function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEvent[]): WorkflowUiEvent[] {
+  if (persistedEvents.length === 0) {
+    return buildJobEvents(record);
+  }
+  if (persistedEvents.some((event) => event.type === "job.created")) {
+    return persistedEvents;
+  }
+
+  const fallbackEvents = buildJobEvents(record);
+  const seen = new Set(fallbackEvents.map((event) => `${event.type}|${event.taskRunId ?? ""}|${event.step ?? ""}`));
+  const merged = [...fallbackEvents];
+  for (const event of persistedEvents) {
+    const key = `${event.type}|${event.taskRunId ?? ""}|${event.step ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    merged.push(event);
+    seen.add(key);
+  }
+
+  return merged
+    .sort((a, b) => a.time.localeCompare(b.time) || a.seq - b.seq)
+    .map((event, index) => ({ ...event, seq: index + 1 }));
 }
 
 function buildJobResponse(record: StoredJobRecord): unknown {
@@ -1098,6 +1289,34 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
   const planId = `plan_${randomUUID()}`;
   const taskRunId = `taskrun_${randomUUID()}`;
   const abortController = new AbortController();
+  const emitUiEvent = (event: WorkflowUiEvent) => {
+    appendEvent(event);
+  };
+  const emitLifecycle = (type: string, title: string, summary: string, status: WorkflowUiEvent["status"], meta: Record<string, unknown> = {}, phase: WorkflowUiEvent["phase"] = "result") => {
+    emitUiEvent(createLifecycleEvent({
+      jobId,
+      seq: getNextSeq(jobId),
+      time: new Date().toISOString(),
+      type,
+      title,
+      summary,
+      status,
+      phase,
+      taskRunId,
+      meta,
+    }));
+  };
+  const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
+    emitUiEvent(normalizeWorkflowEvent(
+      { type: event.type, step: event.step, data: event.data } as InternalWorkflowEvent,
+      jobId,
+      getNextSeq(jobId),
+      new Date().toISOString(),
+      taskRunId,
+    ));
+    onEvent?.(event);
+  };
+
   registerActiveJobSession(jobId, userGoal, abortController);
   const pendingTaskRun = createTaskRunRecord({
     id: taskRunId,
@@ -1133,84 +1352,117 @@ async function executeTaskGoal(userGoal: string, model: string | undefined, requ
     taskRuns: [pendingTaskRun],
     artifacts: [],
   });
+  emitLifecycle("job.created", "Job created", "A new job was created and queued for execution.", "running", {
+    mode: pendingJob.mode,
+    goal: pendingJob.goal,
+    plan_id: pendingPlan.id,
+  }, "start");
+  emitLifecycle("job.started", "Job started", "Execution started for the requested goal.", "running", {
+    plan_id: pendingPlan.id,
+    task_run_id: pendingTaskRun.id,
+  }, "start");
   try {
     if (abortController.signal.aborted) {
       throw new Error("Run cancelled before start.");
     }
 
+    let payload: TaskExecutionPayload;
     if (injectedTaskExecutor) {
-      return await injectedTaskExecutor(userGoal, model, requirePlannerCircuit, {
+      payload = await injectedTaskExecutor(userGoal, model, requirePlannerCircuit, {
         jobId,
         planId,
         taskRunId,
         signal: abortController.signal,
+        emitEvent: forwardRuntimeEvent,
       });
-    }
-
-    const baseConfig = loadConfig();
-    const modelSelection = resolveRequestedModel(baseConfig, model);
-    if (requirePlannerCircuit) {
-      assertPlannerCircuitClosed();
-    }
-    const logger = createRunLogger(userGoal);
-    const routing = loadTaskRoutingConfig(modelSelection.resolvedConfig.taskRoutingPath);
-    const taskType = detectTaskType(userGoal, routing);
-    const routePolicy = getRoutePolicy(taskType, routing);
-    let result;
-    try {
-      result = await runTask(modelSelection.resolvedConfig, userGoal, routePolicy, logger, undefined, {
-        abortSignal: abortController.signal,
-        jobId,
-        planId,
-        taskRunId,
-        onEvent,
-      });
+    } else {
+      const baseConfig = loadConfig();
+      const modelSelection = resolveRequestedModel(baseConfig, model);
       if (requirePlannerCircuit) {
-        markPlannerSuccess();
+        assertPlannerCircuitClosed();
       }
-    } catch (error) {
-      if (requirePlannerCircuit && error instanceof PlannerUnavailableError) {
-        throw markPlannerFailure(error.message);
+      const logger = createRunLogger(userGoal);
+      const routing = loadTaskRoutingConfig(modelSelection.resolvedConfig.taskRoutingPath);
+      const taskType = detectTaskType(userGoal, routing);
+      const routePolicy = getRoutePolicy(taskType, routing);
+      let result;
+      try {
+        result = await runTask(modelSelection.resolvedConfig, userGoal, routePolicy, logger, undefined, {
+          abortSignal: abortController.signal,
+          jobId,
+          planId,
+          taskRunId,
+          onEvent: forwardRuntimeEvent,
+        });
+        if (requirePlannerCircuit) {
+          markPlannerSuccess();
+        }
+      } catch (error) {
+        if (requirePlannerCircuit && error instanceof PlannerUnavailableError) {
+          throw markPlannerFailure(error.message);
+        }
+        throw error;
       }
-      throw error;
+
+      payload = {
+        content: result.output || "",
+        logPath: logger.logPath,
+        resolvedModel: modelSelection.exposed.id,
+        job: result.job,
+        plan: result.plan,
+        taskRuns: result.taskRuns,
+        artifacts: result.artifacts,
+      };
     }
 
-    const content = result.output || "";
-
-    // Run system-level verification
+    const executorHistory = payload.taskRuns.flatMap((taskRun) => taskRun.executorHistory ?? []);
     const verificationContext: VerificationContext = {
       jobId,
       goal: userGoal,
-      executorHistory: result.executorHistory,
-      artifacts: result.artifacts,
-      taskRuns: result.taskRuns,
+      executorHistory,
+      artifacts: payload.artifacts,
+      taskRuns: payload.taskRuns,
       workspaceRoot: WORKSPACE_ROOT,
       runtimeRoot: RUNTIME_ROOT,
     };
     const verificationResults = await runVerifiers(verificationContext);
     const allPassed = verificationPassed(verificationResults);
+    const verifiedJob = allPassed ? payload.job : { ...payload.job, verified: false };
     if (!allPassed) {
-      result.job = { ...result.job, verified: false };
+      emitLifecycle("system.verification_failed", "Verification reported issues", "Verification completed with one or more issues.", "blocked", {
+        verifier_count: verificationResults.length,
+      });
+    } else {
+      emitLifecycle("system.verification_passed", "Verification passed", "Verification completed successfully.", "success", {
+        verifier_count: verificationResults.length,
+      });
     }
 
     const jobRecordPath = persistWorkflowPayload({
-      job: result.job,
-      plan: result.plan,
-      taskRuns: result.taskRuns,
-      artifacts: result.artifacts,
+      job: verifiedJob,
+      plan: payload.plan,
+      taskRuns: payload.taskRuns,
+      artifacts: payload.artifacts,
     });
+    emitLifecycle(mapJobFinalType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatus(verifiedJob.status), {
+      verified: verifiedJob.verified,
+      output_preview: verifiedJob.output.slice(0, 200),
+      log_path: payload.logPath,
+      job_record_path: jobRecordPath,
+    }, "final");
 
-    console.error(`Run log: ${logger.logPath}`);
+    console.error(`Run log: ${payload.logPath}`);
     console.error(`Job record: ${jobRecordPath}`);
     return {
-      content,
-      logPath: logger.logPath,
-      resolvedModel: modelSelection.exposed.id,
-      job: result.job,
-      plan: result.plan,
-      taskRuns: result.taskRuns,
-      artifacts: result.artifacts,
+      ...payload,
+      job: verifiedJob,
     };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    emitLifecycle("job.failed", "Job failed", truncateToolResultContent(message || "Job failed."), "failed", {
+      error: message,
+    }, "final");
+    throw error;
   } finally {
     unregisterActiveJobSession(jobId);
   }
@@ -1412,7 +1664,7 @@ async function handleGetJobRuntimeProfile(_req: IncomingMessage, res: ServerResp
   });
 }
 
-async function handleGetJobEvents(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+async function handleGetJobEvents(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
     jsonResponse(res, 404, {
@@ -1423,12 +1675,103 @@ async function handleGetJobEvents(_req: IncomingMessage, res: ServerResponse, jo
     });
     return;
   }
-  const events = buildJobEvents(record);
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  const sinceSeqRaw = url.searchParams.get("since_seq");
+  const limitRaw = url.searchParams.get("limit");
+  const sinceSeq = sinceSeqRaw ? Number.parseInt(sinceSeqRaw, 10) : undefined;
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
+
+  let events = mergeJobEvents(record, loadEventsFromDisk(jobId));
+  if (Number.isFinite(sinceSeq)) {
+    events = events.filter((event) => event.seq > (sinceSeq as number));
+  }
+  if (Number.isFinite(limit) && (limit as number) >= 0) {
+    events = events.slice(0, limit as number);
+  }
   jsonResponse(res, 200, {
     job_id: jobId,
     count: events.length,
+    snapshot: getLatestSnapshot(jobId) ?? buildEventSnapshot(jobId, events),
     events,
   });
+}
+
+async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  // Verify job exists
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  // Load existing events from disk
+  const existingEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
+
+  // Set SSE headers
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+
+  // Send initial snapshot
+  const snapshot = getLatestSnapshot(jobId) ?? buildEventSnapshot(jobId, existingEvents);
+  if (snapshot) {
+    sseWriteEvent(res, "job.snapshot", JSON.stringify(snapshot));
+  }
+
+  // Send existing events
+  const replayEvents = existingEvents.length > 0 ? existingEvents : getEvents(jobId);
+  for (const event of replayEvents) {
+    sseWriteEvent(res, "job.event", JSON.stringify(event));
+  }
+
+  // Subscribe to new events
+  const unsubscribe = subscribe(jobId, (event) => {
+    try {
+      sseWriteEvent(res, "job.event", JSON.stringify(event));
+    } catch {
+      // Client disconnected
+      unsubscribe();
+    }
+  });
+
+  // Heartbeat every 30 seconds
+  const heartbeat = setInterval(() => {
+    try {
+      sseWriteEvent(res, "heartbeat", JSON.stringify({ time: new Date().toISOString() }));
+    } catch {
+      clearInterval(heartbeat);
+      unsubscribe();
+    }
+  }, 30_000);
+  heartbeat.unref?.();
+
+  // Auto-cleanup after 10 minutes (SSE connections shouldn't last forever)
+  const maxDuration = 10 * 60 * 1000;
+  const timeout = setTimeout(() => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    try {
+      res.end();
+    } catch {
+      // Ignore
+    }
+  }, maxDuration);
+  timeout.unref?.();
+
+  // Clear timeout if response ends normally
+  const originalEnd = res.end.bind(res);
+  res.end = function (...args: Parameters<typeof originalEnd>) {
+    clearTimeout(timeout);
+    clearInterval(heartbeat);
+    unsubscribe();
+    return originalEnd(...args);
+  } as typeof res.end;
 }
 
 async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
@@ -1447,6 +1790,20 @@ async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId
     });
     return;
   }
+  appendEvent(createLifecycleEvent({
+    jobId,
+    seq: getNextSeq(jobId),
+    time: updated.control?.cancelledAt ?? new Date().toISOString(),
+    type: "job.cancelled",
+    title: "Job cancelled",
+    summary: "Cancellation was requested for this job.",
+    status: "blocked",
+    meta: {
+      active: Boolean(active),
+      interrupted,
+      cancellation_requested_at: updated.control?.cancellationRequestedAt ?? null,
+    },
+  }));
   jsonResponse(res, 200, {
     ok: true,
     job_id: jobId,
@@ -1476,6 +1833,18 @@ async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId:
   const retriedRecord = updateJobControlState(retryResult.job.id, {
     retryOf: jobId,
   });
+  appendEvent(createLifecycleEvent({
+    jobId,
+    seq: getNextSeq(jobId),
+    time: new Date().toISOString(),
+    type: "job.retried",
+    title: "Job retried",
+    summary: `A retry job was created: ${retryResult.job.id}.`,
+    status: "success",
+    meta: {
+      retried_to_job_id: retryResult.job.id,
+    },
+  }));
 
   jsonResponse(res, 200, {
     ok: true,
@@ -1486,6 +1855,35 @@ async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId:
     artifacts: retryResult.artifacts,
     control: retriedRecord?.control ?? { retryOf: jobId },
   });
+}
+
+async function handleJobTimeline(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  const record = readJobRecord(jobId);
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Job not found: ${jobId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  // Load events from disk
+  const events = loadEventsFromDisk(jobId);
+  const timelineEvents = events.length > 0 ? events : buildJobEvents(record);
+
+  // Render timeline HTML
+  const html = renderTimelineHtml(
+    jobId,
+    timelineEvents,
+    record.job.goal,
+    record.job.status,
+  );
+
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
 }
 
 async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
@@ -1526,6 +1924,23 @@ async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId
   }
 
   const signaled = resolvePendingApproval(jobId, body.decision);
+  appendEvent(createLifecycleEvent({
+    jobId,
+    seq: getNextSeq(jobId),
+    time: new Date().toISOString(),
+    type: body.decision === "approved" ? "approval.approved" : "approval.denied",
+    title: body.decision === "approved" ? "Approval granted" : "Approval denied",
+    summary: body.decision === "approved"
+      ? "A pending approval request was approved."
+      : "A pending approval request was denied.",
+    status: body.decision === "approved" ? "success" : "blocked",
+    phase: "approval",
+    meta: {
+      approval_id: body.approval_id,
+      note: body.note ?? "",
+      signaled,
+    },
+  }));
 
   jsonResponse(res, 200, {
     ok: true,
@@ -1569,6 +1984,18 @@ async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId
   const resumedRecord = updateJobControlState(resumeResult.job.id, {
     resumeOf: jobId,
   });
+  appendEvent(createLifecycleEvent({
+    jobId,
+    seq: getNextSeq(jobId),
+    time: new Date().toISOString(),
+    type: "job.resumed",
+    title: "Job resumed",
+    summary: `A resumed job was created: ${resumeResult.job.id}.`,
+    status: "success",
+    meta: {
+      resumed_to_job_id: resumeResult.job.id,
+    },
+  }));
 
   jsonResponse(res, 200, {
     ok: true,
@@ -1659,7 +2086,6 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     const streamId = `chatcmpl-${Date.now()}`;
     sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { role: "assistant", content: "" }, null));
 
-    // Create callback to forward orchestrator events to SSE
     const onEvent: OrchestratorEventCallback | undefined = includeWorkflowEvents
       ? (event) => {
           try {
@@ -2083,6 +2509,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const jobEventsMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/events$/);
     if (method === "GET" && jobEventsMatch) {
       await handleGetJobEvents(req, res, decodeURIComponent(jobEventsMatch[1]!));
+      return;
+    }
+
+    const jobStreamMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/stream$/);
+    if (method === "GET" && jobStreamMatch) {
+      await handleJobStream(req, res, decodeURIComponent(jobStreamMatch[1]!));
+      return;
+    }
+
+    const jobTimelineMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)\/timeline$/);
+    if (method === "GET" && jobTimelineMatch) {
+      await handleJobTimeline(req, res, decodeURIComponent(jobTimelineMatch[1]!));
       return;
     }
 
