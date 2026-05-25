@@ -61,7 +61,9 @@ English documentation: [README.md](./README.md)
 
 ## 配置
 
-编辑 `config/example.config.yml`：
+先将 `config/example.config.yml` 作为模板，复制为 `config/config.yml`。
+
+实际运行时请编辑 `config/config.yml`：
 
 ```yml
 planner:
@@ -89,6 +91,12 @@ npm install
 npm run build
 npm run config:validate
 ```
+
+说明：
+
+- 系统默认读取的是 `config/config.yml`
+- `config/example.config.yml` 仅作为示例模板，不会被自动加载
+- `npm run config:validate` 和 `npm run doctor` 默认校验的也都是 `config/config.yml`，除非你显式传入其他路径
 
 执行单次 CLI 任务：
 

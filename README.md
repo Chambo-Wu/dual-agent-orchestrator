@@ -69,7 +69,9 @@ Notes:
 
 ## Configuration
 
-Edit `config/example.config.yml`:
+Use `config/example.config.yml` as a template, then copy it to `config/config.yml`.
+
+Edit `config/config.yml`:
 
 ```yml
 planner:
@@ -97,6 +99,12 @@ npm install
 npm run build
 npm run config:validate
 ```
+
+Notes:
+
+- the runtime loads `config/config.yml` by default
+- `config/example.config.yml` is only a sample template and is not loaded automatically
+- `npm run config:validate` and `npm run doctor` also validate `config/config.yml` unless you pass a custom path
 
 Run a one-off CLI task:
 
