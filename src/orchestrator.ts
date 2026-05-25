@@ -498,6 +498,7 @@ async function runExecutorConversation(
   const messages = buildExecutorMessages(config, request);
   const artifacts: ExecutorOutput["artifacts"] = [];
   const executedCalls: Array<{ tool: string; arguments: Record<string, unknown> }> = [];
+  const executedCallKeys = new Set<string>();
   let lastSummary = "";
   let lastRawResult = "";
   let lastError: string | undefined;
@@ -523,7 +524,8 @@ async function runExecutorConversation(
         .map((call) => ({
           tool: call.tool,
           arguments: isRecord(call.arguments) ? call.arguments : {},
-        }));
+        }))
+        .filter((call) => !executedCallKeys.has(`${call.tool}:${JSON.stringify(call.arguments)}`));
 
       if (declaredCalls.length > 0) {
         logger?.log("executor.declared_tool_calls_fallback", {
@@ -579,6 +581,7 @@ async function runExecutorConversation(
 
       const call = { tool: nativeCall.name, arguments: argumentsObject };
       executedCalls.push(call);
+      executedCallKeys.add(`${call.tool}:${JSON.stringify(call.arguments)}`);
 
       if (!request?.allowed_tools.includes(call.tool)) {
         logger?.log("tool.blocked", {
@@ -1200,6 +1203,18 @@ function buildPlannerHistoryText(config: OrchestratorConfig, executorHistory: Ex
 
   if (hiddenCount > 0) {
     historyLines.unshift(`... ${hiddenCount} earlier worker steps omitted to save planner tokens ...`);
+  }
+
+  // Detect poor search quality in recent steps
+  const recentSearchSteps = visibleHistory.filter((item) =>
+    item.tool_calls_made.some((tc) => tc.tool === "web_search")
+  );
+  const poorSearchCount = recentSearchSteps.filter((item) => {
+    const previews = item.artifacts.map((a) => a.content_preview ?? "").join(" ");
+    return previews.length < 150 || /(登录|注册|首页|navigation|sign\s*in)/i.test(previews);
+  }).length;
+  if (recentSearchSteps.length >= 2 && poorSearchCount >= 2) {
+    historyLines.push("⚠ SEARCH QUALITY WARNING: The last search results appear irrelevant or low-quality. Consider changing the search query significantly, or skip search and use your own knowledge instead.");
   }
 
   return historyLines.join("\n");

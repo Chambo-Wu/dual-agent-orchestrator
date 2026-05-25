@@ -234,6 +234,61 @@ function stripHtmlTags(html: string): string {
   return html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 
+function cleanBingTitle(title: string): string {
+  let cleaned = title;
+  // Bing Chinese results often embed "domain.com https://url › path" before the real title
+  cleaned = cleaned.replace(/^[^\s]{1,50}\s+https?:\/\/[^\s]+/, "").trim();
+  // Remove trailing breadcrumb " › item › ..."
+  cleaned = cleaned.replace(/\s*›\s*.+$/, "").trim();
+  return cleaned;
+}
+
+const NAVIGATION_JUNK_PATTERNS = [
+  /^(sign\s*in|log\s*in|register|登录|注册|登入)$/i,
+  /^(home|首页|主页)$/i,
+  /^(about|contact|privacy|terms|关于|联系|隐私|条款)$/i,
+  /^(skip\s+to|跳转|导航)$/i,
+];
+
+function isNavigationJunk(title: string, url: string, snippet: string): boolean {
+  const t = title.trim().toLowerCase();
+  for (const p of NAVIGATION_JUNK_PATTERNS) {
+    if (p.test(t)) return true;
+  }
+  // Root URL with short snippet = likely homepage, not a specific result
+  if (/\/(?:zh|cn|en)?\/?$/.test(url) && snippet.length < 50) return true;
+  // Title is just a domain name like "baidu.com"
+  if (/^[a-z0-9-]+\.[a-z]{2,6}$/i.test(t)) return true;
+  return false;
+}
+
+const searchCache = new Map<string, { results: Array<{ title: string; url: string; snippet: string }>; timestamp: number }>();
+const SEARCH_CACHE_TTL_MS = 60_000;
+
+function getCachedSearchResults(query: string): Array<{ title: string; url: string; snippet: string }> | null {
+  const key = query.toLowerCase().trim();
+  const entry = searchCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > SEARCH_CACHE_TTL_MS) {
+    searchCache.delete(key);
+    return null;
+  }
+  return entry.results;
+}
+
+function setCachedSearchResults(query: string, results: Array<{ title: string; url: string; snippet: string }>): void {
+  const key = query.toLowerCase().trim();
+  searchCache.set(key, { results, timestamp: Date.now() });
+  const now = Date.now();
+  for (const [k, v] of searchCache) {
+    if (now - v.timestamp > SEARCH_CACHE_TTL_MS) searchCache.delete(k);
+  }
+}
+
+export function resetSearchCache(): void {
+  searchCache.clear();
+}
+
 async function fetchUrlText(url: string, timeoutMs: number): Promise<{ ok: boolean; body: string; error?: string }> {
   try {
     const resp = await fetch(url, {
@@ -309,9 +364,9 @@ function parseSearchResults(body: string, count: number): Array<{ title: string;
     for (const m of html.matchAll(bingRe)) {
       if (results.length >= count) break;
       const url = m[1] || "";
-      const title = stripHtmlTags(m[2] || "");
+      const title = cleanBingTitle(stripHtmlTags(m[2] || ""));
       const snippet = stripHtmlTags(m[3] || m[4] || "");
-      if (url && title && url.startsWith("http")) {
+      if (url && title && url.startsWith("http") && !isNavigationJunk(title, url, snippet)) {
         results.push({ title, url, snippet });
       }
     }
@@ -345,11 +400,12 @@ function parseSearchResults(body: string, count: number): Array<{ title: string;
     const url = m[1] || "";
     const title = stripHtmlTags(m[2] || "");
     if (!url || !title || seen.has(url)) continue;
-    if (title.length < 5 || /^(sign in|log in|register|home|about|contact|privacy|terms)$/i.test(title)) continue;
+    if (title.length < 5 || isNavigationJunk(title, url, "")) continue;
     seen.add(url);
     const afterLink = html.slice(m.index + m[0].length, m.index + m[0].length + 500);
     const snippetMatch = afterLink.match(/<(?:p|span|div)[^>]*>([\s\S]*?)<\/(?:p|span|div)>/);
     const snippet = snippetMatch ? stripHtmlTags(snippetMatch[1] || "") : "";
+    if (isNavigationJunk(title, url, snippet)) continue;
     results.push({ title, url, snippet });
   }
   return results;
@@ -457,6 +513,19 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
     if (!query) return { ok: false, summary: "web_search requires query.", rawResult: "", error: "query required" };
     const count = Math.min(Math.max(typeof args.count === "number" ? args.count : 5, 1), 10);
 
+    // Check cache first
+    const cached = getCachedSearchResults(query);
+    if (cached) {
+      const cachedResults = cached.slice(0, count);
+      const raw = JSON.stringify(cachedResults, null, 2);
+      return {
+        ok: true,
+        summary: `Found ${cachedResults.length} results (cached)`,
+        artifact: { type: "json", path: "", content_preview: raw.slice(0, 200) },
+        rawResult: raw,
+      };
+    }
+
     let results: Array<{ title: string; url: string; snippet: string }> = [];
     let providerUsed = "legacy";
 
@@ -506,6 +575,24 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       providerUsed = "legacy";
     }
 
+    // Google fallback when legacy Bing results look like navigation junk
+    if (results.length > 0 && results.every((r) => r.snippet.length < 80)) {
+      try {
+        const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=zh-CN&num=${count}`;
+        const googleResult = await fetchUrlText(googleUrl, DEFAULT_COMMAND_TIMEOUT_MS);
+        if (googleResult.ok) {
+          const googleResults = parseSearchResults(googleResult.body, count);
+          // Only use Google results if they have richer snippets than the Bing ones
+          if (googleResults.length > 0 && googleResults.some((r) => r.snippet.length >= 80)) {
+            results = googleResults;
+            providerUsed = "google_fallback";
+          }
+        }
+      } catch {
+        // Google fallback is best-effort; don't fail if it's blocked
+      }
+    }
+
     const artifactPath = saveJsonArtifact("web-search", results);
     const raw = JSON.stringify(results, null, 2);
     if (results.length === 0) {
@@ -517,6 +604,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
         error: "No search results could be parsed from the fetched page.",
       };
     }
+    setCachedSearchResults(query, results);
     return {
       ok: true,
       summary: `Found ${results.length} results (${providerUsed})`,

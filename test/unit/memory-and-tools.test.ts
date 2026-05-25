@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { resolve } from "node:path";
 import { SharedMemory } from "../../src/memory/shared.js";
 import { ToolRegistry } from "../../src/tool/registry.js";
-import { executeTool } from "../../src/tools.js";
+import { executeTool, resetSearchCache } from "../../src/tools.js";
 import { WORKSPACE_ROOT } from "../../src/paths.js";
 
 test("shared memory isolates task-scoped values", async () => {
@@ -60,6 +60,7 @@ test("file tools resolve relative paths from workspace root", async () => {
 });
 
 test("extended tools reject invalid arguments predictably", async () => {
+  resetSearchCache();
   const missingQuery = await executeTool("web_search", {});
   assert.equal(missingQuery.ok, false);
   assert.equal(missingQuery.error, "query required");
@@ -74,6 +75,7 @@ test("extended tools reject invalid arguments predictably", async () => {
 });
 
 test("web_search writes a real artifact path when results are returned", async () => {
+  resetSearchCache();
   const originalTemplate = process.env.SEARCH_URL_TEMPLATE;
   process.env.SEARCH_URL_TEMPLATE = "data:application/json,{\"results\":[{\"title\":\"DeepSeek\",\"url\":\"https://www.deepseek.com/\",\"snippet\":\"preview\"}]}";
 

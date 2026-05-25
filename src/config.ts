@@ -196,7 +196,7 @@ function validateSearchSection(root: Record<string, unknown>, issues: Validation
   return { provider, fallbackEnabled, apiKey, timeoutMs, providers };
 }
 
-export function loadConfig(configPath = "config/example.config.yml"): OrchestratorConfig {
+export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig {
   loadDotEnvFile();
   const absPath = resolve(configPath);
   const raw = readFileSync(absPath, "utf8");

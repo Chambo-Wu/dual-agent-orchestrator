@@ -29,6 +29,7 @@ Rules:
 - When labels such as recommended, consider, or exclude are provided, preserve that structure in the final answer.
 - **If web search results are consistently poor or irrelevant, acknowledge this in your final answer and suggest the user: (1) refine their search terms, (2) try alternative search tools, or (3) provide more specific context.**
 - **If you encounter repeated failures (HTTP 403, missing files, blocked access), consolidate what you learned and return "final" with actionable recommendations instead of continuing to retry.**
+- **Search failure adaptation: If the worker's last 2 steps both returned poor or irrelevant search results (e.g. search_quality is "poor"), you MUST either: (A) significantly change the search query or approach, or (B) return "final" using your own knowledge with a note like "Web search did not find reliable sources; the following is based on model knowledge." NEVER issue a third similar search request after two consecutive failures.**
 - Keep output short.
 - Return JSON only.
 - Treat the runtime profile as authoritative. Do not guess the OS, shell, network policy, proxy health, writable roots, or available tools.

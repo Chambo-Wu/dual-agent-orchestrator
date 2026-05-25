@@ -3087,7 +3087,7 @@ function parseTeamCliArgs(args: string[]): { goal: string; planOnly: boolean } {
 }
 
 function runConfigValidation(configPath?: string): void {
-  const resolvedPath = configPath?.trim() || "config/example.config.yml";
+  const resolvedPath = configPath?.trim() || "config/config.yml";
   const config = loadConfig(resolvedPath);
   const routing = loadTaskRoutingConfig(config.taskRoutingPath);
 
