@@ -29,9 +29,19 @@ This is no longer just a CLI skeleton. The current codebase includes:
 - planner/executor step history and artifacts
 - realtime workflow event streaming over SSE
 - HTML timeline rendering for jobs
+- workflow-plan parsing, validation, and runtime execution
+- explicit workflow DAG summaries with active and superseded lanes
+- runtime workflow replan history preserved in job responses
+- dependency-graph visualization in the built-in timeline UI
+- replan-to-graph focus interactions in the timeline UI
 - Cherry Studio-friendly progress mirroring inside standard chat streams
 - protocol compatibility guards for OpenAI-style and Anthropic-style clients
 - stronger file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
+
+Milestone note:
+
+- Milestone C is now effectively closed at the runtime and UI-contract level
+- the next phase is mainly Milestone D polish, richer workflow UX, and deeper observability
 
 ## Architecture
 
@@ -41,6 +51,9 @@ This is no longer just a CLI skeleton. The current codebase includes:
 - `src/workflow-ui-events.ts`: normalized frontend event schema
 - `src/job-event-bus.ts`: persisted event bus for job streams
 - `src/timeline.ts`: HTML timeline rendering
+- `src/workflow-plan.ts`: workflow plan schema parsing and validation
+- `src/workflow-runtime.ts`: workflow runtime execution and replan flow
+- `src/workflow-graph.ts`: DAG and replan-history view-model generation
 - `runtime/jobs/`: persisted job records
 - `runtime/logs/`: per-run JSONL logs
 - `runtime/command-results/`: tool artifacts
@@ -201,6 +214,8 @@ The current progress system is designed for both custom frontends and generic cl
 - stage-style progress states such as `planning`, `research`, `evidence`, `filtering`, `synthesis`, and `writing`
 - aggregated tool summaries so repeated `web_search` or `url_fetch` calls do not flood the UI
 - card-style text progress in standard chat streams
+- built-in DAG lanes that now render real dependency graphs instead of simple task lists
+- superseded workflow lanes and replan history focus interactions inside `/v1/jobs/:id/timeline`
 
 Example mirrored progress in chat streams:
 

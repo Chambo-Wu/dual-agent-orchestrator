@@ -127,6 +127,53 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "time_lookup",
+    description: "Return current time details for a timezone, UTC offset, or local runtime.",
+    parameters: {
+      type: "object",
+      properties: {
+        timezone: { type: "string" },
+        utc_offset: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "weather_lookup",
+    description: "Fetch a short weather forecast for a location using a direct weather endpoint.",
+    parameters: {
+      type: "object",
+      properties: {
+        location: { type: "string" },
+        days: { type: "number" },
+      },
+      required: ["location"],
+    },
+  },
+  {
+    name: "finance_lookup",
+    description: "Fetch a direct market quote for a ticker or crypto symbol.",
+    parameters: {
+      type: "object",
+      properties: {
+        symbol: { type: "string" },
+      },
+      required: ["symbol"],
+    },
+  },
+  {
+    name: "sports_lookup",
+    description: "Fetch a direct scoreboard or schedule snapshot for a supported sports league.",
+    parameters: {
+      type: "object",
+      properties: {
+        league: { type: "string" },
+        date: { type: "string" },
+        team: { type: "string" },
+      },
+      required: ["league"],
+    },
+  },
+  {
     name: "summarize_artifact",
     description: "Read an artifact file and produce a truncated summary.",
     parameters: {
@@ -304,6 +351,118 @@ async function fetchUrlText(url: string, timeoutMs: number): Promise<{ ok: boole
   } catch (error) {
     return { ok: false, body: "", error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+async function fetchJson(url: string, timeoutMs: number, headers?: Record<string, string>): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+  try {
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "dual-agent-orchestrator", Accept: "application/json", ...headers },
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "follow",
+    });
+    if (!resp.ok) {
+      return { ok: false, error: `HTTP ${resp.status}: ${resp.statusText}` };
+    }
+    const data = await resp.json();
+    return { ok: true, data };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function formatLocalTime(timezone?: string, utcOffset?: string): { summary: string; raw: string } {
+  const now = new Date();
+  if (utcOffset) {
+    const match = utcOffset.match(/^([+-])(\d{2}):?(\d{2})$/);
+    if (match) {
+      const sign = match[1] === "-" ? -1 : 1;
+      const hours = Number(match[2]);
+      const minutes = Number(match[3]);
+      const offsetMs = sign * ((hours * 60) + minutes) * 60_000;
+      const shifted = new Date(now.getTime() + offsetMs + now.getTimezoneOffset() * 60_000);
+      const iso = shifted.toISOString().replace("T", " ").slice(0, 19);
+      return {
+        summary: `Current time at UTC${utcOffset} is ${iso}`,
+        raw: `Current time at UTC${utcOffset}: ${iso}`,
+      };
+    }
+  }
+
+  const resolvedTimezone = timezone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: resolvedTimezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    const value = formatter.format(now).replace(",", "");
+    return {
+      summary: `Current time in ${resolvedTimezone} is ${value}`,
+      raw: `Current time in ${resolvedTimezone}: ${value}`,
+    };
+  } catch {
+    const fallback = now.toISOString().replace("T", " ").slice(0, 19);
+    return {
+      summary: `Current local time is ${fallback}`,
+      raw: `Current local time: ${fallback}`,
+    };
+  }
+}
+
+function formatWeatherSummary(location: string, payload: any, days: number): string {
+  const daily = Array.isArray(payload?.weather) ? payload.weather.slice(0, days) : [];
+  const lines = [`# Weather forecast for ${location}`, ""];
+  if (daily.length === 0) {
+    return `Weather data for ${location} was returned, but no daily forecast entries were found.`;
+  }
+  lines.push("| Date | Condition | High | Low |");
+  lines.push("| --- | --- | --- | --- |");
+  for (const day of daily) {
+    const date = typeof day?.date === "string" ? day.date : "";
+    const condition = Array.isArray(day?.hourly) && day.hourly[0]?.weatherDesc?.[0]?.value
+      ? String(day.hourly[0].weatherDesc[0].value)
+      : "";
+    const high = day?.maxtempC ? `${day.maxtempC}C` : "";
+    const low = day?.mintempC ? `${day.mintempC}C` : "";
+    lines.push(`| ${date} | ${condition} | ${high} | ${low} |`);
+  }
+  return lines.join("\n");
+}
+
+function formatFinanceSummary(symbol: string, quote: any): string {
+  const price = quote?.regularMarketPrice ?? quote?.postMarketPrice ?? quote?.preMarketPrice;
+  const change = quote?.regularMarketChange;
+  const changePct = quote?.regularMarketChangePercent;
+  const currency = quote?.currency ?? "";
+  const marketState = quote?.marketState ?? "UNKNOWN";
+  return [
+    `# Market quote for ${symbol}`,
+    "",
+    `Price: ${price ?? "N/A"} ${currency}`.trim(),
+    `Change: ${change ?? "N/A"} (${typeof changePct === "number" ? `${changePct.toFixed(2)}%` : "N/A"})`,
+    `Market state: ${marketState}`,
+  ].join("\n");
+}
+
+function formatSportsSummary(league: string, events: any[], team?: string): string {
+  const lines = [`# ${league.toUpperCase()} scoreboard`, ""];
+  const filtered = team
+    ? events.filter((event) => JSON.stringify(event).toLowerCase().includes(team.toLowerCase()))
+    : events;
+  if (filtered.length === 0) {
+    return `No ${league.toUpperCase()} games matched${team ? ` team "${team}"` : ""}.`;
+  }
+  for (const event of filtered.slice(0, 10)) {
+    const name = event?.name ?? "Unknown matchup";
+    const status = event?.status?.type?.shortDetail ?? event?.status?.type?.description ?? "Scheduled";
+    lines.push(`- ${name}: ${status}`);
+  }
+  return lines.join("\n");
 }
 
 function buildWebSearchUrl(query: string): string {
@@ -610,6 +769,95 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       summary: `Found ${results.length} results (${providerUsed})`,
       artifact: { type: "json", path: artifactPath, content_preview: raw.slice(0, 200) },
       rawResult: raw,
+    };
+  }
+
+  if (name === "time_lookup") {
+    const timezone = typeof args.timezone === "string" ? args.timezone.trim() : undefined;
+    const utcOffset = typeof args.utc_offset === "string" ? args.utc_offset.trim() : undefined;
+    const formatted = formatLocalTime(timezone, utcOffset);
+    return {
+      ok: true,
+      summary: formatted.summary,
+      rawResult: formatted.raw,
+    };
+  }
+
+  if (name === "weather_lookup") {
+    const location = typeof args.location === "string" ? args.location.trim() : "";
+    if (!location) {
+      return { ok: false, summary: "weather_lookup requires location.", rawResult: "", error: "location required" };
+    }
+    const days = typeof args.days === "number" && Number.isFinite(args.days)
+      ? Math.max(1, Math.min(7, Math.floor(args.days)))
+      : 3;
+    const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+    const json = await fetchJson(url, 15_000);
+    if (!json.ok) {
+      return { ok: false, summary: `Weather lookup failed for ${location}`, rawResult: "", error: json.error };
+    }
+    const summaryText = formatWeatherSummary(location, json.data, days);
+    const artifactPath = saveJsonArtifact("weather-lookup", json.data);
+    return {
+      ok: true,
+      summary: `Fetched weather forecast for ${location}`,
+      artifact: { type: "json", path: artifactPath, content_preview: summaryText.slice(0, 200) },
+      rawResult: summaryText,
+    };
+  }
+
+  if (name === "finance_lookup") {
+    const symbol = typeof args.symbol === "string" ? args.symbol.trim().toUpperCase() : "";
+    if (!symbol) {
+      return { ok: false, summary: "finance_lookup requires symbol.", rawResult: "", error: "symbol required" };
+    }
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
+    const json = await fetchJson(url, 15_000);
+    const quote = (json.data as any)?.quoteResponse?.result?.[0];
+    if (!json.ok || !quote) {
+      return { ok: false, summary: `Finance lookup failed for ${symbol}`, rawResult: "", error: json.error || "No quote found" };
+    }
+    const summaryText = formatFinanceSummary(symbol, quote);
+    const artifactPath = saveJsonArtifact("finance-lookup", quote);
+    return {
+      ok: true,
+      summary: `Fetched market quote for ${symbol}`,
+      artifact: { type: "json", path: artifactPath, content_preview: summaryText.slice(0, 200) },
+      rawResult: summaryText,
+    };
+  }
+
+  if (name === "sports_lookup") {
+    const leagueInput = typeof args.league === "string" ? args.league.trim().toLowerCase() : "";
+    if (!leagueInput) {
+      return { ok: false, summary: "sports_lookup requires league.", rawResult: "", error: "league required" };
+    }
+    const date = typeof args.date === "string" && args.date.trim() ? args.date.trim().replaceAll("-", "") : "";
+    const team = typeof args.team === "string" ? args.team.trim() : undefined;
+    const leagueMap: Record<string, { sport: string; league: string }> = {
+      nba: { sport: "basketball", league: "nba" },
+      nfl: { sport: "football", league: "nfl" },
+      mlb: { sport: "baseball", league: "mlb" },
+      nhl: { sport: "hockey", league: "nhl" },
+      epl: { sport: "soccer", league: "eng.1" },
+    };
+    const mapped = leagueMap[leagueInput];
+    if (!mapped) {
+      return { ok: false, summary: `Unsupported league ${leagueInput}`, rawResult: "", error: "unsupported league" };
+    }
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${mapped.sport}/${mapped.league}/scoreboard${date ? `?dates=${date}` : ""}`;
+    const json = await fetchJson(url, 15_000);
+    const events = Array.isArray((json.data as any)?.events) ? (json.data as any).events : [];
+    if (!json.ok) {
+      return { ok: false, summary: `Sports lookup failed for ${leagueInput}`, rawResult: "", error: json.error };
+    }
+    const summaryText = formatSportsSummary(leagueInput, events, team);
+    const artifactPath = saveJsonArtifact("sports-lookup", events);
+    return {
+      ok: true,
+      summary: `Fetched ${leagueInput.toUpperCase()} scoreboard`,
+      artifact: { type: "json", path: artifactPath, content_preview: summaryText.slice(0, 200) },
+      rawResult: summaryText,
     };
   }
 

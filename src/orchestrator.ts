@@ -8,13 +8,15 @@ import type { RunLogger } from "./logger.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
-import type { ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskType } from "./types.js";
+import type { ExecutionMode, ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskComplexityAssessment, TaskType } from "./types.js";
 import { Tracer } from "./trace.js";
 import { LoopDetector } from "./loop-detector.js";
 import { compressJsonOutput } from "./compress.js";
 import { buildSingleTaskContract } from "./workflow-contract.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
+import { buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, validateWorkflowPlan, assessWorkflowExecutionSupport } from "./workflow-plan.js";
+import { runWorkflowPlan } from "./workflow-runtime.js";
 
 export class PlannerUnavailableError extends Error {
   readonly causeError?: Error;
@@ -137,6 +139,178 @@ function parsePlannerExecutorRequest(value: unknown): PlannerExecutorRequest | u
   };
 }
 
+function parsePlannerStatus(value: unknown): PlannerOutput["status"] {
+  return value === "need_executor" || value === "workflow" || value === "final" || value === "clarify"
+    ? value
+    : "clarify";
+}
+
+function parsePlannerAudit(
+  value: unknown,
+  hasExecutorHistory: boolean,
+): PlannerOutput["audit"] {
+  if (!isRecord(value)) {
+    return {
+      verdict: hasExecutorHistory ? "approved" : "not_applicable",
+      notes: "",
+    };
+  }
+
+  return {
+    verdict: value.verdict === "approved"
+      || value.verdict === "retry"
+      || value.verdict === "blocked"
+      || value.verdict === "not_applicable"
+      ? value.verdict
+      : "not_applicable",
+    notes: typeof value.notes === "string" ? value.notes : "",
+  };
+}
+
+function parsePlannerOutputRecord(
+  userGoal: string,
+  parsed: Record<string, unknown>,
+  hasExecutorHistory: boolean,
+): PlannerOutput {
+  return {
+    goal: userGoal,
+    status: parsePlannerStatus(parsed.status),
+    reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
+    next_step: typeof parsed.step === "string" ? parsed.step : "",
+    audit: parsePlannerAudit(parsed.audit, hasExecutorHistory),
+    workflow_plan: parseWorkflowPlan(parsed.workflow_plan),
+    executor_request: parsePlannerExecutorRequest(parsed.executor_request),
+    final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
+    clarification_question: typeof parsed.question === "string" ? parsed.question : undefined,
+  };
+}
+
+function applyWorkflowMilestoneAFallback(
+  planner: PlannerOutput,
+  stepNumber: number,
+  logger?: RunLogger,
+  options?: RunOptions,
+): PlannerOutput {
+  if (planner.status !== "workflow") {
+    return planner;
+  }
+
+  if (!planner.workflow_plan) {
+    logger?.log("planner.protocol_violation", {
+      step: stepNumber,
+      reason: "workflow_without_valid_workflow_plan",
+      parsed: planner,
+    });
+    return {
+      ...planner,
+      status: "clarify",
+      audit: {
+        verdict: "blocked",
+        notes: planner.audit.notes
+          ? `${planner.audit.notes} Protocol corrected: workflow status requires a valid workflow_plan.`
+          : "Protocol corrected: workflow status requires a valid workflow_plan.",
+      },
+    };
+  }
+
+  const validation = validateWorkflowPlan(planner.workflow_plan, TOOL_DEFINITIONS);
+  emitWorkflowPlanEvents(planner.workflow_plan, validation, stepNumber, logger, options);
+
+  const fallbackRequest = buildWorkflowFallbackExecutorRequest(planner.workflow_plan);
+  if (!validation.valid || !fallbackRequest) {
+    const validationNotes = validation.issues.length > 0
+      ? validation.issues.join("; ")
+      : "Workflow plan could not be materialized into a fallback executor request.";
+    return {
+      ...planner,
+      status: "clarify",
+      audit: {
+        verdict: "blocked",
+        notes: planner.audit.notes
+          ? `${planner.audit.notes} ${validationNotes}`
+          : validationNotes,
+      },
+      executor_request: undefined,
+    };
+  }
+
+  logger?.log("workflow.plan.degraded", {
+    step: stepNumber,
+    workflow_id: planner.workflow_plan.id,
+    fallback_executor_request: fallbackRequest,
+  });
+
+  return {
+    ...planner,
+    status: "need_executor",
+    audit: {
+      verdict: planner.audit.verdict === "blocked" ? "blocked" : "approved",
+      notes: planner.audit.notes
+        ? `${planner.audit.notes} Milestone A fallback applied: runtime recorded the workflow plan and degraded to a single executor step.`
+        : "Milestone A fallback applied: runtime recorded the workflow plan and degraded to a single executor step.",
+    },
+    executor_request: fallbackRequest,
+  };
+}
+
+function shouldExecuteWorkflowPlan(plan: import("./types.js").WorkflowPlan): boolean {
+  return assessWorkflowExecutionSupport(plan).supported;
+}
+
+function emitWorkflowPlanEvents(
+  plan: import("./types.js").WorkflowPlan,
+  validation: import("./workflow-plan.js").WorkflowPlanValidationResult,
+  stepNumber: number,
+  logger?: RunLogger,
+  options?: RunOptions,
+): void {
+  logger?.log("workflow.plan.created", {
+    step: stepNumber,
+    workflow_plan: plan,
+  });
+  options?.onEvent?.({
+    type: "workflow.plan.created",
+    step: stepNumber,
+    data: {
+      workflow_id: plan.id,
+      strategy: plan.strategy,
+      summary: plan.summary,
+      task_count: plan.tasks.length,
+      finish_mode: plan.finish_when.mode,
+    },
+  });
+
+  if (validation.valid) {
+    logger?.log("workflow.plan.validated", {
+      step: stepNumber,
+      workflow_id: plan.id,
+      task_count: plan.tasks.length,
+    });
+    options?.onEvent?.({
+      type: "workflow.plan.validated",
+      step: stepNumber,
+      data: {
+        workflow_id: plan.id,
+        task_count: plan.tasks.length,
+      },
+    });
+  } else {
+    logger?.log("workflow.plan.rejected", {
+      step: stepNumber,
+      workflow_id: plan.id,
+      issues: validation.issues,
+    });
+    options?.onEvent?.({
+      type: "workflow.plan.rejected",
+      step: stepNumber,
+      data: {
+        workflow_id: plan.id,
+        issues: validation.issues,
+      },
+    });
+  }
+}
+
 function normalizeRequestKey(request: PlannerExecutorRequest | undefined): string {
   if (!request) {
     return "";
@@ -155,6 +329,26 @@ function summarizeRecentArtifacts(executorHistory: ExecutorOutput[]): string {
     .slice(-6)
     .map((artifact) => `${artifact.type}:${artifact.path}`);
   return artifacts.length > 0 ? artifacts.join("; ") : "none";
+}
+
+function hasSubstantiveDirectAnswer(executorResult: ExecutorOutput): boolean {
+  if (executorResult.status !== "success" && executorResult.status !== "partial_success") {
+    return false;
+  }
+
+  if (executorResult.tool_calls_made.some((call) => call.tool === "write_file")) {
+    return true;
+  }
+
+  if (executorResult.tool_calls_made.some((call) => call.tool === "read_file" || call.tool === "url_fetch" || call.tool === "parse_json")) {
+    return true;
+  }
+
+  if (/^Found \d+ results/i.test(executorResult.summary) || /\(legacy\)/i.test(executorResult.summary)) {
+    return false;
+  }
+
+  return executorResult.raw_result.trim().length >= 80 || executorResult.summary.trim().length >= 80;
 }
 
 function hasUsefulExecutorProgress(conversation: {
@@ -196,6 +390,224 @@ export function detectTaskType(userGoal: string, routing: RoutePolicy[]): TaskTy
 
 export function getRoutePolicy(taskType: TaskType, routing: RoutePolicy[]): RoutePolicy {
   return routing.find((route) => route.type === taskType) || routing[routing.length - 1];
+}
+
+function buildDirectExecutorRequest(goal: string, routePolicy: RoutePolicy, requestedOutputPath?: string): PlannerExecutorRequest {
+  const normalizedGoal = goal.toLowerCase();
+
+  if (/\b(weather|forecast|temperature|humidity|wind)\b|天气|气温|预报/.test(normalizedGoal)) {
+    return {
+      instruction: requestedOutputPath
+        ? `Use weather_lookup first to get the requested forecast directly. If that succeeds, write the final answer to ${requestedOutputPath}. Only fall back to web_search or url_fetch if the direct lookup fails.`
+        : "Use weather_lookup first to get the requested forecast directly. Only fall back to web_search or url_fetch if the direct lookup fails.",
+      allowed_tools: ["weather_lookup", "web_search", "url_fetch", "read_file", "write_file"],
+      expected_output: requestedOutputPath
+        ? `A concise weather forecast summary written to ${requestedOutputPath}.`
+        : "A concise weather forecast summary with daily details.",
+    };
+  }
+
+  if (/\b(time|timezone|utc|clock)\b|时间|时区/.test(normalizedGoal)) {
+    return {
+      instruction: requestedOutputPath
+        ? `Use time_lookup first to determine the requested time or timezone information, then write the result to ${requestedOutputPath}.`
+        : "Use time_lookup first to determine the requested time or timezone information and return the result directly.",
+      allowed_tools: ["time_lookup", "write_file"],
+      expected_output: requestedOutputPath
+        ? `A short time answer written to ${requestedOutputPath}.`
+        : "A short direct answer about time or timezone.",
+    };
+  }
+
+  if (/\b(stock|stocks|ticker|quote|price|market cap|crypto|btc|eth|usd|cny|exchange rate)\b|股价|股票|币价|汇率|行情|价格/.test(normalizedGoal)) {
+    return {
+      instruction: requestedOutputPath
+        ? `Use finance_lookup first to get the requested market quote or exchange-related data, then write the concise answer to ${requestedOutputPath}.`
+        : "Use finance_lookup first to get the requested market quote or exchange-related data and return the answer directly.",
+      allowed_tools: ["finance_lookup", "write_file", "web_search"],
+      expected_output: requestedOutputPath
+        ? `A concise finance answer written to ${requestedOutputPath}.`
+        : "A concise finance answer with the key quote values.",
+    };
+  }
+
+  if (/\b(score|scores|schedule|standings|match|game|fixture|nba|nfl|mlb|nhl|epl)\b|比分|赛程|排名|比赛/.test(normalizedGoal)) {
+    return {
+      instruction: requestedOutputPath
+        ? `Use sports_lookup first to get the requested schedule or scoreboard information, then write the concise result to ${requestedOutputPath}.`
+        : "Use sports_lookup first to get the requested schedule or scoreboard information and return the result directly.",
+      allowed_tools: ["sports_lookup", "write_file", "web_search"],
+      expected_output: requestedOutputPath
+        ? `A concise sports answer written to ${requestedOutputPath}.`
+        : "A concise sports answer with the requested games or standings.",
+    };
+  }
+
+  if (routePolicy.type === "file_ops") {
+    return {
+      instruction: requestedOutputPath
+        ? `Complete this file task directly with the narrowest possible read/write operations. If the task asks for local output, write the result to ${requestedOutputPath}. Avoid broad exploration. Goal: ${goal}`
+        : `Complete this file task directly with the narrowest possible read/write operations. Avoid broad exploration. Goal: ${goal}`,
+      allowed_tools: ["list_files", "read_file", "write_file", "parse_json"],
+      expected_output: requestedOutputPath
+        ? `Requested file task completed and local output written to ${requestedOutputPath} when applicable.`
+        : "Requested file task completed directly.",
+    };
+  }
+
+  return {
+    instruction: requestedOutputPath
+      ? `Complete this simple task using the fewest steps possible. Prefer one direct lookup or one direct file operation. If the user requested a local output file, write the result to ${requestedOutputPath}. Goal: ${goal}`
+      : `Complete this simple task using the fewest steps possible. Prefer one direct lookup or one direct file operation. Goal: ${goal}`,
+    allowed_tools: [...new Set([...routePolicy.preferredTools, "web_search", "url_fetch", "read_file", "write_file", "parse_json"])],
+    expected_output: requestedOutputPath
+      ? `A concise result written to ${requestedOutputPath} when requested.`
+      : "A concise direct answer.",
+  };
+}
+
+export function assessTaskComplexity(userGoal: string, taskType: TaskType, routePolicy: RoutePolicy): TaskComplexityAssessment {
+  const goal = userGoal.toLowerCase();
+  let score = 0;
+  const reasons: string[] = [];
+
+  if (taskType === "research" || taskType === "code" || taskType === "data_analysis") {
+    score -= 5;
+    reasons.push(`task type ${taskType} defaults to orchestration`);
+  }
+
+  if (/\b(compare|comparison|research|survey|rank|ranking|evaluate|analysis|analyze|investigate|debug|fix|refactor)\b|对比|比较|调研|研究|分析|评测|修复|重构/.test(goal)) {
+    score -= 4;
+    reasons.push("goal implies multi-step analysis or comparison");
+  }
+
+  if (/\b(weather|forecast|temperature|humidity|wind|time|timezone|utc|clock|price|quote|score|schedule|standings)\b|天气|气温|预报|时间|时区|汇率|价格|比分|赛程/.test(goal)) {
+    score += 4;
+    reasons.push("goal looks like a direct factual lookup");
+  }
+
+  if (/\b(summarize|summary|extract|list|show|what is|when is|today|tomorrow|this week)\b|总结|提取|列出|是什么|什么时候|今天|明天|本周/.test(goal)) {
+    score += 2;
+    reasons.push("requested output is short-form or extractive");
+  }
+
+  if (routePolicy.type === "file_ops") {
+    score += 3;
+    reasons.push("file ops usually support direct execution");
+  }
+
+  if (routePolicy.type === "general" || routePolicy.type === "web_search") {
+    score += 1;
+    reasons.push(`route type ${routePolicy.type} can often be satisfied with a direct path`);
+  }
+
+  if (/\b(write|save|create)\b.+\.(md|markdown|txt|json|csv)\b|写入本地|保存到本地|生成.*\.md/.test(goal)) {
+    score -= 1;
+    reasons.push("local file output adds a small amount of execution overhead");
+  }
+
+  if (/\b(report|document|proposal|plan|design)\b|报告|文档|方案|设计/.test(goal)) {
+    score -= 3;
+    reasons.push("long-form output usually needs orchestration");
+  }
+
+  const mode: ExecutionMode = score >= 4 ? "direct" : "orchestrated";
+  reasons.push(mode === "direct" ? "direct path chosen" : "full orchestration required");
+  return { mode, score, reasons };
+}
+
+async function runDirectTask(
+  config: OrchestratorConfig,
+  taskPrompt: string,
+  routePolicy: RoutePolicy,
+  logger?: RunLogger,
+  deps?: Partial<RuntimeDeps>,
+  options?: RunOptions,
+): Promise<RunTaskResult> {
+  const runtimeDeps = mergeRuntimeDeps(deps);
+  const requestedOutputPath = extractRequestedOutputPath(taskPrompt);
+  const directRequest = buildDirectExecutorRequest(taskPrompt, routePolicy, requestedOutputPath);
+  const executorHistory: ExecutorOutput[] = [];
+
+  logger?.log("orchestrator.direct.request", {
+    request: directRequest,
+    requested_output_path: requestedOutputPath,
+    route_policy: routePolicy.type,
+  });
+  options?.onEvent?.({
+    type: "workflow.complexity.assessed",
+    data: {
+      execution_mode: "direct",
+      route_type: routePolicy.type,
+      requested_output_path: requestedOutputPath ?? "",
+    },
+  });
+
+  const planner: PlannerOutput = {
+    goal: taskPrompt,
+    status: "need_executor",
+    reasoning_summary: "Direct mode: attempting the simplest viable execution path first.",
+    next_step: "direct_executor",
+    audit: {
+      verdict: "not_applicable",
+      notes: "Simple task fast path selected before full orchestration.",
+    },
+    executor_request: directRequest,
+  };
+
+  const executorResult = await runtimeDeps.runExecutorStep(config, planner, 1, logger, runtimeDeps, options);
+  executorHistory.push(executorResult);
+
+  const goalCheck = requestedOutputPath
+    ? {
+        achieved: hasSuccessfulWriteToPath(executorHistory, requestedOutputPath),
+        answer: executorHistory.at(-1)?.summary || `File written successfully to ${requestedOutputPath}.`,
+      }
+    : checkGoalAchieved(executorHistory, routePolicy);
+
+  if (goalCheck.achieved) {
+    logger?.log("orchestrator.direct.completed", {
+      output: goalCheck.answer ?? "",
+      requested_output_path: requestedOutputPath,
+    });
+    return finalizeRunTaskResult({
+      goal: taskPrompt,
+      status: "completed",
+      output: goalCheck.answer ?? "",
+      verified: true,
+      executorHistory,
+      options,
+    });
+  }
+
+  if (hasSubstantiveDirectAnswer(executorResult)) {
+    logger?.log("orchestrator.direct.completed", {
+      output: executorResult.summary,
+      requested_output_path: requestedOutputPath,
+    });
+    return finalizeRunTaskResult({
+      goal: taskPrompt,
+      status: "completed",
+      output: executorResult.summary,
+      verified: executorResult.status === "success",
+      executorHistory,
+      options,
+    });
+  }
+
+  logger?.log("orchestrator.direct.escalate", {
+    reason: executorResult.error || executorResult.summary,
+    status: executorResult.status,
+  });
+
+  return finalizeRunTaskResult({
+    goal: taskPrompt,
+    status: "failed",
+    output: executorResult.error || executorResult.summary || "Direct execution could not complete the task.",
+    verified: false,
+    executorHistory,
+    options,
+  });
 }
 
 function isRepoRecord(value: unknown): value is Record<string, unknown> {
@@ -893,6 +1305,34 @@ export async function runTask(
   deps?: Partial<RuntimeDeps>,
   options?: RunOptions,
 ): Promise<RunTaskResult> {
+  const complexity = assessTaskComplexity(taskPrompt, routePolicy.type, routePolicy);
+  logger?.log("orchestrator.task_complexity", {
+    task_type: routePolicy.type,
+    execution_mode: complexity.mode,
+    complexity_score: complexity.score,
+    reasons: complexity.reasons,
+  });
+  options?.onEvent?.({
+    type: "workflow.complexity.assessed",
+    data: {
+      task_type: routePolicy.type,
+      execution_mode: complexity.mode,
+      complexity_score: complexity.score,
+      reasons: complexity.reasons,
+    },
+  });
+
+  if (complexity.mode === "direct") {
+    const directResult = await runDirectTask(config, taskPrompt, routePolicy, logger, deps, options);
+    if (directResult.status === "completed") {
+      return directResult;
+    }
+    logger?.log("orchestrator.direct.fallback", {
+      reason: directResult.output,
+      task_type: routePolicy.type,
+    });
+  }
+
   const runtimeDeps = mergeRuntimeDeps(deps);
   const executorHistory: ExecutorOutput[] = [];
   const loopDetector = new LoopDetector();
@@ -903,6 +1343,23 @@ export async function runTask(
   for (let step = 0; step < config.policy.maxSteps; step++) {
     assertNotCancelled(options);
     const planner = await runtimeDeps.runPlannerStep(config, taskPrompt, executorHistory, replanCount, routePolicy, step + 1, logger, runtimeDeps, options);
+
+    if (planner.workflow_plan && shouldExecuteWorkflowPlan(planner.workflow_plan)) {
+      logger?.log("workflow.plan.execute", {
+        step: step + 1,
+        workflow_id: planner.workflow_plan.id,
+        task_count: planner.workflow_plan.tasks.length,
+      });
+      return await runWorkflowPlan(
+        config,
+        taskPrompt,
+        planner.workflow_plan,
+        routePolicy,
+        logger,
+        runtimeDeps,
+        options,
+      );
+    }
 
     if (planner.status === "final" && requestedOutputPath && !hasSuccessfulWriteToPath(executorHistory, requestedOutputPath)) {
       logger?.log("planner.protocol_violation", {
@@ -1062,27 +1519,7 @@ async function runPlannerStep(
         : undefined,
     };
   }
-  const parsedAudit = isRecord(parsed.audit) ? parsed.audit : undefined;
-  const parsedExecutorRequest = parsePlannerExecutorRequest(parsed.executor_request);
-  const planner: PlannerOutput = {
-    goal: userGoal,
-    status: parsed.status === "need_executor" || parsed.status === "final" || parsed.status === "clarify"
-      ? parsed.status
-      : "clarify",
-    reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
-    next_step: typeof parsed.step === "string" ? parsed.step : "",
-    audit: parsedAudit
-      ? {
-          verdict: parsedAudit.verdict === "approved" || parsedAudit.verdict === "retry" || parsedAudit.verdict === "blocked" || parsedAudit.verdict === "not_applicable"
-            ? parsedAudit.verdict
-            : "not_applicable",
-          notes: typeof parsedAudit.notes === "string" ? parsedAudit.notes : "",
-        }
-      : { verdict: executorHistory.length > 0 ? "approved" : "not_applicable", notes: "" },
-    executor_request: parsedExecutorRequest,
-    final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
-    clarification_question: typeof parsed.question === "string" ? parsed.question : undefined,
-  };
+  const planner = parsePlannerOutputRecord(userGoal, parsed, executorHistory.length > 0);
 
   // Protocol: final with executor_request but no answer
   if (planner.status === "final" && planner.executor_request && !isNonEmptyString(planner.final_answer)) {
@@ -1139,18 +1576,22 @@ async function runPlannerStep(
     }
   }
 
-  logger?.log("planner.response.parsed", { step: stepNumber, parsed: planner });
+  const normalizedPlanner = applyWorkflowMilestoneAFallback(planner, stepNumber, logger, options);
+
+  logger?.log("planner.response.parsed", { step: stepNumber, parsed: normalizedPlanner });
   options?.onEvent?.({
     type: "workflow.planner.decision",
     step: stepNumber,
     data: {
-      status: planner.status,
-      reasoning_summary: planner.reasoning_summary,
-      next_step: planner.next_step,
-      verdict: planner.audit?.verdict,
+      status: normalizedPlanner.status,
+      reasoning_summary: normalizedPlanner.reasoning_summary,
+      next_step: normalizedPlanner.next_step,
+      verdict: normalizedPlanner.audit?.verdict,
+      workflow_id: normalizedPlanner.workflow_plan?.id,
+      workflow_task_count: normalizedPlanner.workflow_plan?.tasks.length ?? 0,
     },
   });
-  return planner;
+  return normalizedPlanner;
 }
 
 function formatReasoningTrace(label: string, stepNumber: number, reasoning: string): string {
@@ -1530,33 +1971,7 @@ export async function runOrchestrator(
       // Treat parse failure as retry — the planner will be called again
       continue;
     }
-    const parsedAudit = isRecord(parsed.audit) ? parsed.audit : undefined;
-    const parsedExecutorRequest = parsePlannerExecutorRequest(parsed.executor_request);
-    const planner: PlannerOutput = {
-      goal: userGoal,
-      status: parsed.status === "need_executor" || parsed.status === "final" || parsed.status === "clarify"
-        ? parsed.status
-        : "clarify",
-      reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
-      next_step: typeof parsed.step === "string" ? parsed.step : "",
-      audit: parsedAudit
-        ? {
-            verdict: parsedAudit.verdict === "approved"
-              || parsedAudit.verdict === "retry"
-              || parsedAudit.verdict === "blocked"
-              || parsedAudit.verdict === "not_applicable"
-              ? parsedAudit.verdict
-              : "not_applicable",
-            notes: typeof parsedAudit.notes === "string" ? parsedAudit.notes : "",
-          }
-        : {
-            verdict: executorHistory.length > 0 ? "approved" : "not_applicable",
-            notes: "",
-          },
-      executor_request: parsedExecutorRequest,
-      final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
-      clarification_question: typeof parsed.question === "string" ? parsed.question : undefined,
-    };
+    const planner = parsePlannerOutputRecord(userGoal, parsed, executorHistory.length > 0);
 
     if (planner.status === "final" && planner.executor_request && !isNonEmptyString(planner.final_answer)) {
       logger?.log("planner.protocol_violation", {
@@ -1644,13 +2059,27 @@ export async function runOrchestrator(
       planner.final_answer = undefined;
     }
 
-    const currentRequestKey = planner.status === "need_executor" && planner.executor_request
-      ? normalizeRequestKey(planner.executor_request)
+    const normalizedPlanner = applyWorkflowMilestoneAFallback(planner, step + 1, logger, options);
+
+    const currentRequestKey = normalizedPlanner.status === "need_executor" && normalizedPlanner.executor_request
+      ? normalizeRequestKey(normalizedPlanner.executor_request)
       : undefined;
 
     logger?.log("planner.response.parsed", {
       step: step + 1,
-      parsed: planner,
+      parsed: normalizedPlanner,
+    });
+    options?.onEvent?.({
+      type: "workflow.planner.decision",
+      step: step + 1,
+      data: {
+        status: normalizedPlanner.status,
+        reasoning_summary: normalizedPlanner.reasoning_summary,
+        next_step: normalizedPlanner.next_step,
+        verdict: normalizedPlanner.audit?.verdict,
+        workflow_id: normalizedPlanner.workflow_plan?.id,
+        workflow_task_count: normalizedPlanner.workflow_plan?.tasks.length ?? 0,
+      },
     });
 
     // Unified loop detection
@@ -1669,16 +2098,16 @@ export async function runOrchestrator(
       return result;
     }
 
-    if (planner.status === "final" || planner.status === "clarify") {
-      transitionTo("finalized", `planner returned ${planner.status}`);
+    if (normalizedPlanner.status === "final" || normalizedPlanner.status === "clarify") {
+      transitionTo("finalized", `planner returned ${normalizedPlanner.status}`);
       logger?.log("orchestrator.finished", {
         step: step + 1,
-        result: planner,
+        result: normalizedPlanner,
       });
-      return planner;
+      return normalizedPlanner;
     }
 
-    if (planner.audit.verdict === "retry") {
+    if (normalizedPlanner.audit.verdict === "retry") {
       replanCount += 1;
       if (replanCount > config.policy.maxReplans) {
         replanCount = config.policy.maxReplans;
@@ -1691,13 +2120,13 @@ export async function runOrchestrator(
           });
         }
       }
-    } else if (planner.audit.verdict === "approved" || planner.audit.verdict === "not_applicable") {
+    } else if (normalizedPlanner.audit.verdict === "approved" || normalizedPlanner.audit.verdict === "not_applicable") {
       replanCount = 0;
     }
 
     transitionTo("executing", `executor step ${step + 1}`);
     assertNotCancelled(options);
-    const executorResult = await runtimeDeps.runExecutorStep(config, planner, step + 1, logger, runtimeDeps, options);
+    const executorResult = await runtimeDeps.runExecutorStep(config, normalizedPlanner, step + 1, logger, runtimeDeps, options);
     executorHistory.push(executorResult);
     logger?.log("executor.step.finished", {
       step: step + 1,
@@ -1793,6 +2222,7 @@ export async function runOrchestrator(
 }
 
 export const __testables = {
+  assessTaskComplexity,
   runPlannerStep,
   finalizeExecutorResult,
   buildPlannerMessages,

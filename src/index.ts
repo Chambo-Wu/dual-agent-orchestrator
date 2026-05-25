@@ -22,6 +22,7 @@ import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workfl
 import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
 import { appendEvent, getEvents, getLatestSnapshot, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
 import { renderTimelineHtml } from "./timeline.js";
+import { buildWorkflowGraph } from "./workflow-graph.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
@@ -189,6 +190,7 @@ function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "pla
     plan: payload.plan,
     taskRuns: payload.taskRuns,
     artifacts: payload.artifacts,
+    workflowGraph: payload.job.workflowGraph,
   });
 }
 
@@ -756,6 +758,8 @@ function buildWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan"
 }
 
 function buildStepList(record: StoredJobRecord): unknown[] {
+  const currentTask = getWorkflowCurrentTask(record);
+  const awaitingApprovalTask = getWorkflowAwaitingApprovalTask(record);
   return record.taskRuns.map((taskRun) => {
     const executorHistory = taskRun.executorHistory ?? [];
     const latestExecutorOutput = executorHistory.at(-1);
@@ -775,6 +779,12 @@ function buildStepList(record: StoredJobRecord): unknown[] {
       executor_history: executorHistory,
       latest_executor_status: latestExecutorOutput?.status ?? null,
       latest_executor_summary: latestExecutorOutput?.summary ?? null,
+      is_current_task: currentTask?.id === taskRun.id,
+      is_awaiting_approval_task: awaitingApprovalTask?.id === taskRun.id,
+      workflow_position: {
+        index: record.taskRuns.findIndex((item) => item.id === taskRun.id) + 1,
+        total: record.taskRuns.length,
+      },
     };
   });
 }
@@ -989,6 +999,8 @@ function mapTaskRunStatus(status: TaskRun["status"]): WorkflowUiEvent["status"] 
       return "failed";
     case "blocked":
       return "blocked";
+    case "awaiting_approval":
+      return "awaiting_approval";
     case "in_progress":
     case "pending":
     case "skipped":
@@ -1109,6 +1121,7 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
 
 function buildJobResponse(record: StoredJobRecord): unknown {
   const latestStep = record.taskRuns.at(-1);
+  const workflowSummary = buildWorkflowSummary(record);
   return {
     saved_at: record.savedAt,
     job: record.job,
@@ -1126,8 +1139,90 @@ function buildJobResponse(record: StoredJobRecord): unknown {
           latest_executor_status: latestExecutorStatus(record),
         }
       : null,
+    workflow_summary: workflowSummary,
     control: record.control ?? {},
   };
+}
+
+function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> {
+  const counts = {
+    pending: 0,
+    in_progress: 0,
+    awaiting_approval: 0,
+    completed: 0,
+    failed: 0,
+    blocked: 0,
+    skipped: 0,
+  };
+
+  for (const taskRun of record.taskRuns) {
+    switch (taskRun.status) {
+      case "pending":
+        counts.pending += 1;
+        break;
+      case "in_progress":
+        counts.in_progress += 1;
+        break;
+      case "awaiting_approval":
+        counts.awaiting_approval += 1;
+        break;
+      case "completed":
+        counts.completed += 1;
+        break;
+      case "failed":
+        counts.failed += 1;
+        break;
+      case "blocked":
+        counts.blocked += 1;
+        break;
+      case "skipped":
+        counts.skipped += 1;
+        break;
+    }
+  }
+
+  const currentTask = getWorkflowCurrentTask(record);
+  const awaitingApprovalTask = getWorkflowAwaitingApprovalTask(record);
+  const workflowGraph = record.workflowGraph ?? record.job.workflowGraph ?? buildWorkflowGraph(record.plan.id, record.taskRuns, record.plan.summary);
+
+  return {
+    workflow_id: record.plan.id,
+    task_counts: counts,
+    current_task: currentTask
+      ? {
+          id: currentTask.id,
+          title: currentTask.title,
+          status: currentTask.status,
+          assignee: currentTask.assignee ?? null,
+          depends_on: currentTask.dependsOn,
+          verified: currentTask.verified,
+          attempts: currentTask.attempts,
+        }
+      : null,
+    awaiting_approval_task: awaitingApprovalTask
+      ? {
+          id: awaitingApprovalTask.id,
+          title: awaitingApprovalTask.title,
+          status: awaitingApprovalTask.status,
+          assignee: awaitingApprovalTask.assignee ?? null,
+        }
+      : null,
+    workflow_graph: workflowGraph,
+    dag: workflowGraph,
+    replan_history: workflowGraph.replan_history,
+  };
+}
+
+function getWorkflowCurrentTask(record: StoredJobRecord): TaskRun | null {
+  return record.taskRuns.find((taskRun) =>
+    taskRun.status === "awaiting_approval"
+    || taskRun.status === "in_progress"
+    || taskRun.status === "pending",
+  ) ?? null;
+}
+
+function getWorkflowAwaitingApprovalTask(record: StoredJobRecord): TaskRun | null {
+  return record.taskRuns.find((taskRun) => taskRun.status === "awaiting_approval") ?? null;
 }
 
 function buildWorkflowEvent(type: string, workflow: unknown, extra: Record<string, unknown> = {}): string {
@@ -2029,6 +2124,7 @@ async function handleGetJobSteps(_req: IncomingMessage, res: ServerResponse, job
   jsonResponse(res, 200, {
     job_id: jobId,
     count: steps.length,
+    workflow_summary: buildWorkflowSummary(record),
     steps,
   });
 }
@@ -2278,6 +2374,11 @@ async function handleJobTimeline(_req: IncomingMessage, res: ServerResponse, job
     timelineEvents,
     record.job.goal,
     record.job.status,
+    buildWorkflowSummary(record) as {
+      current_task?: { title?: string; status?: string } | null;
+      awaiting_approval_task?: { title?: string; status?: string } | null;
+      task_counts?: Record<string, number>;
+    },
   );
 
   res.statusCode = 200;

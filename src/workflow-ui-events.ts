@@ -99,7 +99,201 @@ export function normalizeWorkflowEvent(
           reasoning_summary: internal.data.reasoning_summary ?? "",
           next_step: internal.data.next_step ?? "",
           verdict: internal.data.verdict ?? null,
+          workflow_id: asString(internal.data.workflow_id),
+          workflow_task_count: typeof internal.data.workflow_task_count === "number" ? internal.data.workflow_task_count : 0,
         },
+      });
+
+    case "workflow.plan.created":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "planner",
+        phase: "decision",
+        type: "planner.workflow_plan_created",
+        title: "Workflow plan created",
+        summary: formatWorkflowPlanCreatedSummary(internal.data),
+        status: "running",
+        step: internal.step,
+        meta: {
+          workflow_id: asString(internal.data.workflow_id),
+          strategy: asString(internal.data.strategy),
+          task_count: typeof internal.data.task_count === "number" ? internal.data.task_count : 0,
+          finish_mode: asString(internal.data.finish_mode),
+        },
+      });
+
+    case "workflow.plan.validated":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "result",
+        type: "system.workflow_plan_validated",
+        title: "Workflow plan validated",
+        summary: formatWorkflowPlanValidatedSummary(internal.data),
+        status: "success",
+        step: internal.step,
+        meta: {
+          workflow_id: asString(internal.data.workflow_id),
+          task_count: typeof internal.data.task_count === "number" ? internal.data.task_count : 0,
+        },
+      });
+
+    case "workflow.plan.rejected":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "retry",
+        type: "system.workflow_plan_rejected",
+        title: "Workflow plan rejected",
+        summary: formatWorkflowPlanRejectedSummary(internal.data),
+        status: "blocked",
+        step: internal.step,
+        meta: {
+          workflow_id: asString(internal.data.workflow_id),
+          issues: Array.isArray(internal.data.issues) ? internal.data.issues : [],
+        },
+      });
+
+    case "workflow.plan.replanned":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "planner",
+        phase: "retry",
+        type: "planner.workflow_plan_replanned",
+        title: "Workflow plan replanned",
+        summary: formatWorkflowPlanReplannedSummary(internal.data),
+        status: "running",
+        step: internal.step,
+        meta: {
+          workflow_id: asString(internal.data.workflow_id),
+          replacement_workflow_id: asString(internal.data.replacement_workflow_id),
+          task_id: asString(internal.data.task_id),
+          replan_count: typeof internal.data.replan_count === "number" ? internal.data.replan_count : 0,
+        },
+      });
+
+    case "workflow.task.ready":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "start",
+        type: "workflow.task.ready",
+        title: "Workflow task ready",
+        summary: formatWorkflowTaskSummary(internal.data, "ready"),
+        status: "running",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.assigned":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "decision",
+        type: "workflow.task.assigned",
+        title: "Workflow task assigned",
+        summary: formatWorkflowTaskSummary(internal.data, "assigned"),
+        status: "running",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.awaiting_approval":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: "system",
+        phase: "approval",
+        type: "workflow.task.awaiting_approval",
+        title: "Workflow task awaiting approval",
+        summary: formatWorkflowTaskSummary(internal.data, "awaiting_approval"),
+        status: "awaiting_approval",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.completed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "result",
+        type: "workflow.task.completed",
+        title: "Workflow task completed",
+        summary: formatWorkflowTaskSummary(internal.data, "completed"),
+        status: "completed",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.failed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "result",
+        type: "workflow.task.failed",
+        title: "Workflow task failed",
+        summary: formatWorkflowTaskSummary(internal.data, "failed"),
+        status: "failed",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.skipped":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "result",
+        type: "workflow.task.skipped",
+        title: "Workflow task skipped",
+        summary: formatWorkflowTaskSummary(internal.data, "skipped"),
+        status: "blocked",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
+      });
+
+    case "workflow.task.superseded":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: mapWorkflowTaskAgent(internal.data.role),
+        phase: "retry",
+        type: "workflow.task.superseded",
+        title: "Workflow task superseded",
+        summary: formatWorkflowTaskSupersededSummary(internal.data),
+        status: "blocked",
+        step: internal.step,
+        meta: buildWorkflowTaskMeta(internal.data),
       });
 
     case "workflow.executor.start":
@@ -180,6 +374,36 @@ export function normalizeWorkflowEvent(
       });
     }
 
+    case "workflow.complexity.assessed": {
+      const mode = asString(internal.data.execution_mode) || "orchestrated";
+      const score = typeof internal.data.complexity_score === "number" ? internal.data.complexity_score : 0;
+      const reasons = Array.isArray(internal.data.reasons)
+        ? internal.data.reasons.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        : [];
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "decision",
+        type: "system.complexity_assessed",
+        title: "Task complexity assessed",
+        summary: mode === "direct"
+          ? `Task was classified as simple and will try the fast path first.`
+          : `Task was classified as multi-step and will use full orchestration.`,
+        status: "running",
+        step: internal.step,
+        meta: {
+          execution_mode: mode,
+          complexity_score: score,
+          reasons,
+          task_type: asString(internal.data.task_type),
+          route_type: asString(internal.data.route_type),
+        },
+      });
+    }
+
     default:
       return createUiEvent({
         jobId,
@@ -202,6 +426,17 @@ function formatPlannerSummary(data: Record<string, unknown>): string {
   const plannerStatus = asString(data.status);
   const reasoning = asString(data.reasoning_summary);
   const nextStep = asString(data.next_step);
+  const workflowId = asString(data.workflow_id);
+  const workflowTaskCount = typeof data.workflow_task_count === "number" ? data.workflow_task_count : 0;
+
+  if (plannerStatus === "workflow") {
+    const workflowLabel = workflowId
+      ? `Planner proposed workflow ${workflowId}`
+      : "Planner proposed a workflow plan";
+    return workflowTaskCount > 0
+      ? `${workflowLabel} with ${workflowTaskCount} tasks.`
+      : `${workflowLabel}.`;
+  }
 
   if (plannerStatus === "final") {
     return "Planner believes the task is ready to finalize.";
@@ -228,6 +463,47 @@ function formatExecutorStartSummary(data: Record<string, unknown>): string {
   return "Executor started working on the current step.";
 }
 
+function formatWorkflowPlanCreatedSummary(data: Record<string, unknown>): string {
+  const workflowId = asString(data.workflow_id) || "workflow";
+  const strategy = asString(data.strategy);
+  const taskCount = typeof data.task_count === "number" ? data.task_count : 0;
+  if (strategy && taskCount > 0) {
+    return `Created ${workflowId} using ${strategy} with ${taskCount} tasks.`;
+  }
+  if (taskCount > 0) {
+    return `Created ${workflowId} with ${taskCount} tasks.`;
+  }
+  return `Created ${workflowId}.`;
+}
+
+function formatWorkflowPlanValidatedSummary(data: Record<string, unknown>): string {
+  const workflowId = asString(data.workflow_id) || "workflow";
+  const taskCount = typeof data.task_count === "number" ? data.task_count : 0;
+  return taskCount > 0
+    ? `${workflowId} passed validation with ${taskCount} tasks.`
+    : `${workflowId} passed validation.`;
+}
+
+function formatWorkflowPlanRejectedSummary(data: Record<string, unknown>): string {
+  const workflowId = asString(data.workflow_id) || "workflow";
+  const issues = Array.isArray(data.issues)
+    ? data.issues.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  return issues.length > 0
+    ? `${workflowId} was rejected: ${truncate(issues[0] ?? "", 140)}`
+    : `${workflowId} was rejected during validation.`;
+}
+
+function formatWorkflowPlanReplannedSummary(data: Record<string, unknown>): string {
+  const workflowId = asString(data.workflow_id) || "workflow";
+  const replacementWorkflowId = asString(data.replacement_workflow_id) || "replacement workflow";
+  const taskId = asString(data.task_id);
+  if (taskId) {
+    return `${workflowId} was replaced by ${replacementWorkflowId} after task ${taskId} failed.`;
+  }
+  return `${workflowId} was replaced by ${replacementWorkflowId}.`;
+}
+
 function formatToolStartSummary(data: Record<string, unknown>): string {
   const tool = asString(data.tool);
   if (!tool) {
@@ -235,6 +511,55 @@ function formatToolStartSummary(data: Record<string, unknown>): string {
   }
   const argSummary = summarizeArguments(data.arguments);
   return argSummary ? `${tool}(${argSummary})` : tool;
+}
+
+function formatWorkflowTaskSummary(data: Record<string, unknown>, state: "ready" | "assigned" | "awaiting_approval" | "completed" | "failed" | "skipped"): string {
+  const title = asString(data.title) || asString(data.task_id) || "workflow task";
+  switch (state) {
+    case "ready":
+      return `${title} is ready to run.`;
+    case "assigned":
+      return `${title} is now running.`;
+    case "awaiting_approval":
+      return `${title} is waiting for approval.`;
+    case "completed":
+      return `${title} completed successfully.`;
+    case "failed":
+      return `${title} failed.`;
+    case "skipped":
+      return `${title} was skipped.`;
+  }
+}
+
+function formatWorkflowTaskSupersededSummary(data: Record<string, unknown>): string {
+  const title = asString(data.title) || asString(data.task_id) || "workflow task";
+  const replacementWorkflowId = asString(data.replacement_workflow_id) || "replacement workflow";
+  return `${title} was superseded by ${replacementWorkflowId}.`;
+}
+
+function buildWorkflowTaskMeta(data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    task_id: asString(data.task_id),
+    title: asString(data.title),
+    kind: asString(data.kind),
+    role: asString(data.role),
+    depends_on: Array.isArray(data.depends_on) ? data.depends_on : [],
+    output: asString(data.output),
+  };
+}
+
+function mapWorkflowTaskAgent(role: unknown): UiEventAgent {
+  switch (role) {
+    case "verifier":
+      return "verifier";
+    case "synthesizer":
+      return "synthesizer";
+    case "planner_proxy":
+      return "planner";
+    case "worker":
+    default:
+      return "executor";
+  }
 }
 
 function sanitizeArguments(args: unknown): Record<string, unknown> {
@@ -275,6 +600,8 @@ function mapPlannerStatus(value: unknown): UiEventStatus {
   switch (value) {
     case "final":
       return "completed";
+    case "workflow":
+      return "running";
     case "clarify":
       return "awaiting_approval";
     case "need_executor":

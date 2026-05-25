@@ -38,11 +38,36 @@ Rules:
 
 Schema:
 {
-  "status": "need_executor | final | clarify",
+  "status": "need_executor | workflow | final | clarify",
   "step": "short string",
   "audit": {
     "verdict": "not_applicable | approved | retry | blocked",
     "notes": "short string"
+  },
+  "workflow_plan": {
+    "id": "wf_xxx",
+    "strategy": "short string",
+    "summary": "short string",
+    "tasks": [
+      {
+        "id": "t1",
+        "title": "short string",
+        "kind": "search | fetch | read | extract | transform | write | verify | synthesize | approval | delegate",
+        "role": "worker | verifier | synthesizer | planner_proxy",
+        "instruction": "string",
+        "allowed_tools": ["tool1"],
+        "depends_on": [],
+        "required": true
+      }
+    ],
+    "finish_when": {
+      "mode": "all_required_tasks_completed | any_of | first_success | manual_approval_resolved",
+      "task_ids": ["t1"]
+    },
+    "replan_policy": {
+      "allow_runtime_replan": true,
+      "max_replans": 1
+    }
   },
   "executor_request": {
     "instruction": "string",
@@ -51,7 +76,13 @@ Schema:
   },
   "answer": "string",
   "question": "string"
-}`;
+}
+
+Workflow planning rules:
+- Use "workflow" only for genuinely multi-stage tasks that benefit from an explicit plan.
+- If status is "workflow", include a valid "workflow_plan".
+- In Milestone A, runtime will validate and record the plan, then safely degrade to a single executor step.
+- For simple tasks, prefer "need_executor" instead of "workflow".`;
 
 export const EXECUTOR_PROMPT = `You are the Executor.
 

@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, type Dirent } from "node:fs";
 import { resolve } from "node:path";
 import { RUNTIME_ROOT } from "./paths.js";
-import type { ApprovalRequest, Artifact, Job, Plan, TaskRun } from "./types.js";
+import type { ApprovalRequest, Artifact, Job, Plan, TaskRun, WorkflowGraph } from "./types.js";
 
 export interface JobControlState {
   cancellationRequestedAt?: string;
@@ -22,6 +22,7 @@ export interface StoredJobRecord {
   plan: Plan;
   taskRuns: TaskRun[];
   artifacts: Artifact[];
+  workflowGraph?: WorkflowGraph;
   control?: JobControlState;
   approvalRequests?: ApprovalRequest[];
 }
@@ -47,6 +48,7 @@ export function persistJobRecord(payload: {
   plan: Plan;
   taskRuns: TaskRun[];
   artifacts: Artifact[];
+  workflowGraph?: WorkflowGraph;
 }): string {
   ensureJobsRoot();
   mkdirSync(jobDir(payload.job.id), { recursive: true });
@@ -56,6 +58,7 @@ export function persistJobRecord(payload: {
     plan: payload.plan,
     taskRuns: payload.taskRuns,
     artifacts: payload.artifacts,
+    workflowGraph: payload.workflowGraph ?? payload.job.workflowGraph,
     control: {},
   };
   const path = jobRecordPath(payload.job.id);

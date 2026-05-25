@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { __testables as orchestratorTestables } from "../../src/orchestrator.js";
 import type { ModelResponse } from "../../src/types.js";
+import { buildMinimalConfig, buildRoutePolicy, createFakeChatRunner, createFakeRuntimeDeps, modelResponseFromJson } from "../helpers/fake-runtime.js";
 
 test("finalizeExecutorResult treats successful native tool calls as success even when assistant text is empty", () => {
   const executorResponse: ModelResponse = {
@@ -112,4 +113,124 @@ test("finalizeExecutorResult preserves model-declared failure after native tool 
   assert.equal(result.error, "Need better sources before continuing.");
   assert.deepEqual(result.tool_calls_made, [{ tool: "web_search", arguments: { query: "example topic" } }]);
   assert.deepEqual(result.artifacts, [{ type: "json", path: "runtime/command-results/search.json", content_preview: "[{\"title\":\"Example\"}]" }]);
+});
+
+test("assessTaskComplexity classifies simple weather lookup as direct", () => {
+  const result = orchestratorTestables.assessTaskComplexity(
+    "帮我查询上海未来一周的天气，然后写入本地天气预报-上海-20260525.md",
+    "general",
+    {
+      type: "general",
+      matchers: [],
+      plannerInstruction: "",
+      enableRanking: false,
+      requireEvidenceBeforeFinal: false,
+      minGroundedCandidates: 0,
+      requireArtifactReadback: false,
+      requireNonEmptyArtifact: false,
+      preferredTools: ["web_search"],
+      artifactPriority: [],
+      completionChecklist: [],
+      fallbackRule: "",
+    },
+  );
+
+  assert.equal(result.mode, "direct");
+  assert.ok(result.score >= 4);
+});
+
+test("assessTaskComplexity keeps comparison-heavy research as orchestrated", () => {
+  const result = orchestratorTestables.assessTaskComplexity(
+    "调研 DeepSeek、Qwen、GLM 的代码能力对比，分析优劣并生成报告",
+    "research",
+    {
+      type: "research",
+      matchers: ["research"],
+      plannerInstruction: "",
+      enableRanking: true,
+      requireEvidenceBeforeFinal: true,
+      minGroundedCandidates: 3,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+      preferredTools: ["web_search", "read_file"],
+      artifactPriority: [],
+      completionChecklist: [],
+      fallbackRule: "",
+    },
+  );
+
+  assert.equal(result.mode, "orchestrated");
+  assert.ok(result.score < 4);
+});
+
+test("runPlannerStep records and degrades workflow plans during milestone A", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy();
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "workflow",
+      step: "build_workflow",
+      audit: {
+        verdict: "approved",
+        notes: "Multi-stage task benefits from a workflow plan.",
+      },
+      workflow_plan: {
+        id: "wf_demo",
+        strategy: "research_and_write",
+        summary: "Collect evidence then write the result.",
+        tasks: [
+          {
+            id: "t1",
+            title: "Collect evidence",
+            kind: "delegate",
+            role: "worker",
+            instruction: "Collect evidence with direct tools.",
+            allowed_tools: ["web_search", "read_file"],
+            depends_on: [],
+            required: true,
+          },
+        ],
+        finish_when: {
+          mode: "all_required_tasks_completed",
+        },
+        replan_policy: {
+          allow_runtime_replan: true,
+          max_replans: 1,
+        },
+      },
+    }),
+  ]);
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+
+  const result = await orchestratorTestables.runPlannerStep(
+    config,
+    "Research a topic and prepare a report",
+    [],
+    0,
+    routePolicy,
+    1,
+    undefined,
+    createFakeRuntimeDeps({
+      runChatCompletionDetailed: fakeChat.runner,
+    }),
+    {
+      onEvent: (event) => {
+        events.push({ type: event.type, data: event.data });
+      },
+    },
+  );
+
+  assert.equal(result.status, "need_executor");
+  assert.equal(result.workflow_plan?.id, "wf_demo");
+  assert.equal(result.executor_request?.allowed_tools.includes("web_search"), true);
+  assert.equal(result.audit.notes.includes("Milestone A fallback applied"), true);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    [
+      "workflow.step.start",
+      "workflow.plan.created",
+      "workflow.plan.validated",
+      "workflow.planner.decision",
+    ],
+  );
 });

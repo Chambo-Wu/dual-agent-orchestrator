@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, ExecutorArtifact, ExecutorOutput, Job, JobMode, JobStatus, Plan, TaskRun, TaskRunStatus } from "./types.js";
+import type { Artifact, ExecutorArtifact, ExecutorOutput, Job, JobMode, JobStatus, Plan, TaskRun, TaskRunStatus, WorkflowGraph } from "./types.js";
 
 function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
@@ -92,6 +92,7 @@ export function createJobRecord(params: {
   taskRuns: readonly TaskRun[];
   artifacts?: readonly Artifact[];
   memorySummary?: string;
+  workflowGraph?: WorkflowGraph;
 }): Job {
   return {
     id: params.id ?? createId("job"),
@@ -104,6 +105,7 @@ export function createJobRecord(params: {
     taskRuns: [...params.taskRuns],
     artifacts: [...(params.artifacts ?? params.taskRuns.flatMap((taskRun) => taskRun.artifacts))],
     memorySummary: params.memorySummary,
+    workflowGraph: params.workflowGraph,
   };
 }
 

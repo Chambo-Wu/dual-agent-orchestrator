@@ -83,6 +83,13 @@ export interface RuntimeProfile {
 }
 
 export type TaskType = "research" | "web_search" | "code" | "data_analysis" | "file_ops" | "shell_ops" | "general";
+export type ExecutionMode = "direct" | "orchestrated";
+
+export interface TaskComplexityAssessment {
+  mode: ExecutionMode;
+  score: number;
+  reasons: string[];
+}
 
 export interface RoutePolicy {
   type: TaskType;
@@ -105,15 +112,86 @@ export interface PlannerExecutorRequest {
   expected_output: string;
 }
 
+export type WorkflowTaskKind =
+  | "search"
+  | "fetch"
+  | "read"
+  | "extract"
+  | "transform"
+  | "write"
+  | "verify"
+  | "synthesize"
+  | "approval"
+  | "delegate";
+
+export type WorkflowRole = "worker" | "verifier" | "synthesizer" | "planner_proxy";
+
+export interface WorkflowTaskRetryPolicy {
+  max_attempts: number;
+  on_failure: "replan" | "fail" | "skip" | "fallback";
+  fallback_task_id?: string;
+}
+
+export interface WorkflowTaskOutputs {
+  artifacts?: string[];
+  memory_key?: string;
+}
+
+export interface WorkflowTaskInput {
+  from_memory?: string[];
+  from_artifacts?: string[];
+}
+
+export interface WorkflowTaskConstraints {
+  max_tool_rounds?: number;
+  max_runtime_seconds?: number;
+  require_structured_output?: boolean;
+}
+
+export interface WorkflowTaskSpec {
+  id: string;
+  title: string;
+  kind: WorkflowTaskKind;
+  role: WorkflowRole;
+  instruction: string;
+  allowed_tools: string[];
+  depends_on: string[];
+  required: boolean;
+  input?: WorkflowTaskInput;
+  constraints?: WorkflowTaskConstraints;
+  retry_policy?: WorkflowTaskRetryPolicy;
+  outputs?: WorkflowTaskOutputs;
+}
+
+export interface WorkflowFinishCondition {
+  mode: "all_required_tasks_completed" | "any_of" | "first_success" | "manual_approval_resolved";
+  task_ids?: string[];
+}
+
+export interface WorkflowReplanPolicy {
+  allow_runtime_replan: boolean;
+  max_replans: number;
+}
+
+export interface WorkflowPlan {
+  id: string;
+  strategy: string;
+  summary: string;
+  tasks: WorkflowTaskSpec[];
+  finish_when: WorkflowFinishCondition;
+  replan_policy?: WorkflowReplanPolicy;
+}
+
 export interface PlannerOutput {
   goal: string;
-  status: "need_executor" | "final" | "clarify";
+  status: "need_executor" | "workflow" | "final" | "clarify";
   reasoning_summary: string;
   next_step: string;
   audit: {
     verdict: "not_applicable" | "approved" | "retry" | "blocked";
     notes: string;
   };
+  workflow_plan?: WorkflowPlan;
   executor_request?: PlannerExecutorRequest;
   final_answer?: string;
   clarification_question?: string;
@@ -144,7 +222,7 @@ export interface ExecutorOutput {
 
 export type JobMode = "task" | "team";
 export type JobStatus = "queued" | "running" | "awaiting_approval" | "completed" | "failed" | "blocked" | "cancelled";
-export type TaskRunStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
+export type TaskRunStatus = "pending" | "in_progress" | "awaiting_approval" | "completed" | "failed" | "blocked" | "skipped";
 
 export interface ApprovalRequest {
   id: string;
@@ -188,6 +266,44 @@ export interface Plan {
   summary?: string;
 }
 
+export interface WorkflowGraphTaskNode {
+  id: string;
+  task_id: string;
+  title: string;
+  status: TaskRunStatus;
+  assignee: string | null;
+  depends_on: readonly string[];
+  verified: boolean;
+  attempts: number;
+  superseded: boolean;
+  superseded_by: string | null;
+}
+
+export interface WorkflowGraphLane {
+  workflow_id: string;
+  status: "active" | "superseded";
+  superseded_by?: string;
+  task_count: number;
+  completed_count: number;
+  tasks: WorkflowGraphTaskNode[];
+}
+
+export interface WorkflowReplanHistoryEntry {
+  index: number;
+  superseded_workflow_id?: string;
+  replacement_workflow_id?: string;
+  failed_task_id?: string;
+  summary?: string;
+}
+
+export interface WorkflowGraph {
+  workflow_id: string;
+  workflow_count: number;
+  edge_count: number;
+  workflows: WorkflowGraphLane[];
+  replan_history: WorkflowReplanHistoryEntry[];
+}
+
 export interface Job {
   id: string;
   goal: string;
@@ -199,6 +315,7 @@ export interface Job {
   taskRuns: readonly TaskRun[];
   artifacts: readonly Artifact[];
   memorySummary?: string;
+  workflowGraph?: WorkflowGraph;
 }
 
 export interface ToolDefinition {
