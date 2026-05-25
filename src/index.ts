@@ -279,9 +279,17 @@ function resolveRequestedModel(config: OrchestratorConfig, requestedModel: strin
 }
 
 function jsonResponse(res: ServerResponse, statusCode: number, payload: unknown): void {
+  if (responseAlreadyStarted(res)) {
+    return;
+  }
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(payload));
+}
+
+function responseAlreadyStarted(res: ServerResponse): boolean {
+  const state = res as ServerResponse & { headersSent?: boolean; writableEnded?: boolean };
+  return state.headersSent === true || state.writableEnded === true;
 }
 
 function secondsUntilCircuitHalfOpen(): number {
@@ -326,6 +334,9 @@ function markPlannerFailure(message: string): ServiceUnavailableError {
 }
 
 function serviceUnavailableResponse(res: ServerResponse, message: string, retryAfterSeconds: number): void {
+  if (responseAlreadyStarted(res)) {
+    return;
+  }
   res.statusCode = 503;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Retry-After", String(retryAfterSeconds));
@@ -3162,6 +3173,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       || message.includes("Unable to derive")
       || message.includes("Invalid JSON")
       || message.includes("exceeds maximum size");
+
+    if (responseAlreadyStarted(res)) {
+      console.error("Request failed after response started:", message);
+      if (!(res as ServerResponse & { writableEnded?: boolean }).writableEnded) {
+        try {
+          res.end();
+        } catch {
+          // Best effort: the original response has already started.
+        }
+      }
+      return;
+    }
 
     jsonResponse(res, isBadRequest ? 400 : 500, {
       error: {
