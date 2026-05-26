@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { classifyFailure, getFailureCategoryLabel } from "./failure-classification.js";
+import { getExecutorDisplaySummary, getPlannerDecisionText } from "./output-contract.js";
 
 export type UiEventAgent = "planner" | "executor" | "tool" | "system" | "verifier" | "synthesizer";
 export type UiEventPhase = "start" | "reasoning" | "decision" | "result" | "retry" | "approval" | "final";
@@ -74,7 +76,7 @@ export function normalizeWorkflowEvent(
         agent: "planner",
         phase: "start",
         type: "planner.start",
-        title: "Planner started step",
+        title: "Planner step started",
         summary: `Started orchestration step ${internal.step ?? 1}.`,
         status: "running",
         step: internal.step,
@@ -90,7 +92,7 @@ export function normalizeWorkflowEvent(
         agent: "planner",
         phase: "decision",
         type: "planner.decision",
-        title: "Planner made a decision",
+        title: "Planner decision recorded",
         summary: formatPlannerSummary(internal.data),
         status: mapPlannerStatus(internal.data.status),
         step: internal.step,
@@ -99,6 +101,11 @@ export function normalizeWorkflowEvent(
           reasoning_summary: internal.data.reasoning_summary ?? "",
           next_step: internal.data.next_step ?? "",
           verdict: internal.data.verdict ?? null,
+          failure_category: classifyFailure({
+            type: "planner.decision",
+            status: asString(internal.data.status),
+            summary: getPlannerDecisionText(internal.data),
+          }),
           workflow_id: asString(internal.data.workflow_id),
           workflow_task_count: typeof internal.data.workflow_task_count === "number" ? internal.data.workflow_task_count : 0,
         },
@@ -113,7 +120,7 @@ export function normalizeWorkflowEvent(
         agent: "planner",
         phase: "decision",
         type: "planner.workflow_plan_created",
-        title: "Workflow plan created",
+        title: "Workflow plan drafted",
         summary: formatWorkflowPlanCreatedSummary(internal.data),
         status: "running",
         step: internal.step,
@@ -160,6 +167,40 @@ export function normalizeWorkflowEvent(
         meta: {
           workflow_id: asString(internal.data.workflow_id),
           issues: Array.isArray(internal.data.issues) ? internal.data.issues : [],
+          failure_category: classifyFailure({
+            type: "workflow.plan.rejected",
+            status: "blocked",
+            summary: formatWorkflowPlanRejectedSummary(internal.data),
+          }),
+        },
+      });
+
+    case "workflow.replan.rejected":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: "planner",
+        phase: "retry",
+        type: "planner.workflow_replan_rejected",
+        title: "Workflow replan rejected",
+        summary: formatWorkflowReplanRejectedSummary(internal.data),
+        status: "blocked",
+        step: internal.step,
+        meta: {
+          workflow_id: asString(internal.data.workflow_id),
+          replacement_workflow_id: asString(internal.data.replacement_workflow_id),
+          task_id: asString(internal.data.task_id),
+          planner_status: asString(internal.data.planner_status),
+          reason: asString(internal.data.reason),
+          issues: Array.isArray(internal.data.issues) ? internal.data.issues : [],
+          failure_category: classifyFailure({
+            type: "workflow.replan.rejected",
+            status: "blocked",
+            summary: formatWorkflowReplanRejectedSummary(internal.data),
+            error: asString(internal.data.reason),
+          }),
         },
       });
 
@@ -172,7 +213,7 @@ export function normalizeWorkflowEvent(
         agent: "planner",
         phase: "retry",
         type: "planner.workflow_plan_replanned",
-        title: "Workflow plan replanned",
+        title: "Workflow plan updated",
         summary: formatWorkflowPlanReplannedSummary(internal.data),
         status: "running",
         step: internal.step,
@@ -193,7 +234,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "start",
         type: "workflow.task.ready",
-        title: "Workflow task ready",
+        title: "Task ready",
         summary: formatWorkflowTaskSummary(internal.data, "ready"),
         status: "running",
         step: internal.step,
@@ -209,7 +250,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "decision",
         type: "workflow.task.assigned",
-        title: "Workflow task assigned",
+        title: "Task started",
         summary: formatWorkflowTaskSummary(internal.data, "assigned"),
         status: "running",
         step: internal.step,
@@ -225,7 +266,7 @@ export function normalizeWorkflowEvent(
         agent: "system",
         phase: "approval",
         type: "workflow.task.awaiting_approval",
-        title: "Workflow task awaiting approval",
+        title: "Task awaiting approval",
         summary: formatWorkflowTaskSummary(internal.data, "awaiting_approval"),
         status: "awaiting_approval",
         step: internal.step,
@@ -241,7 +282,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "result",
         type: "workflow.task.completed",
-        title: "Workflow task completed",
+        title: "Task completed",
         summary: formatWorkflowTaskSummary(internal.data, "completed"),
         status: "completed",
         step: internal.step,
@@ -257,7 +298,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "result",
         type: "workflow.task.failed",
-        title: "Workflow task failed",
+        title: "Task failed",
         summary: formatWorkflowTaskSummary(internal.data, "failed"),
         status: "failed",
         step: internal.step,
@@ -273,7 +314,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "result",
         type: "workflow.task.skipped",
-        title: "Workflow task skipped",
+        title: "Task skipped",
         summary: formatWorkflowTaskSummary(internal.data, "skipped"),
         status: "blocked",
         step: internal.step,
@@ -289,7 +330,7 @@ export function normalizeWorkflowEvent(
         agent: mapWorkflowTaskAgent(internal.data.role),
         phase: "retry",
         type: "workflow.task.superseded",
-        title: "Workflow task superseded",
+        title: "Task superseded",
         summary: formatWorkflowTaskSupersededSummary(internal.data),
         status: "blocked",
         step: internal.step,
@@ -305,7 +346,7 @@ export function normalizeWorkflowEvent(
         agent: "executor",
         phase: "start",
         type: "executor.start",
-        title: "Executor started work",
+        title: "Executor started",
         summary: formatExecutorStartSummary(internal.data),
         status: "running",
         step: internal.step,
@@ -324,13 +365,18 @@ export function normalizeWorkflowEvent(
         agent: "executor",
         phase: "result",
         type: mapExecutorResultType(internal.data.status),
-        title: "Executor returned a result",
-        summary: asString(internal.data.summary) || "Executor completed a step.",
+        title: "Executor result",
+        summary: getExecutorDisplaySummary(internal.data) || "Executor completed a step.",
         status: mapExecutorStatus(internal.data.status),
         step: internal.step,
         meta: {
           executor_status: internal.data.status ?? null,
           artifact_count: typeof internal.data.artifact_count === "number" ? internal.data.artifact_count : 0,
+          failure_category: classifyFailure({
+            type: mapExecutorResultType(internal.data.status),
+            status: asString(internal.data.status),
+            summary: getExecutorDisplaySummary(internal.data),
+          }),
         },
       });
 
@@ -343,7 +389,7 @@ export function normalizeWorkflowEvent(
         agent: "tool",
         phase: "start",
         type: "tool.start",
-        title: "Tool call started",
+        title: "Tool started",
         summary: formatToolStartSummary(internal.data),
         status: "running",
         step: internal.step,
@@ -363,16 +409,66 @@ export function normalizeWorkflowEvent(
         agent: "tool",
         phase: "result",
         type: ok ? "tool.result" : "tool.failed",
-        title: ok ? "Tool returned a result" : "Tool failed",
+        title: ok ? "Tool result" : "Tool failed",
         summary: asString(internal.data.summary) || (ok ? "Tool completed." : "Tool failed."),
         status: ok ? "success" : "failed",
         step: internal.step,
         meta: {
           tool: asString(internal.data.tool),
           ok,
+          failure_category: ok ? null : classifyFailure({
+            type: ok ? "tool.result" : "tool.failed",
+            status: ok ? "success" : "failed",
+            summary: asString(internal.data.summary),
+            tool: asString(internal.data.tool),
+          }),
         },
       });
     }
+
+    case "system.verification_failed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "verifier",
+        phase: "result",
+        type: "system.verification_failed",
+        title: "Verification failed",
+        summary: asString(internal.data.summary) || "Verification reported issues.",
+        status: "blocked",
+        step: internal.step,
+        meta: {
+          verifier_count: typeof internal.data.verifier_count === "number" ? internal.data.verifier_count : 0,
+          verification_status: asString(internal.data.verification_status),
+          failure_category: classifyFailure({
+            type: "system.verification_failed",
+            status: "blocked",
+            summary: asString(internal.data.summary) || "Verification reported issues.",
+            verificationStatus: asString(internal.data.verification_status),
+          }),
+        },
+      });
+
+    case "system.verification_passed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "verifier",
+        phase: "result",
+        type: "system.verification_passed",
+        title: "Verification passed",
+        summary: asString(internal.data.summary) || "Verification passed.",
+        status: "success",
+        step: internal.step,
+        meta: {
+          verifier_count: typeof internal.data.verifier_count === "number" ? internal.data.verifier_count : 0,
+          verification_status: asString(internal.data.verification_status),
+        },
+      });
 
     case "workflow.complexity.assessed": {
       const mode = asString(internal.data.execution_mode) || "orchestrated";
@@ -388,7 +484,7 @@ export function normalizeWorkflowEvent(
         agent: "system",
         phase: "decision",
         type: "system.complexity_assessed",
-        title: "Task complexity assessed",
+        title: "Complexity assessed",
         summary: mode === "direct"
           ? `Task was classified as simple and will try the fast path first.`
           : `Task was classified as multi-step and will use full orchestration.`,
@@ -413,7 +509,7 @@ export function normalizeWorkflowEvent(
         agent: "system",
         phase: "result",
         type: internal.type,
-        title: "System event",
+        title: "System update",
         summary: truncate(JSON.stringify(internal.data), 200) || "System emitted an event.",
         status: "running",
         step: internal.step,
@@ -424,8 +520,7 @@ export function normalizeWorkflowEvent(
 
 function formatPlannerSummary(data: Record<string, unknown>): string {
   const plannerStatus = asString(data.status);
-  const reasoning = asString(data.reasoning_summary);
-  const nextStep = asString(data.next_step);
+  const decisionText = getPlannerDecisionText(data);
   const workflowId = asString(data.workflow_id);
   const workflowTaskCount = typeof data.workflow_task_count === "number" ? data.workflow_task_count : 0;
 
@@ -439,13 +534,10 @@ function formatPlannerSummary(data: Record<string, unknown>): string {
   }
 
   if (plannerStatus === "final") {
-    return "Planner believes the task is ready to finalize.";
+    return decisionText ? truncate(decisionText, 160) : "Planner believes the task is ready to finalize.";
   }
-  if (reasoning) {
-    return truncate(reasoning, 160);
-  }
-  if (nextStep) {
-    return `Next step: ${truncate(nextStep, 120)}`;
+  if (decisionText) {
+    return truncate(decisionText, 160);
   }
   return "Planner updated the execution strategy.";
 }
@@ -504,6 +596,26 @@ function formatWorkflowPlanReplannedSummary(data: Record<string, unknown>): stri
   return `${workflowId} was replaced by ${replacementWorkflowId}.`;
 }
 
+function formatWorkflowReplanRejectedSummary(data: Record<string, unknown>): string {
+  const workflowId = asString(data.workflow_id) || "workflow";
+  const taskId = asString(data.task_id);
+  const reason = asString(data.reason);
+  const issues = Array.isArray(data.issues)
+    ? data.issues.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+  if (issues.length > 0) {
+    return `${workflowId} replan was rejected: ${truncate(issues[0] ?? "", 140)}`;
+  }
+  if (reason) {
+    return taskId
+      ? `${workflowId} replan after task ${taskId} was rejected: ${reason}.`
+      : `${workflowId} replan was rejected: ${reason}.`;
+  }
+  return taskId
+    ? `${workflowId} replan after task ${taskId} was rejected.`
+    : `${workflowId} replan was rejected.`;
+}
+
 function formatToolStartSummary(data: Record<string, unknown>): string {
   const tool = asString(data.tool);
   if (!tool) {
@@ -538,6 +650,11 @@ function formatWorkflowTaskSupersededSummary(data: Record<string, unknown>): str
 }
 
 function buildWorkflowTaskMeta(data: Record<string, unknown>): Record<string, unknown> {
+  const failureCategory = classifyFailure({
+    type: "workflow.task",
+    status: asString(data.status),
+    summary: asString(data.output),
+  });
   return {
     task_id: asString(data.task_id),
     title: asString(data.title),
@@ -545,6 +662,8 @@ function buildWorkflowTaskMeta(data: Record<string, unknown>): Record<string, un
     role: asString(data.role),
     depends_on: Array.isArray(data.depends_on) ? data.depends_on : [],
     output: asString(data.output),
+    failure_category: failureCategory,
+    failure_category_label: failureCategory ? getFailureCategoryLabel(failureCategory) : null,
   };
 }
 

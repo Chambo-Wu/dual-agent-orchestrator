@@ -9,6 +9,10 @@ Dual Agent Orchestrator is a generic `planner + executor` runtime for multi-mode
 
 Chinese documentation: [Readme-CN.md](./Readme-CN.md)
 
+Additional project planning docs:
+
+- [路线图-分阶段持续推进与实施清单-20260526.md](./docs/路线图-分阶段持续推进与实施清单-20260526.md)
+
 ## Overview
 
 The system is built around two model roles:
@@ -21,12 +25,28 @@ The current implementation supports both:
 - direct chat-style use through `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`
 - first-class task jobs through `/v1/jobs`
 
+## Terminology
+
+Use these terms consistently across the runtime, API, UI, and planning docs:
+
+- `job`: the top-level execution record managed through `/v1/jobs`
+- `workflow`: a structured execution plan attached to a job; may be replaced by runtime `replan`
+- `task`: a node inside a workflow plan, such as `write`, `search`, `fetch`, `verify`, or `synthesize`
+- `task run`: the persisted runtime record for a task execution inside a job
+- `step`: a planner/executor iteration or an event-level progression marker; not the same thing as a `task`
+- `artifact`: a concrete output produced by tools or task execution and persisted for later verification or consumption
+- `verifier`: the system-first verification layer that checks whether outputs are real, valid, and sufficient
+- `retry`: rerun the same job or task intent again
+- `resume`: continue from an interrupted or blocked job through the control plane
+- `replan`: replace or adjust the active workflow after failure or new information
+- `replay`: re-read persisted events from `/events` or `/stream` using `since_seq` or `Last-Event-ID`
+
 ## Current Status
 
 This is no longer just a CLI skeleton. The current codebase includes:
 
 - async job creation with persistent job records
-- planner/executor step history and artifacts
+- planner/executor iteration history, task runs, and artifacts
 - realtime workflow event streaming over SSE
 - HTML timeline rendering for jobs
 - workflow-plan parsing, validation, and runtime execution
@@ -141,6 +161,19 @@ Quick health/config self-check:
 npm run doctor
 ```
 
+`npm run doctor` now returns a structured runtime diagnostics report, including:
+
+- config load status
+- planner/executor model readiness
+- task routing load status
+- task routing summary
+- runtime profile snapshot
+- proxy health
+- workspace/runtime writable checks
+- search provider readiness
+- actionable recommendations grouped by failure category
+- a top-level passed/failed summary with generation timestamp
+
 ## API Surface
 
 Auth:
@@ -189,6 +222,16 @@ There are two different streaming experiences:
 - use `/v1/jobs/:id/stream`
 - emits normalized workflow events for frontend UIs
 - intended for dashboards, timelines, and multi-agent collaboration views
+- supports SSE resume with `Last-Event-ID`
+- supports replay from `since_seq`
+- emits SSE `id:` fields on `job.event` entries
+
+Replay contract:
+
+- `GET /v1/jobs/:id/events?since_seq=N` returns events with `seq > N`
+- `GET /v1/jobs/:id/stream?since_seq=N` replays events with `seq > N` before live subscription
+- `GET /v1/jobs/:id/stream` with header `Last-Event-ID: N` resumes from `seq > N`
+- `job.snapshot` includes `replay.next_seq`, `replay.can_resume_from`, `replay.resumed_from_seq`, and `replay.replayed_count`
 
 You can explicitly opt into raw workflow SSE events on compatible routes with:
 
@@ -216,6 +259,9 @@ The current progress system is designed for both custom frontends and generic cl
 - card-style text progress in standard chat streams
 - built-in DAG lanes that now render real dependency graphs instead of simple task lists
 - superseded workflow lanes and replan history focus interactions inside `/v1/jobs/:id/timeline`
+- a built-in runtime analysis panel for verification outcomes, artifact activity, tool activity, and common blockers
+- click-to-filter analysis chips that can jump from summary statistics to matching events and related workflow lanes
+- shareable timeline URLs that preserve `workflowFocus`, `analysisFilter`, and `analysisValue`
 
 Example mirrored progress in chat streams:
 
@@ -294,9 +340,10 @@ For custom apps:
 - create a job with `POST /v1/jobs`
 - subscribe to `/v1/jobs/:id/stream`
 - fetch `/v1/jobs/:id/events` for replay or refresh
+- store the last seen SSE `id` and reconnect with `Last-Event-ID`
 - open `/v1/jobs/:id/timeline` for a built-in visualization
 
 ## Acknowledgments
 
-- [Linux.do](https://linux.do/) — Where possible begins
-- [Xiaomi MiMo Orbit](https://100t.xiaomimimo.com/) — 百万亿Token 创造者激励计划
+- [Linux.do](https://linux.do/)
+- [Xiaomi MiMo Orbit](https://100t.xiaomimimo.com/)

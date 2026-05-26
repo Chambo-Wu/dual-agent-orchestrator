@@ -5,8 +5,14 @@ function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
 
-function mapJobStatusToTaskRunStatus(status: JobStatus): TaskRunStatus {
+export function mapJobStatusToTaskRunStatus(status: JobStatus): TaskRunStatus {
   switch (status) {
+    case "queued":
+      return "pending";
+    case "running":
+      return "in_progress";
+    case "awaiting_approval":
+      return "awaiting_approval";
     case "completed":
       return "completed";
     case "failed":
@@ -14,27 +20,48 @@ function mapJobStatusToTaskRunStatus(status: JobStatus): TaskRunStatus {
     case "blocked":
     case "cancelled":
       return "blocked";
-    case "queued":
-    case "running":
-    case "awaiting_approval":
     default:
       return "pending";
   }
 }
 
-function mapExecutorArtifact(artifact: ExecutorArtifact, sourceTaskRunId?: string): Artifact {
+type ArtifactContext = {
+  sourceTaskRunId?: string;
+  relatedTaskRunId?: string;
+  relatedStep?: number;
+};
+
+function inferArtifactTrustLevel(artifact: ExecutorArtifact): Artifact["trustLevel"] {
+  if (artifact.path) {
+    return "high";
+  }
+  return artifact.type === "text" ? "medium" : "low";
+}
+
+function mapExecutorArtifact(artifact: ExecutorArtifact, context: ArtifactContext = {}): Artifact {
+  const relatedTaskRunId = context.relatedTaskRunId ?? context.sourceTaskRunId;
   return {
     id: createId("artifact"),
     type: artifact.type,
     path: artifact.path,
     contentPreview: artifact.content_preview,
     source: "executor",
-    sourceTaskRunId,
+    trustLevel: inferArtifactTrustLevel(artifact),
+    sourceTaskRunId: context.sourceTaskRunId,
+    relatedTaskRunId,
+    relatedStep: context.relatedStep,
   };
 }
 
-export function collectArtifactsFromExecutorHistory(executorHistory: readonly ExecutorOutput[], sourceTaskRunId?: string): Artifact[] {
-  return executorHistory.flatMap((item) => item.artifacts.map((artifact) => mapExecutorArtifact(artifact, sourceTaskRunId)));
+export function collectArtifactsFromExecutorHistory(
+  executorHistory: readonly ExecutorOutput[],
+  sourceTaskRunId?: string,
+  relatedStepOffset = 0,
+): Artifact[] {
+  return executorHistory.flatMap((item, index) => item.artifacts.map((artifact) => mapExecutorArtifact(artifact, {
+    sourceTaskRunId,
+    relatedStep: relatedStepOffset + index + 1,
+  })));
 }
 
 export function createTaskRunRecord(params: {

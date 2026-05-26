@@ -157,7 +157,7 @@ export function validateWorkflowPlan(plan: WorkflowPlan, tools: readonly ToolDef
   const taskIds = new Set<string>();
 
   if (plan.tasks.length > 16) {
-    issues.push(`workflow plan defines ${plan.tasks.length} tasks, which exceeds the Milestone A limit of 16`);
+    issues.push(`workflow plan defines ${plan.tasks.length} tasks, which exceeds the current runtime limit of 16`);
   }
 
   for (const task of plan.tasks) {
@@ -251,7 +251,7 @@ export function buildWorkflowFallbackExecutorRequest(plan: WorkflowPlan): {
     return undefined;
   }
   return {
-    instruction: `Milestone A fallback: execute the first workflow task directly.\nTask title: ${firstTask.title}\nTask kind: ${firstTask.kind}\nTask instruction: ${firstTask.instruction}`,
+    instruction: `Runtime fallback: execute the first workflow task directly.\nTask title: ${firstTask.title}\nTask kind: ${firstTask.kind}\nTask instruction: ${firstTask.instruction}`,
     allowed_tools: firstTask.allowed_tools,
     expected_output: `Progress for workflow task ${firstTask.id} (${firstTask.title}).`,
   };
@@ -273,7 +273,7 @@ export function assessWorkflowExecutionSupport(plan: WorkflowPlan): WorkflowExec
 
   for (const task of plan.tasks) {
     if (!milestoneCSupportedKinds.has(task.kind)) {
-      issues.push(`unsupported workflow task kind for Milestone C: ${task.kind}`);
+      issues.push(`unsupported workflow task kind for the current runtime: ${task.kind}`);
     }
   }
 

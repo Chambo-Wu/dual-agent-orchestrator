@@ -81,7 +81,7 @@ Schema:
 Workflow planning rules:
 - Use "workflow" only for genuinely multi-stage tasks that benefit from an explicit plan.
 - If status is "workflow", include a valid "workflow_plan".
-- In Milestone A, runtime will validate and record the plan, then safely degrade to a single executor step.
+- If a workflow plan cannot run directly yet, runtime will validate and record the plan, then safely degrade to a single executor step.
 - For simple tasks, prefer "need_executor" instead of "workflow".`;
 
 export const EXECUTOR_PROMPT = `You are the Executor.

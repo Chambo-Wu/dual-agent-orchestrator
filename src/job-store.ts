@@ -14,6 +14,8 @@ export interface JobControlState {
   resumedAt?: string;
   resumedToJobId?: string;
   resumeOf?: string;
+  recoveredAt?: string;
+  recoveryReason?: "service_restart";
 }
 
 export interface StoredJobRecord {

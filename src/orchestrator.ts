@@ -17,6 +17,7 @@ import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, validateWorkflowPlan, assessWorkflowExecutionSupport } from "./workflow-plan.js";
 import { runWorkflowPlan } from "./workflow-runtime.js";
+import { getExecutorDecisionText, getExecutorDisplaySummary, getPlannerDecisionText } from "./output-contract.js";
 
 export class PlannerUnavailableError extends Error {
   readonly causeError?: Error;
@@ -172,7 +173,7 @@ function parsePlannerOutputRecord(
   parsed: Record<string, unknown>,
   hasExecutorHistory: boolean,
 ): PlannerOutput {
-  return {
+  const normalized: PlannerOutput = {
     goal: userGoal,
     status: parsePlannerStatus(parsed.status),
     reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
@@ -182,6 +183,10 @@ function parsePlannerOutputRecord(
     executor_request: parsePlannerExecutorRequest(parsed.executor_request),
     final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
     clarification_question: typeof parsed.question === "string" ? parsed.question : undefined,
+  };
+  return {
+    ...normalized,
+    decision_text: getPlannerDecisionText(normalized),
   };
 }
 
@@ -246,8 +251,8 @@ function applyWorkflowMilestoneAFallback(
     audit: {
       verdict: planner.audit.verdict === "blocked" ? "blocked" : "approved",
       notes: planner.audit.notes
-        ? `${planner.audit.notes} Milestone A fallback applied: runtime recorded the workflow plan and degraded to a single executor step.`
-        : "Milestone A fallback applied: runtime recorded the workflow plan and degraded to a single executor step.",
+        ? `${planner.audit.notes} Runtime fallback applied: the workflow plan was recorded and degraded to a single executor step.`
+        : "Runtime fallback applied: the workflow plan was recorded and degraded to a single executor step.",
     },
     executor_request: fallbackRequest,
   };
@@ -581,14 +586,15 @@ async function runDirectTask(
   }
 
   if (hasSubstantiveDirectAnswer(executorResult)) {
+    const output = getExecutorDecisionText(executorResult);
     logger?.log("orchestrator.direct.completed", {
-      output: executorResult.summary,
+      output,
       requested_output_path: requestedOutputPath,
     });
     return finalizeRunTaskResult({
       goal: taskPrompt,
       status: "completed",
-      output: executorResult.summary,
+      output,
       verified: executorResult.status === "success",
       executorHistory,
       options,
@@ -596,14 +602,14 @@ async function runDirectTask(
   }
 
   logger?.log("orchestrator.direct.escalate", {
-    reason: executorResult.error || executorResult.summary,
+    reason: getExecutorDecisionText(executorResult),
     status: executorResult.status,
   });
 
   return finalizeRunTaskResult({
     goal: taskPrompt,
     status: "failed",
-    output: executorResult.error || executorResult.summary || "Direct execution could not complete the task.",
+    output: getExecutorDecisionText(executorResult) || "Direct execution could not complete the task.",
     verified: false,
     executorHistory,
     options,
@@ -1161,6 +1167,15 @@ function finalizeExecutorResult(
         ? "Executor self-declared success without native tool execution."
         : error,
     source: usedNativeToolCalls ? "native_tool" : "model_text",
+    display_summary: getExecutorDisplaySummary({
+      summary,
+      raw_result: rawResult,
+      error: declaredToolCallsWithoutExecution
+        ? "Executor declared tool calls without actually executing any native tools."
+        : parsed.status === "success" && !usedNativeToolCalls
+          ? "Executor self-declared success without native tool execution."
+          : error,
+    }),
   };
 }
 
@@ -1586,6 +1601,7 @@ async function runPlannerStep(
       status: normalizedPlanner.status,
       reasoning_summary: normalizedPlanner.reasoning_summary,
       next_step: normalizedPlanner.next_step,
+      decision_text: getPlannerDecisionText(normalizedPlanner),
       verdict: normalizedPlanner.audit?.verdict,
       workflow_id: normalizedPlanner.workflow_plan?.id,
       workflow_task_count: normalizedPlanner.workflow_plan?.tasks.length ?? 0,
@@ -1868,6 +1884,7 @@ export async function runExecutorStep(
     data: {
       status: finalized.status,
       summary: finalized.summary,
+      display_summary: getExecutorDisplaySummary(finalized),
       artifact_count: finalized.artifacts.length,
     },
   });
@@ -2076,6 +2093,7 @@ export async function runOrchestrator(
         status: normalizedPlanner.status,
         reasoning_summary: normalizedPlanner.reasoning_summary,
         next_step: normalizedPlanner.next_step,
+        decision_text: getPlannerDecisionText(normalizedPlanner),
         verdict: normalizedPlanner.audit?.verdict,
         workflow_id: normalizedPlanner.workflow_plan?.id,
         workflow_task_count: normalizedPlanner.workflow_plan?.tasks.length ?? 0,

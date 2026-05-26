@@ -1,12 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import type { Artifact, ExecutorOutput, TaskRun } from "./types.js";
-
-export interface VerificationResult {
-  passed: boolean;
-  verifier: string;
-  message: string;
-}
+import type { Artifact, ExecutorOutput, TaskRun, VerificationCheck, VerificationResult } from "./types.js";
 
 export interface VerificationContext {
   jobId: string;
@@ -20,7 +14,7 @@ export interface VerificationContext {
 
 export interface Verifier {
   name: string;
-  verify(context: VerificationContext): Promise<VerificationResult>;
+  verify(context: VerificationContext): Promise<VerificationCheck>;
 }
 
 const FileExistsVerifier: Verifier = {
@@ -28,17 +22,17 @@ const FileExistsVerifier: Verifier = {
   async verify(context) {
     const fileArtifacts = context.artifacts.filter((a) => a.type === "file" && a.path);
     if (fileArtifacts.length === 0) {
-      return { passed: true, verifier: "file_exists", message: "No file artifacts to check." };
+      return { name: "file_exists", passed: true, detail: "No file artifacts to check." };
     }
     const missing = fileArtifacts.filter((a) => !existsSync(a.path!));
     if (missing.length > 0) {
       return {
+        name: "file_exists",
         passed: false,
-        verifier: "file_exists",
-        message: `Missing files: ${missing.map((a) => a.path).join(", ")}`,
+        detail: `Missing files: ${missing.map((a) => a.path).join(", ")}`,
       };
     }
-    return { passed: true, verifier: "file_exists", message: `All ${fileArtifacts.length} file artifacts exist.` };
+    return { name: "file_exists", passed: true, detail: `All ${fileArtifacts.length} file artifacts exist.` };
   },
 };
 
@@ -47,7 +41,7 @@ const SchemaCheckVerifier: Verifier = {
   async verify(context) {
     const jsonArtifacts = context.artifacts.filter((a) => a.type === "json" && a.path);
     if (jsonArtifacts.length === 0) {
-      return { passed: true, verifier: "schema_check", message: "No JSON artifacts to check." };
+      return { name: "schema_check", passed: true, detail: "No JSON artifacts to check." };
     }
     const errors: string[] = [];
     for (const artifact of jsonArtifacts) {
@@ -61,9 +55,9 @@ const SchemaCheckVerifier: Verifier = {
       }
     }
     if (errors.length > 0) {
-      return { passed: false, verifier: "schema_check", message: `Invalid JSON: ${errors.join("; ")}` };
+      return { name: "schema_check", passed: false, detail: `Invalid JSON: ${errors.join("; ")}` };
     }
-    return { passed: true, verifier: "schema_check", message: `All ${jsonArtifacts.length} JSON artifacts are valid.` };
+    return { name: "schema_check", passed: true, detail: `All ${jsonArtifacts.length} JSON artifacts are valid.` };
   },
 };
 
@@ -73,15 +67,15 @@ const ArtifactPresenceVerifier: Verifier = {
     if (context.artifacts.length === 0) {
       const hasNativeTools = context.executorHistory.some((h) => h.tool_calls_made.length > 0);
       if (hasNativeTools) {
-        return { passed: false, verifier: "artifact_presence", message: "Tool calls were made but no artifacts were produced." };
+        return { name: "artifact_presence", passed: false, detail: "Tool calls were made but no artifacts were produced." };
       }
-      return { passed: true, verifier: "artifact_presence", message: "No tools used, no artifacts expected." };
+      return { name: "artifact_presence", passed: true, detail: "No tools used, no artifacts expected." };
     }
     const emptyPreviews = context.artifacts.filter((a) => !a.contentPreview || a.contentPreview.trim() === "");
     if (emptyPreviews.length === context.artifacts.length) {
-      return { passed: false, verifier: "artifact_presence", message: "All artifacts have empty previews." };
+      return { name: "artifact_presence", passed: false, detail: "All artifacts have empty previews." };
     }
-    return { passed: true, verifier: "artifact_presence", message: `${context.artifacts.length} artifacts present with content.` };
+    return { name: "artifact_presence", passed: true, detail: `${context.artifacts.length} artifacts present with content.` };
   },
 };
 
@@ -96,12 +90,12 @@ const GitDiffVerifier: Verifier = {
       });
       const output = (result.stdout || "").trim();
       if (!output) {
-        return { passed: true, verifier: "git_diff", message: "No file changes detected in workspace." };
+        return { name: "git_diff", passed: true, detail: "No file changes detected in workspace." };
       }
       const changedFiles = output.split("\n").filter((l) => l.trim()).length;
-      return { passed: true, verifier: "git_diff", message: `${changedFiles} file(s) changed in workspace.` };
+      return { name: "git_diff", passed: true, detail: `${changedFiles} file(s) changed in workspace.` };
     } catch {
-      return { passed: true, verifier: "git_diff", message: "Git not available, skipping diff check." };
+      return { name: "git_diff", passed: true, detail: "Git not available, skipping diff check." };
     }
   },
 };
@@ -111,9 +105,9 @@ const UrlReachableVerifier: Verifier = {
   async verify(context) {
     const urlArtifacts = context.artifacts.filter((a) => a.type === "json" && a.contentPreview.includes("http"));
     if (urlArtifacts.length === 0) {
-      return { passed: true, verifier: "url_reachable", message: "No URL artifacts to check." };
+      return { name: "url_reachable", passed: true, detail: "No URL artifacts to check." };
     }
-    return { passed: true, verifier: "url_reachable", message: `Skipped URL reachability check for ${urlArtifacts.length} artifacts.` };
+    return { name: "url_reachable", passed: true, detail: `Skipped URL reachability check for ${urlArtifacts.length} artifacts.` };
   },
 };
 
@@ -128,19 +122,27 @@ const DEFAULT_VERIFIERS: Verifier[] = [
 export async function runVerifiers(
   context: VerificationContext,
   verifiers?: Verifier[],
-): Promise<VerificationResult[]> {
+): Promise<VerificationResult> {
   const activeVerifiers = verifiers ?? DEFAULT_VERIFIERS;
-  return Promise.all(
+  const checks = await Promise.all(
     activeVerifiers.map((v) =>
       v.verify(context).catch((err) => ({
+        name: v.name,
         passed: false,
-        verifier: v.name,
-        message: `Verifier error: ${err instanceof Error ? err.message : String(err)}`,
+        detail: `Verifier error: ${err instanceof Error ? err.message : String(err)}`,
       })),
     ),
   );
+  const failedChecks = checks.filter((check) => !check.passed);
+  return {
+    status: failedChecks.length === 0 ? "verified" : "failed",
+    summary: failedChecks.length === 0
+      ? "Verification completed successfully."
+      : failedChecks.map((check) => `${check.name}: ${check.detail}`).join("; "),
+    checks,
+  };
 }
 
-export function verificationPassed(results: VerificationResult[]): boolean {
-  return results.every((r) => r.passed);
+export function verificationPassed(result: VerificationResult): boolean {
+  return result.status === "verified";
 }

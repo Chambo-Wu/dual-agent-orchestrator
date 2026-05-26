@@ -414,7 +414,7 @@ runtime 在接受 `workflow_plan` 前执行：
 
 把 `workflow_plan.tasks` 映射为现有 `Task` / `TaskRun`：
 
-- `workflow task` -> `Task`
+- `task` -> `Task`
 - `Task` -> `TaskRun`
 - `outputs.artifacts` -> artifact expectation metadata
 

@@ -85,6 +85,52 @@ test("workflow runtime executes delegate then write tasks", async () => {
   assert.equal(result.taskRuns[1]?.status, "completed");
 });
 
+test("workflow runtime uses executor decision text for task output", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy();
+
+  const result = await runWorkflowPlan(
+    config,
+    "Read with separate display summary",
+    {
+      id: "wf_executor_decision_text",
+      strategy: "read",
+      summary: "Read one source.",
+      tasks: [
+        {
+          id: "t1",
+          title: "Read source",
+          kind: "read",
+          role: "worker",
+          instruction: "Read source.",
+          allowed_tools: ["read_file"],
+          depends_on: [],
+          required: true,
+        },
+      ],
+      finish_when: {
+        mode: "all_required_tasks_completed",
+      },
+    },
+    routePolicy,
+    undefined,
+    createFakeRuntimeDeps({
+      runExecutorStep: async () => ({
+        status: "success",
+        summary: "Decision summary",
+        display_summary: "Display summary",
+        tool_calls_made: [{ tool: "read_file", arguments: { path: "source.txt" } }],
+        artifacts: [],
+        raw_result: "raw detail",
+        source: "native_tool",
+      }),
+    }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.taskRuns[0]?.output, "Decision summary");
+});
+
 test("workflow runtime blocks unsupported milestone C plans", async () => {
   const config = buildMinimalConfig();
   const routePolicy = buildRoutePolicy();
@@ -116,7 +162,7 @@ test("workflow runtime blocks unsupported milestone C plans", async () => {
   );
 
   assert.equal(result.status, "blocked");
-  assert.equal(result.output.includes("not executable in Milestone C"), true);
+  assert.equal(result.output.includes("not executable in the current runtime"), true);
 });
 
 test("workflow runtime persists awaiting approval state for approval tasks", async () => {

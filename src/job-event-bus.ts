@@ -67,11 +67,28 @@ export function getLatestSnapshot(jobId: string): Record<string, unknown> | null
   const latestPlanner = [...state.events].reverse().find((e) => e.agent === "planner");
   const latestExecutor = [...state.events].reverse().find((e) => e.agent === "executor");
   const latestTool = [...state.events].reverse().find((e) => e.agent === "tool");
+  const failures = state.events
+    .filter((event) => typeof event.meta.failure_category === "string" && event.meta.failure_category.trim().length > 0)
+    .map((event) => ({
+      category: event.meta.failure_category as string,
+      summary: event.summary,
+    }));
+  const byCategory: Record<string, number> = {};
+  for (const failure of failures) {
+    byCategory[failure.category] = (byCategory[failure.category] ?? 0) + 1;
+  }
+  const latestFailure = failures.at(-1) ?? null;
 
   return {
     job_id: jobId,
     seq: state.seq,
     event_count: state.events.length,
+    failure_summary: {
+      total: failures.length,
+      by_category: byCategory,
+      latest_category: latestFailure?.category ?? null,
+      latest_summary: latestFailure?.summary ?? null,
+    },
     latest_planner: latestPlanner ? {
       type: latestPlanner.type,
       title: latestPlanner.title,

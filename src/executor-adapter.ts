@@ -1,4 +1,5 @@
 import { parseModelJson, tryParseJsonObject } from "./json.js";
+import { getExecutorDisplaySummary } from "./output-contract.js";
 import type { ExecutorArtifact, ExecutorOutput, ExecutorToolCall } from "./types.js";
 
 function normalizeToolCalls(input: unknown): ExecutorToolCall[] {
@@ -46,13 +47,18 @@ function normalizeExecutorOutput(candidate: Record<string, unknown>, rawText: st
     ? candidate.status
     : "failed";
 
-  return {
+  const normalized: ExecutorOutput = {
     status,
     summary: typeof candidate.summary === "string" ? candidate.summary : "Executor response normalized from model output.",
     tool_calls_made: normalizeToolCalls(candidate.tool_calls_made ?? candidate.tool_calls ?? candidate.actions),
     artifacts: normalizeArtifacts(candidate.artifacts),
     raw_result: typeof candidate.raw_result === "string" ? candidate.raw_result : rawText,
     error: typeof candidate.error === "string" ? candidate.error : undefined,
+  };
+
+  return {
+    ...normalized,
+    display_summary: getExecutorDisplaySummary(normalized),
   };
 }
 
@@ -68,12 +74,17 @@ export function parseExecutorOutput(rawText: string): ExecutorOutput {
     // fall through
   }
 
-  return {
+  const fallback: ExecutorOutput = {
     status: "failed",
-    summary: "AI 返回的格式异常，请重试或更换模型",
+    summary: "Executor returned malformed output. Retry or switch the model.",
     tool_calls_made: [],
     artifacts: [],
     raw_result: rawText,
     error: "Unable to parse executor output as JSON. The model may have returned mixed text and JSON.",
+  };
+
+  return {
+    ...fallback,
+    display_summary: getExecutorDisplaySummary(fallback),
   };
 }

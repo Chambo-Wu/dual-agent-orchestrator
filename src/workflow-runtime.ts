@@ -6,11 +6,12 @@ import { createJobRecord, createPlanRecord, createTaskRunRecord, collectArtifact
 import { assessWorkflowExecutionSupport, validateWorkflowPlan } from "./workflow-plan.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
-import { runVerifiers, verificationPassed, type VerificationContext } from "./verification.js";
+import { runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
 import { persistApprovalRequest } from "./job-store.js";
 import { readJobRecord, updateStoredJobRecord } from "./job-store.js";
 import { setApprovalResolver } from "./job-runtime.js";
 import { buildWorkflowGraph } from "./workflow-graph.js";
+import { getExecutorDecisionText, summarizeVerification } from "./output-contract.js";
 
 type WorkflowTaskOutcome = {
   task: WorkflowTaskSpec;
@@ -205,6 +206,7 @@ function cloneArtifactsForArchivedTaskRun(artifacts: readonly Artifact[], archiv
     ...artifact,
     id: `${artifact.id}_archived_${archivedTaskRunId}`,
     sourceTaskRunId: archivedTaskRunId,
+    relatedTaskRunId: archivedTaskRunId,
   }));
 }
 
@@ -233,12 +235,12 @@ function buildArchivedTaskRuns(
 
 function buildPlanSummary(plan: WorkflowPlan, state: WorkflowRuntimeState): string {
   if (state.replanHistory.length === 0) {
-    return `Workflow plan ${plan.id} executed in Milestone C.`;
+    return `Workflow plan ${plan.id} executed in the current runtime.`;
   }
   const historyText = state.replanHistory
     .map((entry, index) => `${index + 1}. ${entry.supersededWorkflowId} -> ${entry.replacementWorkflowId} (failed task: ${entry.failedTaskId})`)
     .join(" | ");
-  return `Workflow plan ${plan.id} executed in Milestone C after ${state.replanHistory.length} replans. History: ${historyText}`;
+  return `Workflow plan ${plan.id} executed in the current runtime after ${state.replanHistory.length} replans. History: ${historyText}`;
 }
 
 function persistWorkflowProgress(
@@ -639,7 +641,7 @@ async function executeFallbackTask(
         ? resolveFailureStatus(sourceTask, "failed")
         : resolveFailureStatus(sourceTask, "blocked"),
     verified: executorResult.status === "success",
-    output: executorResult.summary || executorResult.raw_result || executorResult.error || "",
+    output: getExecutorDecisionText(executorResult),
     artifacts: collectArtifactsFromExecutorHistory([executorResult], sourceTask.id),
     executorHistory: [executorResult],
     attempts: 1,
@@ -914,13 +916,13 @@ export async function runWorkflowPlan(
 
   const support = assessWorkflowExecutionSupport(plan);
   if (!support.supported) {
-    const output = `Workflow plan is valid but not executable in Milestone C: ${support.issues.join("; ")}`;
+    const output = `Workflow plan is valid but not executable in the current runtime: ${support.issues.join("; ")}`;
     const blockedPlan = createPlanRecord({
       id: options?.planId,
       goal,
       mode: "task",
       taskRunIds: [],
-      summary: "Workflow plan is not executable in Milestone C.",
+      summary: "Workflow plan is not executable in the current runtime.",
     });
   const blockedJob = createJobRecord({
       id: options?.jobId,
@@ -1210,11 +1212,9 @@ export async function runWorkflowPlan(
 
       if (effectiveTask.kind === "verify") {
         const verificationContext = buildVerificationContext(goal, effectiveTask, outcomes, options);
-        const verificationResults = await runVerifiers(verificationContext);
-        const passed = verificationPassed(verificationResults);
-        const verificationSummary = verificationResults
-          .map((result) => `${result.passed ? "PASS" : "FAIL"} ${result.verifier}: ${result.message}`)
-          .join("\n");
+        const verificationResult = await runVerifiers(verificationContext);
+        const passed = verificationResultPassed(verificationResult);
+        const verificationSummary = summarizeVerification(verificationResult);
         let outcome: WorkflowTaskOutcome = {
           task: effectiveTask,
           status: passed ? "completed" : resolveFailureStatus(effectiveTask, "failed"),
@@ -1246,7 +1246,7 @@ export async function runWorkflowPlan(
         next_step: effectiveTask.title,
         audit: {
           verdict: "approved",
-          notes: `Workflow task ${effectiveTask.id} executing in Milestone C runtime.`,
+          notes: `Workflow task ${effectiveTask.id} executing in the current runtime.`,
         },
         executor_request: {
           instruction: buildWorkflowTaskPrompt(goal, effectiveTask, dependencyOutputs),
@@ -1263,7 +1263,7 @@ export async function runWorkflowPlan(
             ? resolveFailureStatus(effectiveTask, "failed")
             : resolveFailureStatus(effectiveTask, "blocked"),
         verified: executorResult.status === "success",
-        output: executorResult.summary || executorResult.raw_result || executorResult.error || "",
+        output: getExecutorDecisionText(executorResult),
         artifacts: collectArtifactsFromExecutorHistory([executorResult], task.id),
         executorHistory: [executorResult],
         attempts: 1,

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { persistJobRecord, readJobRecord } from "../../src/job-store.js";
+import { persistJobRecord, readJobRecord, updateStoredJobRecord } from "../../src/job-store.js";
 import { __testables } from "../../src/index.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "../../src/workflow-contract.js";
 
@@ -416,9 +416,16 @@ test("job runtime profile endpoint exposes platform and tool capabilities", asyn
   await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/runtime-profile"), okRes);
   const okBody = JSON.parse(okRes.body) as {
     job_id: string;
+    diagnostics_summary: {
+      dependency_warnings: number;
+      dependency_checks: number;
+    };
     runtime_profile: {
       platform: { os: string; shell: string };
       filesystem: { workspaceRoot: string; runtimeRoot: string };
+      diagnostics: {
+        dependencyChecks: Array<{ name: string; status: string }>;
+      };
       tools: Array<{ name: string; fallbackOnly?: boolean }>;
     };
   };
@@ -429,6 +436,9 @@ test("job runtime profile endpoint exposes platform and tool capabilities", asyn
   assert.equal(typeof okBody.runtime_profile.platform.shell, "string");
   assert.equal(Boolean(okBody.runtime_profile.filesystem.workspaceRoot), true);
   assert.equal(Boolean(okBody.runtime_profile.filesystem.runtimeRoot), true);
+  assert.equal(typeof okBody.diagnostics_summary.dependency_warnings, "number");
+  assert.equal(typeof okBody.diagnostics_summary.dependency_checks, "number");
+  assert.equal(okBody.runtime_profile.diagnostics.dependencyChecks.length > 0, true);
   assert.equal(okBody.runtime_profile.tools.some((tool) => tool.name === "read_file"), true);
   assert.equal(okBody.runtime_profile.tools.some((tool) => tool.name === "shell_command" && tool.fallbackOnly === true), true);
 
@@ -446,7 +456,11 @@ test("job events endpoint reconstructs job timeline from persisted state", async
   const okBody = JSON.parse(okRes.body) as {
     job_id: string;
     count: number;
-    snapshot: null | { job_id: string; event_count: number };
+    snapshot: null | {
+      job_id: string;
+      event_count: number;
+      replay?: { next_seq?: number; can_resume_from?: number };
+    };
     events: Array<{ type: string; jobId: string; taskRunId?: string; agent: string; status: string; meta?: Record<string, unknown> }>;
   };
 
@@ -460,6 +474,8 @@ test("job events endpoint reconstructs job timeline from persisted state", async
   assert.equal(okBody.events.some((event) => event.type === "artifact.created" && event.taskRunId === "taskrun_steps_test"), true);
   assert.equal(okBody.events.every((event) => typeof event.jobId === "string" && typeof event.agent === "string"), true);
   assert.equal(okBody.snapshot?.job_id, "job_steps_test");
+  assert.equal(typeof okBody.snapshot?.replay?.next_seq, "number");
+  assert.equal(typeof okBody.snapshot?.replay?.can_resume_from, "number");
 
   const cancelRes = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest({
@@ -490,8 +506,46 @@ test("job stream endpoint replays standardized timeline events and snapshot", as
   assert.equal(res.body.includes("event: job.snapshot"), true);
   assert.equal(res.body.includes("event: job.event"), true);
   assert.equal(res.body.includes("\"type\":\"executor.partial_success\""), true);
+  assert.equal(res.body.includes("\"replayed_count\""), true);
+  assert.equal(res.body.includes("id: "), true);
 
   res.end();
+});
+
+test("job stream supports since_seq replay and Last-Event-ID resume", async () => {
+  const allEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), allEventsRes);
+  const allEventsBody = JSON.parse(allEventsRes.body) as {
+    events: Array<{ seq: number; type: string }>;
+  };
+  const cursor = allEventsBody.events.find((event) => event.type === "plan.created")?.seq ?? 0;
+
+  const sinceSeqRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest({
+    ...buildAuthorizedRequest(`/v1/jobs/job_steps_test/stream?since_seq=${cursor}`),
+  } as IncomingMessage, sinceSeqRes);
+
+  assert.equal(sinceSeqRes.statusCode, 200);
+  assert.equal(sinceSeqRes.body.includes(`"resumed_from_seq":${cursor}`), true);
+  assert.equal(sinceSeqRes.body.includes('"replayed_count"'), true);
+  assert.equal(sinceSeqRes.body.includes('"type":"job.created"'), false);
+
+  sinceSeqRes.end();
+
+  const lastEventIdRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest({
+    ...buildAuthorizedRequest("/v1/jobs/job_steps_test/stream"),
+    headers: {
+      authorization: "Bearer dual-agent-local",
+      "last-event-id": String(cursor),
+    },
+  } as IncomingMessage, lastEventIdRes);
+
+  assert.equal(lastEventIdRes.statusCode, 200);
+  assert.equal(lastEventIdRes.body.includes(`"resumed_from_seq":${cursor}`), true);
+  assert.equal(lastEventIdRes.body.includes('"type":"job.created"'), false);
+
+  lastEventIdRes.end();
 });
 
 test("job cancel endpoint updates control metadata", async () => {
@@ -613,4 +667,440 @@ test("job cancel endpoint interrupts an active running job", async () => {
   } finally {
     __testables.setTaskExecutorForTests(null);
   }
+});
+
+test("job approve endpoint resolves pending approval and records lifecycle metadata", async () => {
+  const approvalTask = createTaskRunRecord({
+    id: "taskrun_approval_api",
+    title: "Approval Gate",
+    description: "Wait for reviewer approval",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    attempts: 0,
+    artifacts: [],
+  });
+  const approvalPlan = createPlanRecord({
+    id: "plan_approval_api",
+    goal: "Approval workflow",
+    mode: "task",
+    taskRunIds: [approvalTask.id],
+    summary: "Approval workflow plan.",
+  });
+  const approvalJob = createJobRecord({
+    id: "job_approval_api",
+    goal: "Approval workflow",
+    mode: "task",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+  persistJobRecord({
+    job: approvalJob,
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+  updateStoredJobRecord("job_approval_api", (record) => ({
+    ...record,
+    approvalRequests: [{
+      id: "appr_api_1",
+      jobId: "job_approval_api",
+      taskIds: [approvalTask.id],
+      reason: "Approve the workflow",
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    }],
+    control: {
+      pendingApprovalId: "appr_api_1",
+      approvalStatus: "pending",
+    },
+  }));
+
+  const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs/job_approval_api/approve", {
+    approval_id: "appr_api_1",
+    decision: "approved",
+    note: "looks good",
+  }), res);
+  const body = JSON.parse(res.body) as {
+    ok: boolean;
+    approval_id: string;
+    decision: string;
+    signaled: boolean;
+    control: { approvalStatus?: string; pendingApprovalId?: string };
+  };
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.approval_id, "appr_api_1");
+  assert.equal(body.decision, "approved");
+  assert.equal(body.signaled, false);
+  assert.equal(body.control.approvalStatus, "approved");
+  assert.equal(body.control.pendingApprovalId, undefined);
+
+  const updated = readJobRecord("job_approval_api");
+  assert.equal(updated?.approvalRequests?.[0]?.status, "approved");
+  assert.equal(updated?.approvalRequests?.[0]?.responseNote, "looks good");
+
+  const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_approval_api/events"), eventsRes);
+  const eventsBody = JSON.parse(eventsRes.body) as {
+    events: Array<{ type: string; meta?: Record<string, unknown> }>;
+  };
+  const approvalEvent = eventsBody.events.find((event) => event.type === "approval.approved");
+  assert.equal(Boolean(approvalEvent), true);
+  assert.equal(approvalEvent?.meta?.approval_id, "appr_api_1");
+});
+
+test("job resume endpoint creates a resumed job and blocks awaiting approval jobs", async () => {
+  const blockedTask = createTaskRunRecord({
+    id: "taskrun_resume_source",
+    title: "Blocked Task",
+    description: "Needs later resume",
+    status: "blocked",
+    verified: false,
+    output: "blocked output",
+    attempts: 1,
+    artifacts: [],
+  });
+  const blockedPlan = createPlanRecord({
+    id: "plan_resume_source",
+    goal: "Resume me",
+    mode: "task",
+    taskRunIds: [blockedTask.id],
+  });
+  const blockedJob = createJobRecord({
+    id: "job_resume_source",
+    goal: "Resume me",
+    mode: "task",
+    status: "blocked",
+    verified: false,
+    output: "blocked output",
+    plan: blockedPlan,
+    taskRuns: [blockedTask],
+    artifacts: [],
+  });
+  persistJobRecord({
+    job: blockedJob,
+    plan: blockedPlan,
+    taskRuns: [blockedTask],
+    artifacts: [],
+  });
+
+  const approvalTask = createTaskRunRecord({
+    id: "taskrun_resume_waiting",
+    title: "Approval Wait",
+    description: "Should not resume directly",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    attempts: 0,
+    artifacts: [],
+  });
+  const approvalPlan = createPlanRecord({
+    id: "plan_resume_waiting",
+    goal: "Await approval first",
+    mode: "task",
+    taskRunIds: [approvalTask.id],
+  });
+  const approvalJob = createJobRecord({
+    id: "job_resume_waiting",
+    goal: "Await approval first",
+    mode: "task",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+  persistJobRecord({
+    job: approvalJob,
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+  updateStoredJobRecord("job_resume_waiting", (record) => ({
+    ...record,
+    control: {
+      ...record.control,
+      pendingApprovalId: "appr_resume_waiting",
+      approvalStatus: "pending",
+    },
+    approvalRequests: [{
+      id: "appr_resume_waiting",
+      jobId: "job_resume_waiting",
+      taskIds: [approvalTask.id],
+      reason: "Approve before resume",
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    }],
+  }));
+
+  __testables.setTaskExecutorForTests(async (_goal, _model, _requirePlannerCircuit, context) => {
+    const taskRun = createTaskRunRecord({
+      id: context?.taskRunId,
+      title: "Resumed Task",
+      description: "resumed desc",
+      status: "completed",
+      verified: true,
+      output: "resumed done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal: "Resume me",
+      mode: "task",
+      taskRunIds: [taskRun.id],
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal: "Resume me",
+      mode: "task",
+      status: "completed",
+      verified: true,
+      output: "resumed done",
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    });
+    persistJobRecord({ job, plan, taskRuns: [taskRun], artifacts: [] });
+    return {
+      content: "resumed done",
+      logPath: "runtime/logs/resume.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const resumeRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest({
+      ...buildAuthorizedRequest("/v1/jobs/job_resume_source/resume"),
+      method: "POST",
+    } as IncomingMessage, resumeRes);
+    const resumeBody = JSON.parse(resumeRes.body) as {
+      ok: boolean;
+      resumed_from: string;
+      job: { id: string };
+      control: { resumeOf?: string };
+    };
+
+    assert.equal(resumeRes.statusCode, 200);
+    assert.equal(resumeBody.ok, true);
+    assert.equal(resumeBody.resumed_from, "job_resume_source");
+    assert.equal(resumeBody.control.resumeOf, "job_resume_source");
+
+    const sourceRecord = readJobRecord("job_resume_source");
+    assert.equal(sourceRecord?.control?.resumedToJobId, resumeBody.job.id);
+    assert.equal(typeof sourceRecord?.control?.resumedAt, "string");
+
+    const resumedRecord = readJobRecord(resumeBody.job.id);
+    assert.equal(resumedRecord?.control?.resumeOf, "job_resume_source");
+
+    const waitingRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest({
+      ...buildAuthorizedRequest("/v1/jobs/job_resume_waiting/resume"),
+      method: "POST",
+    } as IncomingMessage, waitingRes);
+    const waitingBody = JSON.parse(waitingRes.body) as { error?: { type?: string; message?: string } };
+
+    assert.equal(waitingRes.statusCode, 409);
+    assert.equal(waitingBody.error?.type, "conflict_error");
+    assert.equal(waitingBody.error?.message?.includes("/approve"), true);
+    assert.equal(waitingBody.error?.failure_category, "approval_blocked");
+  } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
+
+test("job events snapshot summarizes failure categories for diagnostics", async () => {
+  const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), eventsRes);
+  const body = JSON.parse(eventsRes.body) as {
+    snapshot?: {
+      failure_summary?: {
+        total?: number;
+        by_category?: Record<string, number>;
+        latest_category?: string | null;
+      };
+    };
+  };
+
+  assert.equal(eventsRes.statusCode, 200);
+  assert.equal((body.snapshot?.failure_summary?.total ?? 0) > 0, true);
+  assert.equal(Object.keys(body.snapshot?.failure_summary?.by_category ?? {}).length > 0, true);
+  assert.equal(typeof body.snapshot?.failure_summary?.latest_category, "string");
+});
+
+test("restart recovery marks interrupted running jobs as recoverable and preserves approval jobs", async () => {
+  const runningTask = createTaskRunRecord({
+    id: "taskrun_restart_running",
+    title: "Interrupted Task",
+    description: "Was running before restart",
+    status: "pending",
+    verified: false,
+    output: "",
+    attempts: 0,
+    artifacts: [],
+  });
+  const runningPlan = createPlanRecord({
+    id: "plan_restart_running",
+    goal: "Recover me after restart",
+    mode: "task",
+    taskRunIds: [runningTask.id],
+  });
+  const runningJob = createJobRecord({
+    id: "job_restart_running",
+    goal: "Recover me after restart",
+    mode: "task",
+    status: "running",
+    verified: false,
+    output: "Running...",
+    plan: runningPlan,
+    taskRuns: [runningTask],
+    artifacts: [],
+  });
+  persistJobRecord({
+    job: runningJob,
+    plan: runningPlan,
+    taskRuns: [runningTask],
+    artifacts: [],
+  });
+
+  const approvalTask = createTaskRunRecord({
+    id: "taskrun_restart_approval",
+    title: "Approval Task",
+    description: "Still waiting for approval",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    attempts: 0,
+    artifacts: [],
+  });
+  const approvalPlan = createPlanRecord({
+    id: "plan_restart_approval",
+    goal: "Wait for approval across restart",
+    mode: "task",
+    taskRunIds: [approvalTask.id],
+  });
+  const approvalJob = createJobRecord({
+    id: "job_restart_approval",
+    goal: "Wait for approval across restart",
+    mode: "task",
+    status: "awaiting_approval",
+    verified: false,
+    output: "Waiting for approval.",
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+  persistJobRecord({
+    job: approvalJob,
+    plan: approvalPlan,
+    taskRuns: [approvalTask],
+    artifacts: [],
+  });
+
+  const recoveredIds = __testables.recoverInterruptedJobs();
+  assert.equal(recoveredIds.includes("job_restart_running"), true);
+  assert.equal(recoveredIds.includes("job_restart_approval"), false);
+
+  const recoveredRecord = readJobRecord("job_restart_running");
+  assert.equal(recoveredRecord?.job.status, "blocked");
+  assert.equal(recoveredRecord?.job.output.includes("service restart"), true);
+  assert.equal(recoveredRecord?.control?.recoveryReason, "service_restart");
+  assert.equal(typeof recoveredRecord?.control?.recoveredAt, "string");
+  assert.equal(recoveredRecord?.taskRuns[0]?.status, "blocked");
+
+  const approvalRecord = readJobRecord("job_restart_approval");
+  assert.equal(approvalRecord?.job.status, "awaiting_approval");
+  assert.equal(approvalRecord?.taskRuns[0]?.status, "awaiting_approval");
+
+  const recoveredJobRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_running"), recoveredJobRes);
+  const recoveredJobBody = JSON.parse(recoveredJobRes.body) as {
+    job: { status: string };
+    control: { recoveryReason?: string; recoveredAt?: string };
+  };
+  assert.equal(recoveredJobRes.statusCode, 200);
+  assert.equal(recoveredJobBody.job.status, "blocked");
+  assert.equal(recoveredJobBody.control.recoveryReason, "service_restart");
+  assert.equal(typeof recoveredJobBody.control.recoveredAt, "string");
+
+  const recoveredEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_running/events"), recoveredEventsRes);
+  const recoveredEventsBody = JSON.parse(recoveredEventsRes.body) as {
+    snapshot?: {
+      recovery?: {
+        status?: string;
+        reason?: string;
+        affected_task_run_ids?: string[];
+      } | null;
+    };
+    events: Array<{ type: string; meta?: Record<string, unknown> }>;
+  };
+  const recoveredEvent = recoveredEventsBody.events.find((event) => event.type === "job.recovered");
+  assert.equal(Boolean(recoveredEvent), true);
+  assert.equal(recoveredEvent?.meta?.recovery_reason, "service_restart");
+  assert.equal(recoveredEvent?.meta?.recoverable, true);
+  assert.deepEqual(recoveredEvent?.meta?.affected_task_run_ids, ["taskrun_restart_running"]);
+  assert.equal(recoveredEventsBody.snapshot?.recovery?.status, "recovered");
+  assert.equal(recoveredEventsBody.snapshot?.recovery?.reason, "service_restart");
+  assert.deepEqual(recoveredEventsBody.snapshot?.recovery?.affected_task_run_ids, ["taskrun_restart_running"]);
+});
+
+test("doctor report exposes runtime diagnostics and writable checks", () => {
+  const report = __testables.buildDoctorReport() as {
+    ok: boolean;
+    generated_at: string;
+    config_path: string;
+    summary: {
+      passed: number;
+      failed: number;
+      total: number;
+    };
+    recommendations: Array<{
+      category: string;
+      severity: string;
+      message: string;
+      suggested_action: string;
+      related_checks: string[];
+    }>;
+    checks: Array<{
+      name: string;
+      ok: boolean;
+      summary: string;
+      detail?: Record<string, unknown>;
+    }>;
+  };
+
+  assert.equal(typeof report.ok, "boolean");
+  assert.equal(typeof report.generated_at, "string");
+  assert.equal(typeof report.config_path, "string");
+  assert.equal(typeof report.summary?.passed, "number");
+  assert.equal(typeof report.summary?.failed, "number");
+  assert.equal(typeof report.summary?.total, "number");
+  assert.equal(Array.isArray(report.recommendations), true);
+  assert.equal(Array.isArray(report.checks), true);
+  assert.equal(report.checks.some((check) => check.name === "config_load" && check.ok), true);
+  assert.equal(report.checks.some((check) => check.name === "planner_model_config" && check.ok), true);
+  assert.equal(report.checks.some((check) => check.name === "executor_model_config" && check.ok), true);
+  assert.equal(report.checks.some((check) => check.name === "runtime_profile" && check.ok), true);
+  assert.equal(report.checks.some((check) => check.name === "task_routing_summary" && check.ok), true);
+  assert.equal(report.checks.some((check) => check.name === "workspace_writable"), true);
+  assert.equal(report.checks.some((check) => check.name === "runtime_writable"), true);
+  assert.equal(report.checks.some((check) => check.name === "proxy_health"), true);
+  assert.equal(report.checks.some((check) => check.name === "search_provider_readiness"), true);
+  assert.equal(report.summary.total, report.checks.length);
+  assert.equal(report.recommendations.length > 0, true);
+  assert.equal(typeof report.recommendations[0]?.suggested_action, "string");
 });

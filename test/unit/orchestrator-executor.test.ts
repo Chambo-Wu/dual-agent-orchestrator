@@ -223,7 +223,7 @@ test("runPlannerStep records and degrades workflow plans during milestone A", as
   assert.equal(result.status, "need_executor");
   assert.equal(result.workflow_plan?.id, "wf_demo");
   assert.equal(result.executor_request?.allowed_tools.includes("web_search"), true);
-  assert.equal(result.audit.notes.includes("Milestone A fallback applied"), true);
+  assert.equal(result.audit.notes.includes("Runtime fallback applied"), true);
   assert.deepEqual(
     events.map((event) => event.type),
     [

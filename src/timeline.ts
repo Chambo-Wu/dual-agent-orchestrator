@@ -1,3 +1,4 @@
+import { getFailureCategoryLabel, getFailureCategoryTitle } from "./failure-classification.js";
 import type { WorkflowUiEvent } from "./workflow-ui-events.js";
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,8 @@ export function renderTimelineHtml(
   },
 ): string {
   const latestStep = events.reduce((max, e) => Math.max(max, e.step ?? 0), 0);
+  const failureSummary = summarizeFailures(events);
+  const runtimeAnalysis = summarizeRuntimeAnalysis(events);
   const currentTaskId = workflowSummary?.current_task?.id;
   const currentTaskTitle = workflowSummary?.current_task?.title;
   const currentTaskStatus = workflowSummary?.current_task?.status;
@@ -56,6 +59,7 @@ export function renderTimelineHtml(
   const taskCountSummary = taskCounts
     ? `Tasks: ${taskCounts.completed ?? 0} completed, ${taskCounts.awaiting_approval ?? 0} awaiting approval, ${taskCounts.in_progress ?? 0} in progress, ${taskCounts.pending ?? 0} pending`
     : "";
+  const failureSummaryText = formatFailureSummaryDisplay(failureSummary);
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -239,6 +243,14 @@ export function renderTimelineHtml(
     .task-card.is-dimmed {
       opacity: 0.5;
     }
+    .task-card.is-analysis-match {
+      border-color: rgba(88,166,255,0.95);
+      box-shadow: 0 0 0 1px rgba(88,166,255,0.28), 0 8px 20px rgba(31, 111, 235, 0.14);
+      opacity: 1;
+    }
+    .task-card.is-analysis-dimmed {
+      opacity: 0.4;
+    }
     .task-card-title {
       font-size: 13px;
       font-weight: 600;
@@ -364,6 +376,13 @@ export function renderTimelineHtml(
     .event-card:hover {
       border-color: #58a6ff;
     }
+    .event-card.is-analysis-match {
+      border-color: rgba(88,166,255,0.9);
+      box-shadow: 0 0 0 1px rgba(88,166,255,0.25), 0 8px 18px rgba(31, 111, 235, 0.12);
+    }
+    .event-card.is-analysis-dimmed {
+      opacity: 0.42;
+    }
     .event-card::before {
       content: '';
       position: absolute;
@@ -437,6 +456,45 @@ export function renderTimelineHtml(
       background: #30363d;
       color: #8b949e;
     }
+    .analysis-chip {
+      border: 1px solid #30363d;
+      border-radius: 999px;
+      background: transparent;
+      color: #c9d1d9;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease, opacity 0.18s ease;
+      text-align: left;
+    }
+    .analysis-chip:hover {
+      border-color: rgba(88,166,255,0.55);
+      background: #111723;
+    }
+    .analysis-chip.is-active {
+      border-color: rgba(88,166,255,0.8);
+      color: #f0f6fc;
+      background: rgba(88,166,255,0.12);
+    }
+    .analysis-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin: 8px 0 10px 0;
+    }
+    .analysis-clear {
+      border: 1px solid #30363d;
+      border-radius: 999px;
+      background: transparent;
+      color: #8b949e;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    .analysis-clear:hover {
+      border-color: rgba(88,166,255,0.55);
+      color: #c9d1d9;
+      background: #111723;
+    }
 
     .empty-state {
       text-align: center;
@@ -466,16 +524,17 @@ export function renderTimelineHtml(
         ${approvalTaskTitle ? `<span>Approval: ${escapeHtml(approvalTaskTitle)}</span>` : ""}
       </div>
       ${taskCountSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(taskCountSummary)}</span></div>` : ""}
+      ${failureSummaryText ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(failureSummaryText)}</span></div>` : ""}
     </div>
 
-    ${(dag || replanHistory.length > 0) ? `<div class="workflow-panels">
+    ${(dag || replanHistory.length > 0 || runtimeAnalysis.hasData) ? `<div class="workflow-panels">
       <section class="panel">
-        <h2>Workflow DAG</h2>
+        <h2>Workflow Graph</h2>
         ${dag ? renderDagPanel(dag, currentTaskId) : `<div class="subtle">No workflow DAG data available.</div>`}
       </section>
       <section class="panel">
-        <h2>Replan History</h2>
-        ${renderReplanHistoryPanel(replanHistory)}
+        <h2>Workflow Analysis</h2>
+        ${renderWorkflowAnalysisPanel(replanHistory, runtimeAnalysis)}
       </section>
     </div>` : ""}
 
@@ -527,6 +586,10 @@ export function renderTimelineHtml(
     initializeWorkflowInteractions();
 
     function createEventCard(event) {
+      const failureCategory = typeof event.meta?.failure_category === 'string' ? event.meta.failure_category : '';
+      const failureCategoryLabel = typeof event.meta?.failure_category_label === 'string'
+        ? event.meta.failure_category_label
+        : (failureCategory ? escapeHtml(failureCategory) : '');
       const card = document.createElement('div');
       card.className = 'event-card agent-' + event.agent + ' status-' + event.status;
       card.innerHTML = \`
@@ -539,6 +602,7 @@ export function renderTimelineHtml(
           <span class="tag">\${event.agent}</span>
           <span class="tag">\${event.type}</span>
           \${event.step ? '<span class="tag">step ' + event.step + '</span>' : ''}
+          \${failureCategoryLabel ? '<span class="tag" title="' + escapeHtml(failureCategory) + '">' + failureCategoryLabel + '</span>' : ''}
         </div>
         <pre class="event-meta">\${escapeHtml(JSON.stringify(event.meta, null, 2))}</pre>
       \`;
@@ -561,7 +625,66 @@ export function renderTimelineHtml(
       const lanes = Array.from(document.querySelectorAll('.workflow-lane[data-workflow-id]'));
       const historyItems = Array.from(document.querySelectorAll('.history-item[data-superseded-workflow-id], .history-item[data-replacement-workflow-id]'));
       const clearButtons = Array.from(document.querySelectorAll('[data-clear-workflow-focus]'));
+      const analysisChips = Array.from(document.querySelectorAll('[data-analysis-filter]'));
+      const analysisClearButtons = Array.from(document.querySelectorAll('[data-clear-analysis-filter]'));
+      const eventCards = Array.from(document.querySelectorAll('.event-card'));
+      const analysisTaskCards = Array.from(document.querySelectorAll('.task-card[data-task-id]'));
       let focusedWorkflowId = null;
+      let activeAnalysisFilter = null;
+      const focusParamName = 'workflowFocus';
+      const analysisKindParamName = 'analysisFilter';
+      const analysisValueParamName = 'analysisValue';
+
+      const readFocusedWorkflowIdFromUrl = () => {
+        try {
+          const url = new URL(window.location.href);
+          const raw = url.searchParams.get(focusParamName);
+          return raw && raw.trim().length > 0 ? raw.trim() : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const writeFocusedWorkflowIdToUrl = (workflowId) => {
+        try {
+          const url = new URL(window.location.href);
+          if (workflowId) {
+            url.searchParams.set(focusParamName, workflowId);
+          } else {
+            url.searchParams.delete(focusParamName);
+          }
+          window.history.replaceState(null, '', url.toString());
+        } catch {
+          // Best effort only: focus state still works even if URL persistence fails.
+        }
+      };
+
+      const readAnalysisFilterFromUrl = () => {
+        try {
+          const url = new URL(window.location.href);
+          const kind = url.searchParams.get(analysisKindParamName);
+          const value = url.searchParams.get(analysisValueParamName);
+          return kind && value ? { kind, value } : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const writeAnalysisFilterToUrl = (kind, value) => {
+        try {
+          const url = new URL(window.location.href);
+          if (kind && value) {
+            url.searchParams.set(analysisKindParamName, kind);
+            url.searchParams.set(analysisValueParamName, value);
+          } else {
+            url.searchParams.delete(analysisKindParamName);
+            url.searchParams.delete(analysisValueParamName);
+          }
+          window.history.replaceState(null, '', url.toString());
+        } catch {
+          // Best effort only: analysis state still works even if URL persistence fails.
+        }
+      };
 
       const getHistoryFocusMeta = (item) => {
         const supersededWorkflowId = item.getAttribute('data-superseded-workflow-id');
@@ -617,6 +740,7 @@ export function renderTimelineHtml(
 
       const clearWorkflowFocus = () => {
         focusedWorkflowId = null;
+        writeFocusedWorkflowIdToUrl(null);
         lanes.forEach((lane) => {
           lane.classList.remove('is-focused', 'is-focus-dimmed');
         });
@@ -626,12 +750,89 @@ export function renderTimelineHtml(
         });
       };
 
+      const clearAnalysisFilter = () => {
+        activeAnalysisFilter = null;
+        writeAnalysisFilterToUrl(null, null);
+        analysisChips.forEach((chip) => chip.classList.remove('is-active'));
+        eventCards.forEach((card) => {
+          card.classList.remove('is-analysis-match', 'is-analysis-dimmed');
+        });
+        analysisTaskCards.forEach((card) => {
+          card.classList.remove('is-analysis-match', 'is-analysis-dimmed');
+        });
+      };
+
+      const applyAnalysisFilter = (kind, value, sourceChip) => {
+        if (!kind || !value) {
+          clearAnalysisFilter();
+          return null;
+        }
+        if (activeAnalysisFilter && activeAnalysisFilter.kind === kind && activeAnalysisFilter.value === value) {
+          clearAnalysisFilter();
+          return null;
+        }
+        activeAnalysisFilter = { kind, value };
+        writeAnalysisFilterToUrl(kind, value);
+        let firstMatch = null;
+        const matchedTaskIds = new Set();
+        const matchedWorkflowIds = new Set();
+        analysisChips.forEach((chip) => chip.classList.toggle('is-active', chip === sourceChip));
+        eventCards.forEach((card) => {
+          const eventTool = card.getAttribute('data-event-tool');
+          const failureCategory = card.getAttribute('data-failure-category');
+          const eventType = card.getAttribute('data-event-type');
+          const taskRunId = card.getAttribute('data-task-run-id');
+          const matches = kind === 'tool'
+            ? eventTool === value
+            : kind === 'failure_category'
+              ? failureCategory === value
+              : kind === 'verifier'
+                ? eventType === value
+                : kind === 'artifact'
+                  ? eventType === 'artifact.created'
+                  : false;
+          card.classList.toggle('is-analysis-match', matches);
+          card.classList.toggle('is-analysis-dimmed', !matches);
+          if (matches && !firstMatch) {
+            firstMatch = card;
+            card.classList.add('expanded');
+          } else if (!matches) {
+            card.classList.remove('expanded');
+          }
+          if (matches && taskRunId) {
+            matchedTaskIds.add(taskRunId);
+          }
+        });
+        analysisTaskCards.forEach((card) => {
+          const taskId = card.getAttribute('data-task-id');
+          const assignee = card.getAttribute('data-assignee');
+          const verified = card.getAttribute('data-verified');
+          const workflowId = card.getAttribute('data-workflow-id');
+          const matches = kind === 'verifier'
+            ? assignee === 'verifier' || verified === 'true'
+            : kind === 'artifact'
+              ? !!taskId && matchedTaskIds.has(taskId)
+              : !!taskId && matchedTaskIds.has(taskId);
+          if (kind === 'verifier' || kind === 'artifact') {
+            card.classList.toggle('is-analysis-match', matches);
+            card.classList.toggle('is-analysis-dimmed', !matches);
+            if (matches && workflowId) {
+              matchedWorkflowIds.add(workflowId);
+            }
+          } else {
+            card.classList.remove('is-analysis-match', 'is-analysis-dimmed');
+          }
+        });
+        return { firstMatch, matchedWorkflowIds };
+      };
+
       const applyWorkflowFocus = (workflowId, sourceItem) => {
         if (!workflowId) {
           clearWorkflowFocus();
           return;
         }
         focusedWorkflowId = workflowId;
+        writeFocusedWorkflowIdToUrl(workflowId);
         lanes.forEach((lane) => {
           const laneWorkflowId = lane.getAttribute('data-workflow-id');
           const focused = laneWorkflowId === workflowId;
@@ -648,6 +849,26 @@ export function renderTimelineHtml(
 
       clearButtons.forEach((button) => {
         button.addEventListener('click', clearWorkflowFocus);
+      });
+      analysisClearButtons.forEach((button) => {
+        button.addEventListener('click', clearAnalysisFilter);
+      });
+      analysisChips.forEach((chip) => {
+        chip.addEventListener('click', () => {
+          const kind = chip.getAttribute('data-analysis-filter');
+          const value = chip.getAttribute('data-analysis-value');
+          const result = applyAnalysisFilter(kind, value, chip);
+          const match = result?.firstMatch || eventCards.find((card) => card.classList.contains('is-analysis-match'));
+          const preferredWorkflowId = result?.matchedWorkflowIds?.values()?.next()?.value;
+          if (preferredWorkflowId) {
+            const matchingHistoryItem = historyItems.find((item) => {
+              const { supersededWorkflowId, replacementWorkflowId } = getHistoryFocusMeta(item);
+              return supersededWorkflowId === preferredWorkflowId || replacementWorkflowId === preferredWorkflowId;
+            }) ?? null;
+            applyWorkflowFocus(preferredWorkflowId, matchingHistoryItem);
+          }
+          match?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
       });
 
       historyItems.forEach((item) => {
@@ -674,6 +895,37 @@ export function renderTimelineHtml(
           targetLane?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
         });
       });
+
+      const initialFocusedWorkflowId = readFocusedWorkflowIdFromUrl();
+      if (initialFocusedWorkflowId) {
+        const targetLane = lanes.find((lane) => lane.getAttribute('data-workflow-id') === initialFocusedWorkflowId);
+        if (targetLane) {
+          const matchingHistoryItem = historyItems.find((item) => {
+            const { supersededWorkflowId, replacementWorkflowId } = getHistoryFocusMeta(item);
+            return supersededWorkflowId === initialFocusedWorkflowId || replacementWorkflowId === initialFocusedWorkflowId;
+          }) ?? null;
+          applyWorkflowFocus(initialFocusedWorkflowId, matchingHistoryItem);
+        } else {
+          writeFocusedWorkflowIdToUrl(null);
+        }
+      }
+
+      const initialAnalysisFilter = readAnalysisFilterFromUrl();
+      if (initialAnalysisFilter) {
+        const matchingChip = analysisChips.find((chip) =>
+          chip.getAttribute('data-analysis-filter') === initialAnalysisFilter.kind
+          && chip.getAttribute('data-analysis-value') === initialAnalysisFilter.value,
+        ) || null;
+        const result = applyAnalysisFilter(initialAnalysisFilter.kind, initialAnalysisFilter.value, matchingChip);
+        const preferredWorkflowId = result?.matchedWorkflowIds?.values()?.next()?.value;
+        if (preferredWorkflowId) {
+          const matchingHistoryItem = historyItems.find((item) => {
+            const { supersededWorkflowId, replacementWorkflowId } = getHistoryFocusMeta(item);
+            return supersededWorkflowId === preferredWorkflowId || replacementWorkflowId === preferredWorkflowId;
+          }) ?? null;
+          applyWorkflowFocus(preferredWorkflowId, matchingHistoryItem);
+        }
+      }
 
       const graphRoots = document.querySelectorAll('.workflow-graph');
       graphRoots.forEach((root) => {
@@ -769,7 +1021,12 @@ export function renderTimelineHtml(
 }
 
 function renderEventCard(event: WorkflowUiEvent): string {
-  return `<div class="event-card agent-${event.agent} status-${event.status}" onclick="this.classList.toggle('expanded')">
+  const failureCategory = typeof event.meta.failure_category === "string" ? event.meta.failure_category : "";
+  const failureCategoryLabel = typeof event.meta.failure_category_label === "string"
+    ? event.meta.failure_category_label
+    : (failureCategory ? getFailureCategoryLabel(failureCategory) : "");
+  const eventTool = typeof event.meta.tool === "string" ? event.meta.tool : "";
+  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""} onclick="this.classList.toggle('expanded')">
   <div class="event-header">
     <span class="event-title">${escapeHtml(event.title)}</span>
     <span class="event-time">${formatTime(event.time)}</span>
@@ -779,9 +1036,120 @@ function renderEventCard(event: WorkflowUiEvent): string {
     <span class="tag">${event.agent}</span>
     <span class="tag">${event.type}</span>
     ${event.step ? `<span class="tag">step ${event.step}</span>` : ""}
+    ${failureCategoryLabel ? `<span class="tag" title="${escapeHtmlAttribute(failureCategory)}">${escapeHtml(failureCategoryLabel)}</span>` : ""}
   </div>
   <pre class="event-meta">${escapeHtml(JSON.stringify(event.meta, null, 2))}</pre>
 </div>`;
+}
+
+function summarizeFailures(events: WorkflowUiEvent[]): {
+  total: number;
+  byCategory: Record<string, number>;
+  latestCategory: string | null;
+  latestSummary: string | null;
+} {
+  const failures = events
+    .filter((event) => typeof event.meta.failure_category === "string" && event.meta.failure_category.trim().length > 0)
+    .map((event) => ({
+      category: event.meta.failure_category as string,
+      summary: event.summary,
+    }));
+  const byCategory: Record<string, number> = {};
+  for (const failure of failures) {
+    byCategory[failure.category] = (byCategory[failure.category] ?? 0) + 1;
+  }
+  const latest = failures.at(-1) ?? null;
+  return {
+    total: failures.length,
+    byCategory,
+    latestCategory: latest?.category ?? null,
+    latestSummary: latest?.summary ?? null,
+  };
+}
+
+function formatFailureSummaryText(summary: ReturnType<typeof summarizeFailures>): string {
+  if (summary.total === 0) {
+    return "";
+  }
+  const parts = Object.entries(summary.byCategory)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([category, count]) => `${getFailureCategoryLabel(category)}: ${count}`);
+  const latest = summary.latestCategory
+    ? `Latest issue: ${getFailureCategoryTitle(summary.latestCategory)}${summary.latestSummary ? ` (${truncate(summary.latestSummary, 80)})` : ""}`
+    : "";
+  return `Failures: ${summary.total} total${parts.length > 0 ? ` · ${parts.join(", ")}` : ""}${latest ? ` · ${latest}` : ""}`;
+}
+
+function formatFailureSummaryDisplay(summary: ReturnType<typeof summarizeFailures>): string {
+  if (summary.total === 0) {
+    return "";
+  }
+  const parts = Object.entries(summary.byCategory)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([category, count]) => `${getFailureCategoryLabel(category)}: ${count}`);
+  const latest = summary.latestCategory
+    ? `Latest issue: ${getFailureCategoryTitle(summary.latestCategory)}${summary.latestSummary ? ` (${truncate(summary.latestSummary, 80)})` : ""}`
+    : "";
+  return `Issues: ${summary.total} total${parts.length > 0 ? ` · ${parts.join(", ")}` : ""}${latest ? ` · ${latest}` : ""}`;
+}
+
+function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
+  hasData: boolean;
+  toolUsage: Array<{ name: string; count: number }>;
+  blockerPoints: Array<{ label: string; count: number }>;
+  verificationSignals: { passed: number; failed: number };
+  artifactSignals: { created: number };
+} {
+  const toolCounts = new Map<string, number>();
+  const blockerCounts = new Map<string, number>();
+  let verificationPassed = 0;
+  let verificationFailed = 0;
+  let artifactCreated = 0;
+
+  for (const event of events) {
+    const tool = typeof event.meta.tool === "string" ? event.meta.tool.trim() : "";
+    if (tool && (event.type === "tool.start" || event.type === "tool.result" || event.type === "tool.failed")) {
+      toolCounts.set(tool, (toolCounts.get(tool) ?? 0) + 1);
+    }
+
+    if (event.type === "system.verification_passed") {
+      verificationPassed += 1;
+    }
+    if (event.type === "system.verification_failed") {
+      verificationFailed += 1;
+    }
+    if (event.type === "artifact.created") {
+      artifactCreated += 1;
+    }
+
+    if (event.status === "blocked" || event.status === "awaiting_approval" || event.type.endsWith(".failed")) {
+      const failureCategory = typeof event.meta.failure_category === "string" && event.meta.failure_category.trim().length > 0
+        ? event.meta.failure_category.trim()
+        : "";
+      const label = failureCategory || event.title || event.type;
+      blockerCounts.set(label, (blockerCounts.get(label) ?? 0) + 1);
+    }
+  }
+
+  const toolUsage = [...toolCounts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  const blockerPoints = [...blockerCounts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+
+  return {
+    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0,
+    toolUsage,
+    blockerPoints,
+    verificationSignals: {
+      passed: verificationPassed,
+      failed: verificationFailed,
+    },
+    artifactSignals: {
+      created: artifactCreated,
+    },
+  };
 }
 
 function escapeHtml(text: string): string {
@@ -911,7 +1279,7 @@ function renderWorkflowDependencyGraph(
     <div class="graph-column">
       <div class="graph-column-label">Stage ${columnIndex + 1}</div>
       ${column.map((task) => `
-        <div class="task-card status-${escapeHtml(task.status ?? "pending")}${task.task_id === currentTaskId || task.id === currentTaskId ? " is-current-task" : ""}" data-task-id="${escapeHtmlAttribute(task.task_id ?? task.id ?? "")}" data-workflow-id="${escapeHtmlAttribute(workflowId)}" data-depends-on="${escapeHtmlAttribute((task.depends_on ?? []).join(","))}">
+        <div class="task-card status-${escapeHtml(task.status ?? "pending")}${task.task_id === currentTaskId || task.id === currentTaskId ? " is-current-task" : ""}" data-task-id="${escapeHtmlAttribute(task.task_id ?? task.id ?? "")}" data-workflow-id="${escapeHtmlAttribute(workflowId)}" data-depends-on="${escapeHtmlAttribute((task.depends_on ?? []).join(","))}" data-assignee="${escapeHtmlAttribute(task.assignee ?? "")}" data-verified="${task.verified ? "true" : "false"}">
           <div class="task-card-title">${escapeHtml(task.title ?? task.task_id ?? "task")}</div>
           <div class="task-card-meta">Task: ${escapeHtml(task.task_id ?? task.id ?? "")} · Status: ${escapeHtml(task.status ?? "unknown")}</div>
           ${task.assignee ? `<div class="task-card-meta">Assignee: ${escapeHtml(task.assignee)}</div>` : ""}
@@ -927,6 +1295,37 @@ function renderWorkflowDependencyGraph(
       <div class="graph-columns">${columnHtml}</div>
     </div>
   </div>`;
+}
+
+function renderWorkflowAnalysisPanel(
+  replanHistory: NonNullable<Parameters<typeof renderTimelineHtml>[4]>["replan_history"],
+  runtimeAnalysis: ReturnType<typeof summarizeRuntimeAnalysis>,
+): string {
+  const replanSection = `<h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Replan History</h3>${renderReplanHistoryPanel(replanHistory)}`;
+  const verificationSection = `<div class="subtle">Verification: ${runtimeAnalysis.verificationSignals.passed} passed, ${runtimeAnalysis.verificationSignals.failed} failed</div>`;
+  const analysisActions = `<div class="analysis-actions"><button type="button" class="analysis-clear" data-clear-analysis-filter>Show all events</button></div>`;
+  const verificationFilterSection = (runtimeAnalysis.verificationSignals.passed > 0 || runtimeAnalysis.verificationSignals.failed > 0)
+    ? `<div class="history-list" style="margin-bottom:12px">
+        ${runtimeAnalysis.verificationSignals.passed > 0 ? `<button type="button" class="analysis-chip" data-analysis-filter="verifier" data-analysis-value="system.verification_passed"><strong>Verification passed</strong> · ${runtimeAnalysis.verificationSignals.passed}</button>` : ""}
+        ${runtimeAnalysis.verificationSignals.failed > 0 ? `<button type="button" class="analysis-chip" data-analysis-filter="verifier" data-analysis-value="system.verification_failed"><strong>Verification failed</strong> · ${runtimeAnalysis.verificationSignals.failed}</button>` : ""}
+      </div>`
+    : "";
+  const artifactSection = runtimeAnalysis.artifactSignals.created > 0
+    ? `<div class="subtle">Artifact output</div><div class="history-list" style="margin-bottom:12px">
+        <button type="button" class="analysis-chip" data-analysis-filter="artifact" data-analysis-value="artifact.created"><strong>Artifacts created</strong> · ${runtimeAnalysis.artifactSignals.created}</button>
+      </div>`
+    : "";
+  const toolSection = runtimeAnalysis.toolUsage.length > 0
+    ? `<div class="subtle">Tool activity</div><div class="history-list">${runtimeAnalysis.toolUsage.slice(0, 6).map((entry) => `
+        <button type="button" class="analysis-chip" data-analysis-filter="tool" data-analysis-value="${escapeHtmlAttribute(entry.name)}"><strong>${escapeHtml(entry.name)}</strong> · ${entry.count}</button>
+      `).join("")}</div>`
+    : `<div class="subtle">Tool activity will appear once tool events are recorded.</div>`;
+  const blockerSection = runtimeAnalysis.blockerPoints.length > 0
+    ? `<div class="subtle" style="margin-top:12px">Common issues</div><div class="history-list">${runtimeAnalysis.blockerPoints.slice(0, 6).map((entry) => `
+        <button type="button" class="analysis-chip" data-analysis-filter="failure_category" data-analysis-value="${escapeHtmlAttribute(entry.label)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
+      `).join("")}</div>`
+    : `<div class="subtle" style="margin-top:12px">No issue signals recorded.</div>`;
+  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${artifactSection}${toolSection}${blockerSection}</div>`;
 }
 
 function assignTaskLevels(

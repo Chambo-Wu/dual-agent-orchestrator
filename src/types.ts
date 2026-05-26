@@ -68,6 +68,18 @@ export interface RuntimeProfile {
     enabled: boolean;
     proxyMode: "direct" | "env";
     proxyHealth: "ok" | "degraded";
+    configuredProxyUrls?: string[];
+  };
+  diagnostics: {
+    configPath: string;
+    taskRoutingPath: string;
+    searchProvider: string | null;
+    dependencyChecks: Array<{
+      name: string;
+      status: "ok" | "warning";
+      summary: string;
+      detail?: Record<string, unknown>;
+    }>;
   };
   executor: {
     supportsNativeToolCalling: boolean;
@@ -195,6 +207,7 @@ export interface PlannerOutput {
   executor_request?: PlannerExecutorRequest;
   final_answer?: string;
   clarification_question?: string;
+  decision_text?: string;
 }
 
 export type OrchestratorStepState = "pending" | "planning" | "executing" | "completed" | "failed" | "blocked" | "finalized";
@@ -218,6 +231,7 @@ export interface ExecutorOutput {
   raw_result: string;
   error?: string;
   source?: "native_tool" | "model_text";
+  display_summary?: string;
 }
 
 export type JobMode = "task" | "team";
@@ -241,7 +255,10 @@ export interface Artifact {
   path?: string;
   contentPreview: string;
   source: "executor" | "task_run" | "synthesis";
+  trustLevel?: "high" | "medium" | "low";
   sourceTaskRunId?: string;
+  relatedTaskRunId?: string;
+  relatedStep?: number;
 }
 
 export interface TaskRun {
@@ -330,6 +347,18 @@ export interface ToolExecutionResult {
   artifact?: ExecutorArtifact;
   rawResult: string;
   error?: string;
+}
+
+export interface VerificationCheck {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface VerificationResult {
+  status: "verified" | "insufficient" | "failed";
+  summary: string;
+  checks: VerificationCheck[];
 }
 
 export interface NativeToolCall {

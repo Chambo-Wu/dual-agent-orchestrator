@@ -151,6 +151,114 @@ test("buildStepList marks current and approval-blocked workflow steps", () => {
   assert.equal(steps[2]?.is_current_task, false);
 });
 
+test("buildStepList exposes executor display summary when available", () => {
+  const record = buildRecord([
+    {
+      id: "task_done",
+      title: "Completed task",
+      description: "done",
+      status: "completed",
+      assignee: "worker",
+      dependsOn: [],
+      verified: true,
+      output: "done",
+      artifacts: [],
+      attempts: 1,
+      executorHistory: [{
+        status: "success",
+        summary: "Decision summary",
+        display_summary: "Display summary",
+        tool_calls_made: [],
+        artifacts: [],
+        raw_result: "raw detail",
+        source: "model_text",
+      }],
+    },
+  ]);
+
+  const steps = __testables.buildStepList(record) as Array<{
+    latest_executor_summary: string | null;
+  }>;
+
+  assert.equal(steps[0]?.latest_executor_summary, "Display summary");
+});
+
+test("buildJobEvents exposes artifact metadata for control-plane consumers", () => {
+  const record = buildRecord([
+    {
+      id: "task_done",
+      title: "Completed task",
+      description: "done",
+      status: "completed",
+      assignee: "worker",
+      dependsOn: [],
+      verified: true,
+      output: "done",
+      artifacts: [{
+        id: "artifact_1",
+        type: "file",
+        path: "runtime/source.txt",
+        contentPreview: "source",
+        source: "executor",
+        trustLevel: "high",
+        sourceTaskRunId: "task_done",
+        relatedTaskRunId: "task_done",
+        relatedStep: 2,
+      }],
+      attempts: 1,
+    },
+  ]);
+  record.artifacts = record.taskRuns.flatMap((taskRun) => taskRun.artifacts);
+
+  const events = __testables.buildJobEvents(record);
+  const artifactEvent = events.find((event) => event.type === "artifact.created");
+
+  assert.equal(artifactEvent?.meta.trust_level, "high");
+  assert.equal(artifactEvent?.meta.related_task_run_id, "task_done");
+  assert.equal(artifactEvent?.meta.related_step, 2);
+});
+
+test("buildJobEvents classifies failure categories for blocked and failed records", () => {
+  const record = buildRecord([
+    {
+      id: "task_failed",
+      title: "Failed task",
+      description: "failed",
+      status: "failed",
+      assignee: "worker",
+      dependsOn: [],
+      verified: false,
+      output: "Verification failed because the report file is missing.",
+      artifacts: [],
+      attempts: 1,
+      executorHistory: [{
+        status: "failed",
+        summary: "Fetch failed",
+        tool_calls_made: [{ tool: "url_fetch", arguments: { url: "https://example.com" } }],
+        artifacts: [],
+        raw_result: "",
+        error: "HTTP 403: Forbidden",
+        source: "native_tool",
+      }],
+    },
+  ]);
+  record.job.status = "blocked";
+  record.job.output = "Execution was interrupted by a service restart. The job can be resumed from the control plane.";
+  record.control = {
+    recoveredAt: new Date().toISOString(),
+    recoveryReason: "service_restart",
+  };
+
+  const events = __testables.buildJobEvents(record);
+  const stepEvent = events.find((event) => event.type === "step.failed");
+  const executorEvent = events.find((event) => event.type === "executor.failed");
+  const recoveryEvent = events.find((event) => event.type === "job.recovered");
+
+  assert.equal(stepEvent?.meta.failure_category, "verification_failure");
+  assert.equal(executorEvent?.meta.failure_category, "tool_failure");
+  assert.equal(recoveryEvent?.meta.failure_category, "environment_failure");
+});
+
 test("timeline html renders workflow summary details in the header", () => {
   const html = renderTimelineHtml(
     "job_workflow_1",
@@ -182,6 +290,155 @@ test("timeline html renders workflow summary details in the header", () => {
   assert.equal(html.includes("Current: Approval task (awaiting_approval)"), true);
   assert.equal(html.includes("Approval: Approval task"), true);
   assert.equal(html.includes("Tasks: 1 completed, 1 awaiting approval, 0 in progress, 1 pending"), true);
+});
+
+test("timeline html renders failure summary details in the header and event tags", () => {
+  const html = renderTimelineHtml(
+    "job_failure_1",
+    [{
+      id: "evt_1",
+      jobId: "job_failure_1",
+      seq: 1,
+      time: new Date().toISOString(),
+      agent: "system",
+      phase: "result",
+      type: "system.verification_failed",
+      title: "Verification reported issues",
+      summary: "Verification reported issues because artifact output is missing.",
+      status: "blocked",
+      meta: {
+        failure_category: "verification_failure",
+      },
+    }],
+    "Failure summary test",
+    "blocked",
+  );
+
+  assert.equal(html.includes("Issues: 1 total"), true);
+  assert.equal(html.includes("Verification failure: 1"), true);
+  assert.equal(html.includes("Latest issue: Verification issue"), true);
+  assert.equal(html.includes('title="verification_failure">Verification failure</span>'), true);
+});
+
+test("timeline html renders runtime analysis summaries", () => {
+  const html = renderTimelineHtml(
+    "job_analysis_1",
+    [
+      {
+        id: "evt_1",
+        jobId: "job_analysis_1",
+        seq: 1,
+        time: new Date().toISOString(),
+        agent: "tool",
+        phase: "start",
+        type: "tool.start",
+        title: "Tool started",
+        summary: "web_search started.",
+        status: "running",
+        meta: { tool: "web_search" },
+      },
+      {
+        id: "evt_2",
+        jobId: "job_analysis_1",
+        seq: 2,
+        time: new Date().toISOString(),
+        agent: "verifier",
+        phase: "result",
+        type: "system.verification_failed",
+        title: "Verification reported issues",
+        summary: "Verification reported issues because artifact output is missing.",
+        status: "blocked",
+        meta: {
+          tool: "read_file",
+          failure_category: "verification_failure",
+        },
+      },
+      {
+        id: "evt_3",
+        jobId: "job_analysis_1",
+        seq: 3,
+        time: new Date().toISOString(),
+        agent: "system",
+        phase: "result",
+        type: "artifact.created",
+        title: "Artifact created",
+        summary: "Artifact saved to runtime/command-results/report.md.",
+        status: "success",
+        taskRunId: "t2",
+        meta: {
+          related_task_run_id: "t2",
+        },
+      },
+    ],
+    "Runtime analysis test",
+    "blocked",
+    {
+      dag: {
+        workflow_count: 1,
+        edge_count: 0,
+        workflows: [
+          {
+            workflow_id: "wf_analysis",
+            status: "active",
+            task_count: 2,
+            completed_count: 1,
+            tasks: [
+              {
+                id: "t1",
+                task_id: "t1",
+                title: "Collect evidence",
+                status: "completed",
+                assignee: "worker",
+                depends_on: [],
+                verified: false,
+                attempts: 1,
+                superseded: false,
+                superseded_by: null,
+              },
+              {
+                id: "t2",
+                task_id: "t2",
+                title: "Verify artifact",
+                status: "completed",
+                assignee: "verifier",
+                depends_on: ["t1"],
+                verified: true,
+                attempts: 1,
+                superseded: false,
+                superseded_by: null,
+              },
+            ],
+          },
+        ],
+      },
+      replan_history: [],
+    },
+  );
+
+  assert.equal(html.includes("Workflow Analysis"), true);
+  assert.equal(html.includes("Runtime Analysis"), true);
+  assert.equal(html.includes("Verification: 0 passed, 1 failed"), true);
+  assert.equal(html.includes("Artifact output"), true);
+  assert.equal(html.includes("Artifacts created"), true);
+  assert.equal(html.includes("Verification failed"), true);
+  assert.equal(html.includes("Tool activity"), true);
+  assert.equal(html.includes("web_search"), true);
+  assert.equal(html.includes("Common issues"), true);
+  assert.equal(html.includes("verification_failure"), true);
+  assert.equal(html.includes('data-analysis-filter="verifier"'), true);
+  assert.equal(html.includes('data-analysis-filter="artifact"'), true);
+  assert.equal(html.includes('data-analysis-filter="tool"'), true);
+  assert.equal(html.includes('data-analysis-filter="failure_category"'), true);
+  assert.equal(html.includes('data-event-type="system.verification_failed"'), true);
+  assert.equal(html.includes('data-event-type="artifact.created"'), true);
+  assert.equal(html.includes('data-task-run-id="t2"'), true);
+  assert.equal(html.includes('data-event-tool="web_search"'), true);
+  assert.equal(html.includes('data-failure-category="verification_failure"'), true);
+  assert.equal(html.includes('data-assignee="verifier"'), true);
+  assert.equal(html.includes('data-verified="true"'), true);
+  assert.equal(html.includes('data-clear-analysis-filter'), true);
+  assert.equal(html.includes("Show all events"), true);
+  assert.equal(html.includes("is-analysis-match"), true);
 });
 
 test("timeline html renders dependency graph lanes with SVG edges", () => {
@@ -344,6 +601,8 @@ test("timeline html renders replan history focus hooks", () => {
   assert.equal(html.includes('Show all lanes'), true);
   assert.equal(html.includes('clearWorkflowFocus'), true);
   assert.equal(html.includes('applyWorkflowFocus'), true);
+  assert.equal(html.includes("workflowFocus"), true);
+  assert.equal(html.includes("history.replaceState"), true);
   assert.equal(html.includes('history-item.is-focused'), true);
   assert.equal(html.includes('data-focus-state'), true);
   assert.equal(html.includes('data-focus-hint'), true);
@@ -378,4 +637,55 @@ test("workflow UI normalizes replanned and superseded events", () => {
   assert.equal(replanned.summary.includes("wf_old"), true);
   assert.equal(superseded.type, "workflow.task.superseded");
   assert.equal(superseded.summary.includes("wf_new"), true);
+});
+
+test("workflow UI classifies replan rejections and verification failures", () => {
+  const replanRejected = normalizeWorkflowEvent({
+    type: "workflow.replan.rejected",
+    step: 2,
+    data: {
+      workflow_id: "wf_old",
+      replacement_workflow_id: "wf_new",
+      task_id: "t1",
+      issues: ["replacement workflow schema validation failed"],
+    },
+  }, "job_1", 3);
+  const verificationFailed = normalizeWorkflowEvent({
+    type: "system.verification_failed",
+    step: 3,
+    data: {
+      verification_status: "failed",
+      verifier_count: 2,
+      summary: "Verification reported issues because artifact output is missing.",
+    },
+  }, "job_1", 4);
+
+  assert.equal(replanRejected.type, "planner.workflow_replan_rejected");
+  assert.equal(replanRejected.meta.failure_category, "validation_failure");
+  assert.equal(verificationFailed.meta.failure_category, "verification_failure");
+});
+
+test("workflow UI prefers normalized planner and executor contract fields", () => {
+  const planner = normalizeWorkflowEvent({
+    type: "workflow.planner.decision",
+    step: 1,
+    data: {
+      status: "final",
+      reasoning_summary: "internal reasoning",
+      next_step: "next step",
+      decision_text: "Final consumer-facing answer",
+    },
+  }, "job_1", 1);
+  const executor = normalizeWorkflowEvent({
+    type: "workflow.executor.result",
+    step: 1,
+    data: {
+      status: "success",
+      summary: "Decision summary",
+      display_summary: "Display summary",
+    },
+  }, "job_1", 2);
+
+  assert.equal(planner.summary, "Final consumer-facing answer");
+  assert.equal(executor.summary, "Display summary");
 });

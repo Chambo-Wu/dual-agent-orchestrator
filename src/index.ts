@@ -2,6 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import * as process from "node:process";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { compressJsonOutput, compressToolOutput } from "./compress.js";
 import { createRunLogger } from "./logger.js";
@@ -9,20 +11,23 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, TaskRun } from "./types.js";
+import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, TaskRun } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
-import { runVerifiers, verificationPassed, type VerificationContext } from "./verification.js";
+import { runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, updateStoredJobRecord, type StoredJobRecord } from "./job-store.js";
 import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
-import { appendEvent, getEvents, getLatestSnapshot, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
+import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
 import { renderTimelineHtml } from "./timeline.js";
 import { buildWorkflowGraph } from "./workflow-graph.js";
+import { describeJobState, mapJobStatusToLifecycleType, mapJobStatusToUiStatus, mapTaskRunStatusToUiStatus } from "./status-semantics.js";
+import { classifyFailure, getFailureCategoryLabel, listFailureCategories } from "./failure-classification.js";
+import { getExecutorDisplaySummary, getPlannerDecisionText, summarizeVerification } from "./output-contract.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
@@ -292,6 +297,33 @@ function responseAlreadyStarted(res: ServerResponse): boolean {
   return state.headersSent === true || state.writableEnded === true;
 }
 
+function jsonErrorResponse(
+  res: ServerResponse,
+  statusCode: number,
+  message: string,
+  type: string,
+  classification?: {
+    status?: string;
+    error?: string;
+    summary?: string;
+  },
+  extras?: Record<string, unknown>,
+): void {
+  jsonResponse(res, statusCode, {
+    error: {
+      message,
+      type,
+      failure_category: classifyFailure({
+        type,
+        status: classification?.status,
+        error: classification?.error ?? message,
+        summary: classification?.summary ?? message,
+      }),
+      ...(extras ?? {}),
+    },
+  });
+}
+
 function secondsUntilCircuitHalfOpen(): number {
   return Math.max(1, Math.ceil((plannerCircuit.openUntil - Date.now()) / 1000));
 }
@@ -344,6 +376,12 @@ function serviceUnavailableResponse(res: ServerResponse, message: string, retryA
     error: {
       message,
       type: "service_unavailable",
+      failure_category: classifyFailure({
+        type: "service_unavailable",
+        status: "failed",
+        error: message,
+        summary: message,
+      }),
       retry_after: retryAfterSeconds,
     },
   }));
@@ -789,7 +827,7 @@ function buildStepList(record: StoredJobRecord): unknown[] {
       artifacts: taskRun.artifacts,
       executor_history: executorHistory,
       latest_executor_status: latestExecutorOutput?.status ?? null,
-      latest_executor_summary: latestExecutorOutput?.summary ?? null,
+      latest_executor_summary: latestExecutorOutput ? getExecutorDisplaySummary(latestExecutorOutput) : null,
       is_current_task: currentTask?.id === taskRun.id,
       is_awaiting_approval_task: awaitingApprovalTask?.id === taskRun.id,
       workflow_position: {
@@ -832,6 +870,31 @@ function createLifecycleEvent(input: {
     taskRunId: input.taskRunId,
     meta: input.meta ?? {},
   });
+}
+
+function attachFailureCategory(
+  type: string,
+  status: WorkflowUiEvent["status"],
+  summary: string,
+  meta: Record<string, unknown>,
+): Record<string, unknown> {
+  const existingCategory = typeof meta.failure_category === "string" ? meta.failure_category : null;
+  const failureCategory = existingCategory ?? classifyFailure({
+    type,
+    status,
+    summary,
+    error: typeof meta.error === "string" ? meta.error : undefined,
+    verificationStatus: typeof meta.verification_status === "string" ? meta.verification_status : undefined,
+    recoveryReason: typeof meta.recovery_reason === "string" ? meta.recovery_reason : undefined,
+  });
+  if (!failureCategory) {
+    return meta;
+  }
+  return {
+    ...meta,
+    failure_category: failureCategory,
+    failure_category_label: getFailureCategoryLabel(failureCategory),
+  };
 }
 
 function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
@@ -879,13 +942,18 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
       type: `step.${taskRun.status}`,
       title: "Task step recorded",
       summary: `${taskRun.title} is currently ${taskRun.status}.`,
-      status: mapTaskRunStatus(taskRun.status),
+      status: mapTaskRunStatusToUiStatus(taskRun.status),
       taskRunId: taskRun.id,
       meta: {
         title: taskRun.title,
         verified: taskRun.verified,
         attempts: taskRun.attempts,
         artifact_count: taskRun.artifacts.length,
+        failure_category: classifyFailure({
+          type: `step.${taskRun.status}`,
+          status: taskRun.status,
+          summary: taskRun.output,
+        }),
       },
     }));
 
@@ -896,7 +964,7 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
         time: record.savedAt,
         type: mapExecutorHistoryType(executorOutput.status),
         title: "Executor result recorded",
-        summary: executorOutput.summary,
+        summary: getExecutorDisplaySummary(executorOutput),
         status: mapExecutorHistoryStatus(executorOutput.status),
         taskRunId: taskRun.id,
         step: index + 1,
@@ -905,6 +973,13 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
           error: executorOutput.error ?? null,
           artifact_count: executorOutput.artifacts.length,
           tool_call_count: executorOutput.tool_calls_made.length,
+          failure_category: classifyFailure({
+            type: mapExecutorHistoryType(executorOutput.status),
+            status: executorOutput.status,
+            summary: getExecutorDisplaySummary(executorOutput),
+            error: executorOutput.error,
+            tool: executorOutput.tool_calls_made[0]?.tool,
+          }),
         },
       }));
     }
@@ -927,6 +1002,9 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
         artifact_type: artifact.type,
         path: artifact.path ?? null,
         source: artifact.source,
+        trust_level: artifact.trustLevel ?? null,
+        related_task_run_id: artifact.relatedTaskRunId ?? artifact.sourceTaskRunId ?? null,
+        related_step: artifact.relatedStep ?? null,
       },
     }));
   }
@@ -942,6 +1020,11 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
       status: "blocked",
       meta: {
         cancellation_requested_at: record.control.cancellationRequestedAt ?? null,
+        failure_category: classifyFailure({
+          type: "job.cancelled",
+          status: "blocked",
+          summary: "The job was cancelled.",
+        }),
       },
     }));
   }
@@ -976,23 +1059,19 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
     }));
   }
 
-  const stateSummary = record.job.status === "running"
-    ? "Job is currently running."
-    : record.job.status === "queued"
-      ? "Job is queued."
-      : record.job.status === "awaiting_approval"
-        ? "Job is waiting for approval."
-        : record.job.status === "cancelled"
-          ? "Job was cancelled."
-          : `Job finished with status ${record.job.status}.`;
+  const recoveryEvent = createRecoveryEvent(record, seq);
+  if (recoveryEvent) {
+    push(recoveryEvent);
+  }
+
   push(createLifecycleEvent({
     jobId: record.job.id,
     seq,
     time: record.savedAt,
-    type: mapJobFinalType(record.job.status),
+    type: mapJobStatusToLifecycleType(record.job.status),
     title: "Job state recorded",
-    summary: stateSummary,
-    status: mapJobStatus(record.job.status),
+    summary: describeJobState(record.job.status),
+    status: mapJobStatusToUiStatus(record.job.status),
     meta: {
       verified: record.job.verified,
       output_preview: record.job.output.slice(0, 200),
@@ -1000,24 +1079,6 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
   }));
 
   return events;
-}
-
-function mapTaskRunStatus(status: TaskRun["status"]): WorkflowUiEvent["status"] {
-  switch (status) {
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "blocked":
-      return "blocked";
-    case "awaiting_approval":
-      return "awaiting_approval";
-    case "in_progress":
-    case "pending":
-    case "skipped":
-    default:
-      return "running";
-  }
 }
 
 function mapExecutorHistoryStatus(status: ExecutorOutput["status"]): WorkflowUiEvent["status"] {
@@ -1049,55 +1110,70 @@ function mapExecutorHistoryType(status: ExecutorOutput["status"]): string {
   }
 }
 
-function mapJobStatus(status: Job["status"]): WorkflowUiEvent["status"] {
-  switch (status) {
-    case "queued":
-    case "running":
-      return "running";
-    case "awaiting_approval":
-      return "awaiting_approval";
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "cancelled":
-      return "blocked";
-    case "blocked":
-    default:
-      return "blocked";
+function getRecoveredTaskRunIds(record: StoredJobRecord): string[] {
+  if (!record.control?.recoveredAt) {
+    return [];
   }
+  return record.taskRuns
+    .filter((taskRun) => taskRun.status === "blocked" && /service restart/i.test(taskRun.output))
+    .map((taskRun) => taskRun.id);
 }
 
-function mapJobFinalType(status: Job["status"]): string {
-  switch (status) {
-    case "queued":
-      return "job.queued";
-    case "running":
-      return "job.started";
-    case "awaiting_approval":
-      return "job.awaiting_approval";
-    case "completed":
-      return "job.completed";
-    case "failed":
-      return "job.failed";
-    case "cancelled":
-      return "job.cancelled";
-    case "blocked":
-    default:
-      return "job.blocked";
+function createRecoveryEvent(record: StoredJobRecord, seq: number): WorkflowUiEvent | null {
+  if (!record.control?.recoveredAt || record.control.recoveryReason !== "service_restart") {
+    return null;
   }
+  return createLifecycleEvent({
+    jobId: record.job.id,
+    seq,
+    time: record.control.recoveredAt,
+    type: "job.recovered",
+    title: "Job recovered after restart",
+    summary: "The previous in-memory run session was lost after a service restart. The job is now recoverable.",
+    status: "blocked",
+      meta: {
+        recovery_reason: record.control.recoveryReason,
+        recovered_at: record.control.recoveredAt,
+        recoverable: true,
+        job_status: record.job.status,
+        affected_task_run_ids: getRecoveredTaskRunIds(record),
+        failure_category: classifyFailure({
+          type: "job.recovered",
+          status: "blocked",
+          summary: "The previous in-memory run session was lost after a service restart. The job is now recoverable.",
+          recoveryReason: record.control.recoveryReason,
+        }),
+      },
+    });
 }
 
-function buildEventSnapshot(jobId: string, events: WorkflowUiEvent[]): Record<string, unknown> | null {
+function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[]): Record<string, unknown> | null {
   if (events.length === 0) {
     return null;
   }
 
   const latestByAgent = (agent: WorkflowUiEvent["agent"]) => [...events].reverse().find((event) => event.agent === agent) ?? null;
+  const failureSummary = buildFailureSummary(events);
+  const recovery = record.control?.recoveredAt && record.control.recoveryReason
+    ? {
+        status: "recovered",
+        reason: record.control.recoveryReason,
+        recovered_at: record.control.recoveredAt,
+        recoverable: true,
+        affected_task_run_ids: getRecoveredTaskRunIds(record),
+      }
+    : null;
   return {
-    job_id: jobId,
+    job_id: record.job.id,
+    job_status: record.job.status,
     seq: events.at(-1)?.seq ?? 0,
     event_count: events.length,
+    replay: {
+      next_seq: (events.at(-1)?.seq ?? 0) + 1,
+      can_resume_from: Math.max(0, events.at(0)?.seq ?? 0),
+    },
+    failure_summary: failureSummary,
+    recovery,
     latest_planner: latestByAgent("planner"),
     latest_executor: latestByAgent("executor"),
     latest_tool: latestByAgent("tool"),
@@ -1110,7 +1186,11 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
     return buildJobEvents(record);
   }
   if (persistedEvents.some((event) => event.type === "job.created")) {
-    return persistedEvents;
+    if (!record.control?.recoveredAt || persistedEvents.some((event) => event.type === "job.recovered")) {
+      return persistedEvents;
+    }
+    const recoveryEvent = createRecoveryEvent(record, Math.max(...persistedEvents.map((event) => event.seq), 0) + 1);
+    return recoveryEvent ? [...persistedEvents, recoveryEvent] : persistedEvents;
   }
 
   const fallbackEvents = buildJobEvents(record);
@@ -1128,6 +1208,59 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
   return merged
     .sort((a, b) => a.time.localeCompare(b.time) || a.seq - b.seq)
     .map((event, index) => ({ ...event, seq: index + 1 }));
+}
+
+function recoverInterruptedJobs(): string[] {
+  const recoveredJobIds: string[] = [];
+  for (const stored of listStoredJobs()) {
+    if (stored.status !== "running") {
+      continue;
+    }
+
+    const updated = updateStoredJobRecord(stored.id, (record) => {
+      if (record.job.status !== "running") {
+        return record;
+      }
+
+      const recoveredAt = new Date().toISOString();
+      return {
+        ...record,
+        savedAt: recoveredAt,
+        job: {
+          ...record.job,
+          status: "blocked",
+          verified: false,
+          output: "Execution was interrupted by a service restart. The job can be resumed from the control plane.",
+        },
+        taskRuns: record.taskRuns.map((taskRun) => (
+          taskRun.status === "completed" || taskRun.status === "failed" || taskRun.status === "blocked" || taskRun.status === "skipped"
+            ? taskRun
+            : {
+                ...taskRun,
+                status: taskRun.status === "awaiting_approval" ? "awaiting_approval" : "blocked",
+                output: taskRun.output || "Execution was interrupted by a service restart.",
+              }
+        )),
+        control: {
+          ...record.control,
+          recoveredAt,
+          recoveryReason: "service_restart",
+        },
+      };
+    });
+
+    if (!updated || updated.job.status !== "blocked") {
+      continue;
+    }
+
+    const recoveryEvent = createRecoveryEvent(updated, getNextSeq(stored.id));
+    if (recoveryEvent) {
+      appendEvent(recoveryEvent);
+    }
+    recoveredJobIds.push(stored.id);
+  }
+
+  return recoveredJobIds;
 }
 
 function buildJobResponse(record: StoredJobRecord): unknown {
@@ -1221,6 +1354,33 @@ function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> 
     workflow_graph: workflowGraph,
     dag: workflowGraph,
     replan_history: workflowGraph.replan_history,
+  };
+}
+
+function buildFailureSummary(events: WorkflowUiEvent[]): {
+  total: number;
+  by_category: Record<string, number>;
+  latest_category: string | null;
+  latest_summary: string | null;
+} {
+  const failures = events
+    .filter((event) => isObjectRecord(event.meta) && typeof event.meta.failure_category === "string" && event.meta.failure_category.trim().length > 0)
+    .map((event) => ({
+      category: event.meta.failure_category as string,
+      summary: event.summary,
+    }));
+
+  const byCategory: Record<string, number> = {};
+  for (const failure of failures) {
+    byCategory[failure.category] = (byCategory[failure.category] ?? 0) + 1;
+  }
+
+  const latest = failures.at(-1) ?? null;
+  return {
+    total: failures.length,
+    by_category: byCategory,
+    latest_category: latest?.category ?? null,
+    latest_summary: latest?.summary ?? null,
   };
 }
 
@@ -1352,11 +1512,7 @@ function formatProgressUpdate(event: OrchestratorEvent): string | null {
     case "workflow.step.start":
       return buildProgressCard(`步骤 ${event.step ?? 1} · 规划中`, "正在规划下一步。");
     case "workflow.planner.decision": {
-      const summary = typeof event.data.reasoning_summary === "string" && event.data.reasoning_summary.trim()
-        ? event.data.reasoning_summary.trim()
-        : typeof event.data.next_step === "string"
-          ? event.data.next_step.trim()
-          : "";
+      const summary = getPlannerDecisionText(event.data);
       return summary
         ? buildProgressCard(`步骤 ${event.step ?? 1} · 规划中`, humanizePlannerSummary(summary))
         : buildProgressCard(`步骤 ${event.step ?? 1} · 规划中`, "正在整理下一步策略。");
@@ -1368,7 +1524,7 @@ function formatProgressUpdate(event: OrchestratorEvent): string | null {
         : buildProgressCard(`步骤 ${event.step ?? 1} · 执行中`, "正在处理当前任务。");
     }
     case "workflow.executor.result": {
-      const summary = typeof event.data.summary === "string" ? event.data.summary.trim() : "";
+      const summary = getExecutorDisplaySummary(event.data);
       return summary
         ? buildProgressCard(`步骤 ${event.step ?? 1} · ${inferExecutionSummaryPhaseLabel(summary)}`, humanizeExecutionSummary(summary))
         : null;
@@ -1654,7 +1810,10 @@ function sseWrite(res: ServerResponse, payload: string): void {
   res.write(`data: ${payload}\n\n`);
 }
 
-function sseWriteEvent(res: ServerResponse, eventName: string, payload: string): void {
+function sseWriteEvent(res: ServerResponse, eventName: string, payload: string, eventId?: number): void {
+  if (typeof eventId === "number" && Number.isFinite(eventId)) {
+    res.write(`id: ${eventId}\n`);
+  }
   res.write(`event: ${eventName}\ndata: ${payload}\n\n`);
 }
 
@@ -1752,7 +1911,7 @@ async function executeTaskGoal(
       status,
       phase,
       taskRunId,
-      meta,
+      meta: attachFailureCategory(type, status, summary, meta),
     }));
   };
   const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
@@ -1874,16 +2033,18 @@ async function executeTaskGoal(
       workspaceRoot: WORKSPACE_ROOT,
       runtimeRoot: RUNTIME_ROOT,
     };
-    const verificationResults = await runVerifiers(verificationContext);
-    const allPassed = verificationPassed(verificationResults);
+    const verificationResult = await runVerifiers(verificationContext);
+    const allPassed = verificationResultPassed(verificationResult);
     const verifiedJob = allPassed ? payload.job : { ...payload.job, verified: false };
     if (!allPassed) {
-      emitLifecycle("system.verification_failed", "Verification reported issues", "Verification completed with one or more issues.", "blocked", {
-        verifier_count: verificationResults.length,
+      emitLifecycle("system.verification_failed", "Verification reported issues", summarizeVerification(verificationResult), "blocked", {
+        verifier_count: verificationResult.checks.length,
+        verification_status: verificationResult.status,
       });
     } else {
-      emitLifecycle("system.verification_passed", "Verification passed", "Verification completed successfully.", "success", {
-        verifier_count: verificationResults.length,
+      emitLifecycle("system.verification_passed", "Verification passed", summarizeVerification(verificationResult), "success", {
+        verifier_count: verificationResult.checks.length,
+        verification_status: verificationResult.status,
       });
     }
 
@@ -1893,7 +2054,7 @@ async function executeTaskGoal(
       taskRuns: payload.taskRuns,
       artifacts: payload.artifacts,
     });
-    emitLifecycle(mapJobFinalType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatus(verifiedJob.status), {
+    emitLifecycle(mapJobStatusToLifecycleType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatusToUiStatus(verifiedJob.status), {
       verified: verifiedJob.verified,
       output_preview: verifiedJob.output.slice(0, 200),
       log_path: payload.logPath,
@@ -2152,10 +2313,15 @@ async function handleGetJobRuntimeProfile(_req: IncomingMessage, res: ServerResp
     return;
   }
   const config = loadConfig();
+  const runtimeProfile = buildRuntimeProfile(config);
   jsonResponse(res, 200, {
     job_id: jobId,
     generated_at: new Date().toISOString(),
-    runtime_profile: buildRuntimeProfile(config),
+    diagnostics_summary: {
+      dependency_warnings: runtimeProfile.diagnostics.dependencyChecks.filter((check) => check.status === "warning").length,
+      dependency_checks: runtimeProfile.diagnostics.dependencyChecks.length,
+    },
+    runtime_profile: runtimeProfile,
   });
 }
 
@@ -2186,7 +2352,7 @@ async function handleGetJobEvents(req: IncomingMessage, res: ServerResponse, job
   jsonResponse(res, 200, {
     job_id: jobId,
     count: events.length,
-    snapshot: getLatestSnapshot(jobId) ?? buildEventSnapshot(jobId, events),
+    snapshot: buildEventSnapshot(record, events),
     events,
   });
 }
@@ -2204,8 +2370,22 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
     return;
   }
 
+  const url = new URL(_req.url ?? "/", "http://127.0.0.1");
+  const sinceSeqRaw = url.searchParams.get("since_seq");
+  const lastEventIdRaw = getHeaderValue(_req, "last-event-id");
+  const requestedSinceSeq = sinceSeqRaw ? Number.parseInt(sinceSeqRaw, 10) : undefined;
+  const requestedLastEventId = lastEventIdRaw ? Number.parseInt(lastEventIdRaw, 10) : undefined;
+  const replayCursor = Number.isFinite(requestedSinceSeq)
+    ? requestedSinceSeq as number
+    : Number.isFinite(requestedLastEventId)
+      ? requestedLastEventId as number
+      : undefined;
+
   // Load existing events from disk
   const existingEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
+  const replayEvents = replayCursor !== undefined
+    ? existingEvents.filter((event) => event.seq > replayCursor)
+    : (existingEvents.length > 0 ? existingEvents : getEvents(jobId));
 
   // Set SSE headers
   res.statusCode = 200;
@@ -2214,21 +2394,27 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
   res.setHeader("Connection", "keep-alive");
 
   // Send initial snapshot
-  const snapshot = getLatestSnapshot(jobId) ?? buildEventSnapshot(jobId, existingEvents);
+  const snapshot = buildEventSnapshot(record, existingEvents);
   if (snapshot) {
-    sseWriteEvent(res, "job.snapshot", JSON.stringify(snapshot));
+    sseWriteEvent(res, "job.snapshot", JSON.stringify({
+      ...snapshot,
+      replay: {
+        ...(isObjectRecord(snapshot.replay) ? snapshot.replay : {}),
+        resumed_from_seq: replayCursor ?? null,
+        replayed_count: replayEvents.length,
+      },
+    }));
   }
 
-  // Send existing events
-  const replayEvents = existingEvents.length > 0 ? existingEvents : getEvents(jobId);
+  // Send replay events
   for (const event of replayEvents) {
-    sseWriteEvent(res, "job.event", JSON.stringify(event));
+    sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
   }
 
   // Subscribe to new events
   const unsubscribe = subscribe(jobId, (event) => {
     try {
-      sseWriteEvent(res, "job.event", JSON.stringify(event));
+      sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
     } catch {
       // Client disconnected
       unsubscribe();
@@ -2322,11 +2508,8 @@ async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId
 async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
+    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
+      status: "failed",
     });
     return;
   }
@@ -2400,36 +2583,30 @@ async function handleJobTimeline(_req: IncomingMessage, res: ServerResponse, job
 async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const body = await readJsonBody<{ approval_id?: string; decision?: string; note?: string }>(req);
   if (!body.approval_id || !body.decision) {
-    jsonResponse(res, 400, {
-      error: {
-        message: "approval_id and decision are required.",
-        type: "invalid_request_error",
-      },
+    jsonErrorResponse(res, 400, "approval_id and decision are required.", "invalid_request_error", {
+      status: "failed",
     });
     return;
   }
   if (body.decision !== "approved" && body.decision !== "denied") {
-    jsonResponse(res, 400, {
-      error: {
-        message: 'decision must be "approved" or "denied".',
-        type: "invalid_request_error",
-      },
+    jsonErrorResponse(res, 400, 'decision must be "approved" or "denied".', "invalid_request_error", {
+      status: "failed",
     });
     return;
   }
 
   const record = readJobRecord(jobId);
   if (!record) {
-    jsonResponse(res, 404, {
-      error: { message: `Job not found: ${jobId}`, type: "not_found_error" },
+    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
+      status: "failed",
     });
     return;
   }
 
   const updated = resolveApprovalRequest(jobId, body.approval_id, body.decision, body.note);
   if (!updated) {
-    jsonResponse(res, 400, {
-      error: { message: `Approval not found: ${body.approval_id}`, type: "invalid_request_error" },
+    jsonErrorResponse(res, 400, `Approval not found: ${body.approval_id}`, "invalid_request_error", {
+      status: "failed",
     });
     return;
   }
@@ -2466,23 +2643,30 @@ async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId
 async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
-    jsonResponse(res, 404, {
-      error: { message: `Job not found: ${jobId}`, type: "not_found_error" },
+    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
+      status: "failed",
     });
     return;
   }
 
   if (record.job.status === "completed") {
-    jsonResponse(res, 400, {
-      error: { message: "Cannot resume a completed job.", type: "invalid_request_error" },
+    jsonErrorResponse(res, 400, "Cannot resume a completed job.", "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+
+  if (record.job.status === "awaiting_approval" || record.control?.pendingApprovalId) {
+    jsonErrorResponse(res, 409, "Job is awaiting approval. Resolve it through /approve instead of /resume.", "conflict_error", {
+      status: "blocked",
     });
     return;
   }
 
   const active = getActiveJobSession(jobId);
   if (active) {
-    jsonResponse(res, 409, {
-      error: { message: "Job is currently running.", type: "conflict_error" },
+    jsonErrorResponse(res, 409, "Job is currently running.", "conflict_error", {
+      status: "blocked",
     });
     return;
   }
@@ -3156,11 +3340,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    jsonResponse(res, 404, {
-      error: {
-        message: `Route not found: ${method} ${url.pathname}`,
-        type: "not_found_error",
-      },
+    jsonErrorResponse(res, 404, `Route not found: ${method} ${url.pathname}`, "not_found_error", {
+      status: "failed",
     });
   } catch (error) {
     if (error instanceof ServiceUnavailableError) {
@@ -3186,11 +3367,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    jsonResponse(res, isBadRequest ? 400 : 500, {
-      error: {
-        message,
-        type: isBadRequest ? "invalid_request_error" : "server_error",
-      },
+    jsonErrorResponse(res, isBadRequest ? 400 : 500, message, isBadRequest ? "invalid_request_error" : "server_error", {
+      status: isBadRequest ? "failed" : "blocked",
     });
   }
 }
@@ -3223,6 +3401,323 @@ function runConfigValidation(configPath?: string): void {
     task_routing_path: config.taskRoutingPath,
     route_types: routing.map((route) => route.type),
   }, null, 2));
+}
+
+type DoctorCheck = {
+  name: string;
+  ok: boolean;
+  summary: string;
+  detail?: unknown;
+};
+
+type DoctorRecommendation = {
+  category:
+    | "configuration"
+    | "routing"
+    | "network"
+    | "filesystem"
+    | "search"
+    | "runtime";
+  severity: "info" | "warning";
+  message: string;
+  suggested_action: string;
+  related_checks: string[];
+};
+
+function maskSecret(value: string): string {
+  if (!value) {
+    return "";
+  }
+  if (value.length <= 6) {
+    return `${value.slice(0, 1)}***`;
+  }
+  return `${value.slice(0, 3)}***${value.slice(-2)}`;
+}
+
+function buildModelConfigCheck(
+  name: "planner_model_config" | "executor_model_config",
+  label: "planner" | "executor",
+  config: OrchestratorConfig["planner"] | OrchestratorConfig["executor"],
+): DoctorCheck {
+  const urlLooksLocal = /^(https?:\/\/)(127\.0\.0\.1|localhost)/i.test(config.baseUrl);
+  return {
+    name,
+    ok: Boolean(config.baseUrl && config.apiKey && config.model),
+    summary: `${label} model config is ready${urlLooksLocal ? " (local endpoint)." : "."}`,
+    detail: {
+      base_url: config.baseUrl,
+      api_key_present: Boolean(config.apiKey),
+      api_key_preview: config.apiKey ? maskSecret(config.apiKey) : "",
+      model: config.model,
+      timeout_ms: config.timeoutMs,
+      max_tokens: config.maxTokens,
+      temperature: config.temperature,
+      endpoint_scope: urlLooksLocal ? "local" : "remote",
+    },
+  };
+}
+
+function buildTaskRoutingCheck(taskRoutingPath: string | undefined, routing: RoutePolicy[]): DoctorCheck {
+  const routesWithPreferredTools = routing.filter((route) => route.preferredTools.length > 0).length;
+  const routesRequiringEvidence = routing.filter((route) => route.requireEvidenceBeforeFinal).length;
+  return {
+    name: "task_routing_summary",
+    ok: routing.length > 0,
+    summary: `Task routing loaded ${routing.length} route types.`,
+    detail: {
+      task_routing_path: taskRoutingPath ?? "config/task-routing.yml",
+      route_count: routing.length,
+      route_types: routing.map((route) => route.type),
+      routes_with_preferred_tools: routesWithPreferredTools,
+      routes_requiring_evidence: routesRequiringEvidence,
+    },
+  };
+}
+
+function buildSearchProviderCheck(config: OrchestratorConfig): DoctorCheck {
+  if (!config.search) {
+    return {
+      name: "search_provider_readiness",
+      ok: false,
+      summary: "Search provider is not configured.",
+      detail: {
+        provider: null,
+        fallback_enabled: false,
+      },
+    };
+  }
+
+  const providerConfig = config.search.providers[config.search.provider];
+  const providerKindsRequiringApiKey = new Set(["serpapi", "bing_api", "google_cse"]);
+  const providerKindsRequiringSection = new Set(["bing_html", "searxng", "serpapi", "bing_api", "google_cse", "mcp"]);
+  const sectionPresent = config.search.provider === "url_template" || providerKindsRequiringSection.has(config.search.provider)
+    ? Boolean(providerConfig)
+    : true;
+  const apiKeyRequired = providerKindsRequiringApiKey.has(config.search.provider);
+  const apiKeyPresent = !apiKeyRequired || Boolean(config.search.apiKey);
+  const ok = sectionPresent && apiKeyPresent;
+
+  return {
+    name: "search_provider_readiness",
+    ok,
+    summary: ok
+      ? `Search provider "${config.search.provider}" is ready.`
+      : `Search provider "${config.search.provider}" is only partially configured.`,
+    detail: {
+      provider: config.search.provider,
+      provider_section_present: sectionPresent,
+      api_key_required: apiKeyRequired,
+      api_key_present: Boolean(config.search.apiKey),
+      api_key_preview: config.search.apiKey ? maskSecret(config.search.apiKey) : "",
+      fallback_enabled: config.search.fallbackEnabled,
+      timeout_ms: config.search.timeoutMs,
+      provider_config_keys: providerConfig ? Object.keys(providerConfig) : [],
+    },
+  };
+}
+
+function buildDoctorRecommendations(checks: DoctorCheck[]): DoctorRecommendation[] {
+  const recommendations: DoctorRecommendation[] = [];
+  const find = (name: string) => checks.find((check) => check.name === name);
+
+  const configLoad = find("config_load");
+  if (configLoad && !configLoad.ok) {
+    recommendations.push({
+      category: "configuration",
+      severity: "warning",
+      message: "Configuration failed to load.",
+      suggested_action: "Fix the reported config schema errors, then rerun `npm run doctor` or `npm run config:validate`.",
+      related_checks: ["config_load"],
+    });
+    return recommendations;
+  }
+
+  if ((find("planner_model_config") && !find("planner_model_config")!.ok) || (find("executor_model_config") && !find("executor_model_config")!.ok)) {
+    recommendations.push({
+      category: "configuration",
+      severity: "warning",
+      message: "Planner or executor model configuration is incomplete.",
+      suggested_action: "Verify base URLs, model names, and API key env vars for both planner and executor.",
+      related_checks: ["planner_model_config", "executor_model_config"],
+    });
+  }
+
+  if (find("task_routing_load") && !find("task_routing_load")!.ok) {
+    recommendations.push({
+      category: "routing",
+      severity: "warning",
+      message: "Task routing config could not be loaded.",
+      suggested_action: "Fix the task-routing YAML or fall back to the default `config/task-routing.yml` layout.",
+      related_checks: ["task_routing_load", "task_routing_summary"],
+    });
+  }
+
+  if (find("proxy_health") && !find("proxy_health")!.ok) {
+    recommendations.push({
+      category: "network",
+      severity: "warning",
+      message: "Proxy configuration looks degraded.",
+      suggested_action: "Check `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, especially local placeholders or dead ports.",
+      related_checks: ["proxy_health", "runtime_profile"],
+    });
+  }
+
+  if ((find("workspace_writable") && !find("workspace_writable")!.ok) || (find("runtime_writable") && !find("runtime_writable")!.ok)) {
+    recommendations.push({
+      category: "filesystem",
+      severity: "warning",
+      message: "One or more writable roots are not writable.",
+      suggested_action: "Check directory permissions and confirm the workspace/runtime roots are writable by this process.",
+      related_checks: ["workspace_writable", "runtime_writable"],
+    });
+  }
+
+  if (find("search_provider_readiness") && !find("search_provider_readiness")!.ok) {
+    recommendations.push({
+      category: "search",
+      severity: "warning",
+      message: "Search provider is only partially configured.",
+      suggested_action: "Add the active provider section and required API key, or switch to a provider that is already configured.",
+      related_checks: ["search_provider_readiness"],
+    });
+  }
+
+  if (recommendations.length === 0) {
+    recommendations.push({
+      category: "runtime",
+      severity: "info",
+      message: "No critical doctor issues were detected.",
+      suggested_action: "Use `/v1/jobs/:id/runtime-profile`, `/events`, and `/timeline` when you need job-specific diagnostics.",
+      related_checks: checks.filter((check) => check.ok).map((check) => check.name),
+    });
+  }
+
+  return recommendations;
+}
+
+function runWritableCheck(targetDir: string, label: string): DoctorCheck {
+  try {
+    if (!existsSync(targetDir)) {
+      mkdirSync(targetDir, { recursive: true });
+    }
+    const probePath = join(targetDir, `.doctor-write-check-${process.pid}-${Date.now()}.tmp`);
+    writeFileSync(probePath, "ok", "utf8");
+    unlinkSync(probePath);
+    return {
+      name: `${label}_writable`,
+      ok: true,
+      summary: `${label} is writable.`,
+      detail: { path: targetDir },
+    };
+  } catch (error) {
+    return {
+      name: `${label}_writable`,
+      ok: false,
+      summary: `${label} is not writable.`,
+      detail: {
+        path: targetDir,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+function buildDoctorReport(configPath?: string): Record<string, unknown> {
+  const resolvedPath = configPath?.trim() || "config/config.yml";
+  const checks: DoctorCheck[] = [];
+
+  try {
+    const config = loadConfig(resolvedPath);
+    checks.push({
+      name: "config_load",
+      ok: true,
+      summary: "Configuration loaded successfully.",
+      detail: {
+        planner_model: config.planner.model,
+        executor_model: config.executor.model,
+      },
+    });
+    checks.push(buildModelConfigCheck("planner_model_config", "planner", config.planner));
+    checks.push(buildModelConfigCheck("executor_model_config", "executor", config.executor));
+
+    const routing = loadTaskRoutingConfig(config.taskRoutingPath);
+    checks.push({
+      name: "task_routing_load",
+      ok: true,
+      summary: "Task routing config loaded successfully.",
+      detail: {
+        task_routing_path: config.taskRoutingPath,
+        route_types: routing.map((route) => route.type),
+      },
+    });
+    checks.push(buildTaskRoutingCheck(config.taskRoutingPath, routing));
+
+    const runtimeProfile = buildRuntimeProfile(config);
+    checks.push({
+      name: "runtime_profile",
+      ok: true,
+      summary: "Runtime profile generated successfully.",
+      detail: runtimeProfile,
+    });
+
+    checks.push({
+      name: "proxy_health",
+      ok: runtimeProfile.network.proxyHealth === "ok",
+      summary: runtimeProfile.network.proxyHealth === "ok"
+        ? "Proxy health looks normal."
+        : "Proxy configuration looks degraded.",
+      detail: runtimeProfile.network,
+    });
+
+    checks.push(runWritableCheck(WORKSPACE_ROOT, "workspace"));
+    checks.push(runWritableCheck(RUNTIME_ROOT, "runtime"));
+
+    checks.push(buildSearchProviderCheck(config));
+
+    return {
+      ok: checks.every((check) => check.ok),
+      generated_at: new Date().toISOString(),
+      config_path: resolvedPath,
+      diagnostic_taxonomy: {
+        failure_categories: listFailureCategories(),
+      },
+      summary: {
+        passed: checks.filter((check) => check.ok).length,
+        failed: checks.filter((check) => !check.ok).length,
+        total: checks.length,
+      },
+      recommendations: buildDoctorRecommendations(checks),
+      checks,
+    };
+  } catch (error) {
+    checks.push({
+      name: "config_load",
+      ok: false,
+      summary: "Configuration failed to load.",
+      detail: {
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    return {
+      ok: false,
+      generated_at: new Date().toISOString(),
+      config_path: resolvedPath,
+      diagnostic_taxonomy: {
+        failure_categories: listFailureCategories(),
+      },
+      summary: {
+        passed: checks.filter((check) => check.ok).length,
+        failed: checks.filter((check) => !check.ok).length,
+        total: checks.length,
+      },
+      recommendations: buildDoctorRecommendations(checks),
+      checks,
+    };
+  }
+}
+
+function runDoctor(configPath?: string): void {
+  console.log(JSON.stringify(buildDoctorReport(configPath), null, 2));
 }
 
 async function runCliTask(task: string): Promise<void> {
@@ -3299,6 +3794,7 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
 function runServer(port: number): void {
   const config = loadConfig();
   configureSearchTools(config.search);
+  const recoveredJobIds = recoverInterruptedJobs();
   const server = createServer((req, res) => {
     void handleRequest(req, res);
   });
@@ -3306,6 +3802,9 @@ function runServer(port: number): void {
     console.log(`Dual Agent Orchestrator API listening on http://127.0.0.1:${port}`);
     console.log(`API key: ${getServerApiKey()}`);
     console.log(`Models: ${getExposedModels(config).map((model) => model.id).join(", ")}`);
+    if (recoveredJobIds.length > 0) {
+      console.log(`Recovered interrupted jobs after restart: ${recoveredJobIds.join(", ")}`);
+    }
   });
 }
 
@@ -3317,7 +3816,7 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "doctor") {
-    runConfigValidation(args[1]);
+    runDoctor(args[1]);
     return;
   }
 
@@ -3358,4 +3857,6 @@ export const __testables = {
   buildJobEvents,
   setTaskExecutorForTests,
   getActiveJobSession,
+  recoverInterruptedJobs,
+  buildDoctorReport,
 };
