@@ -142,6 +142,10 @@ test("workflow execution support includes verify in milestone C", () => {
         allowed_tools: ["read_file"],
         depends_on: ["t1"],
         required: true,
+        constraints: {
+          verifier_profile: "system_and_model",
+          verifier_agent_id: "verifier_a",
+        },
       },
     ],
     finish_when: {
@@ -150,9 +154,58 @@ test("workflow execution support includes verify in milestone C", () => {
   });
 
   assert.ok(plan);
+  assert.equal(plan.tasks[1]?.constraints?.verifier_profile, "system_and_model");
+  assert.equal(plan.tasks[1]?.constraints?.verifier_agent_id, "verifier_a");
   const support = assessWorkflowExecutionSupport(plan!);
   assert.equal(support.supported, true);
   assert.deepEqual(support.issues, []);
+});
+
+test("workflow plan validation constrains verifier profile fields to verify tasks", () => {
+  const plan = parseWorkflowPlan({
+    id: "wf_invalid_verifier_profile",
+    strategy: "invalid_verifier_profile",
+    summary: "Invalid verifier constraints.",
+    tasks: [
+      {
+        id: "t1",
+        title: "Write report",
+        kind: "write",
+        role: "worker",
+        instruction: "Write report.md.",
+        allowed_tools: ["write_file"],
+        depends_on: [],
+        required: true,
+        constraints: {
+          verifier_profile: "system_and_model",
+          verifier_agent_id: "verifier_a",
+        },
+      },
+      {
+        id: "t2",
+        title: "Verify report",
+        kind: "verify",
+        role: "verifier",
+        instruction: "Verify report.md.",
+        allowed_tools: [],
+        depends_on: ["t1"],
+        required: true,
+        constraints: {
+          verifier_profile: "unsupported_profile",
+        },
+      },
+    ],
+    finish_when: {
+      mode: "all_required_tasks_completed",
+    },
+  });
+
+  assert.ok(plan);
+  const validation = validateWorkflowPlan(plan!, TOOL_DEFINITIONS);
+  assert.equal(validation.valid, false);
+  assert.equal(validation.issues.some((issue) => issue.includes("defines verifier_profile but is not a verify task")), true);
+  assert.equal(validation.issues.some((issue) => issue.includes("defines verifier_agent_id but is not a verify task")), true);
+  assert.equal(validation.issues.some((issue) => issue.includes("unsupported verifier_profile")), true);
 });
 
 test("workflow execution support allows advanced finish_when modes in milestone C", () => {

@@ -789,11 +789,343 @@ test("workflow runtime executes verify tasks using dependency artifacts", async 
     assert.equal(result.taskRuns[1]?.status, "completed");
     assert.equal(result.taskRuns[1]?.verified, true);
     assert.equal(result.taskRuns[1]?.output.includes("PASS artifact_presence"), true);
+    assert.equal(result.taskRuns[1]?.verificationResult?.status, "verified");
+    assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "artifact_presence"), true);
     assert.equal(result.taskRuns[2]?.status, "completed");
     assert.equal(executorPlanners.length, 2);
   } finally {
     unlinkSync(sourcePath);
   }
+});
+
+test("workflow runtime includes configured model verifier for verify tasks", async () => {
+  const config = {
+    ...buildMinimalConfig(),
+    agents: {
+      verifier: {
+        id: "verifier",
+        role: "verifier",
+        model: {
+          provider: "openai_compatible" as const,
+          baseUrl: "http://verifier.test/v1",
+          apiKey: "verifier-key",
+          model: "verifier-model",
+          timeoutMs: 1000,
+          maxTokens: 256,
+          temperature: 0,
+        },
+      },
+    },
+  };
+  const routePolicy = buildRoutePolicy();
+  const sourcePath = resolve(import.meta.dirname!, "../../source-model-verifier.txt");
+  const verifierModels: string[] = [];
+  writeFileSync(sourcePath, "source content", "utf8");
+
+  try {
+    const result = await runWorkflowPlan(
+      config,
+      "Read and model-verify",
+      {
+        id: "wf_model_verify",
+        strategy: "read_model_verify",
+        summary: "Read an artifact, then run system and model verification.",
+        tasks: [
+          {
+            id: "t1",
+            title: "Read source",
+            kind: "read",
+            role: "worker",
+            instruction: "Read source-model-verifier.txt.",
+            allowed_tools: ["read_file"],
+            depends_on: [],
+            required: true,
+          },
+          {
+            id: "t2",
+            title: "Verify source",
+            kind: "verify",
+            role: "verifier",
+            instruction: "Verify the source artifact is sufficient.",
+            allowed_tools: [],
+            depends_on: ["t1"],
+            required: true,
+          },
+        ],
+        finish_when: {
+          mode: "all_required_tasks_completed",
+        },
+      },
+      routePolicy,
+      undefined,
+      createFakeRuntimeDeps({
+        runExecutorStep: async () => ({
+          status: "success",
+          summary: "Read source-model-verifier.txt",
+          tool_calls_made: [{ tool: "read_file", arguments: { path: "source-model-verifier.txt" } }],
+          artifacts: [{ type: "file", path: sourcePath, content_preview: "source content" }],
+          raw_result: "source content",
+          source: "native_tool",
+        }),
+        runChatCompletionDetailed: async (model) => {
+          verifierModels.push(model.model);
+          return {
+            content: JSON.stringify({ passed: true, summary: "Model verifier approved the dependency artifact." }),
+            reasoning: "",
+            toolCalls: [],
+            raw: {},
+          };
+        },
+      }),
+    );
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(verifierModels, ["verifier-model"]);
+    assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "model_verifier" && check.passed), true);
+  } finally {
+    unlinkSync(sourcePath);
+  }
+});
+
+test("workflow runtime honors explicit verifier profile constraints", async () => {
+  const config = {
+    ...buildMinimalConfig(),
+    agents: {
+      verifier: {
+        id: "verifier",
+        role: "verifier",
+        model: {
+          provider: "openai_compatible" as const,
+          baseUrl: "http://verifier.test/v1",
+          apiKey: "verifier-key",
+          model: "default-verifier-model",
+          timeoutMs: 1000,
+          maxTokens: 256,
+          temperature: 0,
+        },
+      },
+      strict_verifier: {
+        id: "strict_verifier",
+        role: "verifier",
+        model: {
+          provider: "openai_compatible" as const,
+          baseUrl: "http://strict-verifier.test/v1",
+          apiKey: "strict-verifier-key",
+          model: "strict-verifier-model",
+          timeoutMs: 1000,
+          maxTokens: 256,
+          temperature: 0,
+        },
+      },
+    },
+  };
+  const routePolicy = buildRoutePolicy();
+  const verifierModels: string[] = [];
+
+  const result = await runWorkflowPlan(
+    config,
+    "Read and run explicit verifier profiles",
+    {
+      id: "wf_explicit_verify_profiles",
+      strategy: "explicit_verify_profiles",
+      summary: "Run one system verifier and one configured model verifier.",
+      tasks: [
+        {
+          id: "t1",
+          title: "Read source",
+          kind: "read",
+          role: "worker",
+          instruction: "Read a source artifact.",
+          allowed_tools: ["read_file"],
+          depends_on: [],
+          required: true,
+        },
+        {
+          id: "t2",
+          title: "System-only verify",
+          kind: "verify",
+          role: "verifier",
+          instruction: "Use system checks only.",
+          allowed_tools: [],
+          depends_on: ["t1"],
+          required: true,
+          constraints: {
+            verifier_profile: "system",
+          },
+        },
+        {
+          id: "t3",
+          title: "Strict model verify",
+          kind: "verify",
+          role: "verifier",
+          instruction: "Use a specific model verifier.",
+          allowed_tools: [],
+          depends_on: ["t1"],
+          required: true,
+          constraints: {
+            verifier_profile: "system_and_model",
+            verifier_agent_id: "strict_verifier",
+          },
+        },
+      ],
+      finish_when: {
+        mode: "all_required_tasks_completed",
+      },
+    },
+    routePolicy,
+    undefined,
+    createFakeRuntimeDeps({
+      runExecutorStep: async () => ({
+        status: "success",
+        summary: "Read source artifact",
+        tool_calls_made: [{ tool: "read_file", arguments: { path: "source.txt" } }],
+        artifacts: [{ type: "text", content_preview: "source content" }],
+        raw_result: "source content",
+        source: "native_tool",
+      }),
+      runChatCompletionDetailed: async (model) => {
+        verifierModels.push(model.model);
+        return {
+          content: JSON.stringify({ passed: true, summary: "Specific verifier approved the artifact." }),
+          reasoning: "",
+          toolCalls: [],
+          raw: {},
+        };
+      },
+    }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(verifierModels, ["strict-verifier-model"]);
+  assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "model_verifier"), false);
+  assert.equal(result.taskRuns[2]?.verificationResult?.checks.some((check) => check.name === "model_verifier" && check.passed), true);
+});
+
+test("workflow runtime enforces explicit verifier acceptance criteria", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy();
+
+  const result = await runWorkflowPlan(
+    config,
+    "Read text and require JSON evidence",
+    {
+      id: "wf_acceptance_criteria",
+      strategy: "acceptance_criteria",
+      summary: "Require a JSON artifact even though the dependency only emits text.",
+      tasks: [
+        {
+          id: "t1",
+          title: "Read text",
+          kind: "read",
+          role: "worker",
+          instruction: "Read plain text.",
+          allowed_tools: ["read_file"],
+          depends_on: [],
+          required: true,
+        },
+        {
+          id: "t2",
+          title: "Verify JSON evidence",
+          kind: "verify",
+          role: "verifier",
+          instruction: "Require JSON evidence.",
+          allowed_tools: [],
+          depends_on: ["t1"],
+          required: true,
+          constraints: {
+            verifier_profile: "json",
+            minimum_artifact_count: 2,
+            required_artifact_type: "json",
+            required_schema: "json",
+          },
+        },
+      ],
+      finish_when: {
+        mode: "all_required_tasks_completed",
+      },
+    },
+    routePolicy,
+    undefined,
+    createFakeRuntimeDeps({
+      runExecutorStep: async () => ({
+        status: "success",
+        summary: "Read text artifact",
+        tool_calls_made: [{ tool: "read_file", arguments: { path: "source.txt" } }],
+        artifacts: [{ type: "text", content_preview: "plain text" }],
+        raw_result: "plain text",
+        source: "native_tool",
+      }),
+    }),
+  );
+
+  assert.equal(result.status, "blocked");
+  assert.equal(result.taskRuns[1]?.status, "blocked");
+  assert.equal(result.taskRuns[1]?.verificationResult?.status, "insufficient");
+  assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "acceptance_criteria" && check.status === "insufficient"), true);
+});
+
+test("workflow runtime records missing verifier agent as a structured check", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy();
+
+  const result = await runWorkflowPlan(
+    config,
+    "Read and require missing verifier agent",
+    {
+      id: "wf_missing_verifier_agent",
+      strategy: "missing_verifier_agent",
+      summary: "Require a verifier agent that is not registered.",
+      tasks: [
+        {
+          id: "t1",
+          title: "Read source",
+          kind: "read",
+          role: "worker",
+          instruction: "Read source.",
+          allowed_tools: ["read_file"],
+          depends_on: [],
+          required: true,
+        },
+        {
+          id: "t2",
+          title: "Verify with missing agent",
+          kind: "verify",
+          role: "verifier",
+          instruction: "Use a missing verifier agent.",
+          allowed_tools: [],
+          depends_on: ["t1"],
+          required: true,
+          constraints: {
+            verifier_profile: "system_and_model",
+            verifier_agent_id: "missing_verifier",
+          },
+        },
+      ],
+      finish_when: {
+        mode: "all_required_tasks_completed",
+      },
+    },
+    routePolicy,
+    undefined,
+    createFakeRuntimeDeps({
+      runExecutorStep: async () => ({
+        status: "success",
+        summary: "Read source artifact",
+        tool_calls_made: [{ tool: "read_file", arguments: { path: "source.txt" } }],
+        artifacts: [{ type: "text", content_preview: "source content" }],
+        raw_result: "source content",
+        source: "native_tool",
+      }),
+      runChatCompletionDetailed: async () => {
+        throw new Error("model verifier should not run when agent is missing");
+      },
+    }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.taskRuns[1]?.status, "failed");
+  assert.equal(result.taskRuns[1]?.verificationResult?.status, "failed");
+  assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "verifier_agent_resolution" && !check.passed), true);
 });
 
 test("workflow runtime fails verify tasks when dependency artifacts do not satisfy verifiers", async () => {
@@ -847,12 +1179,14 @@ test("workflow runtime fails verify tasks when dependency artifacts do not satis
     }),
   );
 
-  assert.equal(result.status, "failed");
+  assert.equal(result.status, "blocked");
   assert.equal(result.taskRuns.length, 2);
   assert.equal(result.taskRuns[0]?.status, "completed");
-  assert.equal(result.taskRuns[1]?.status, "failed");
+  assert.equal(result.taskRuns[1]?.status, "blocked");
   assert.equal(result.taskRuns[1]?.verified, false);
   assert.equal(result.taskRuns[1]?.output.includes("FAIL artifact_presence"), true);
+  assert.equal(result.taskRuns[1]?.verificationResult?.status, "insufficient");
+  assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "artifact_presence" && check.status === "insufficient"), true);
 });
 
 test("workflow runtime honors retry_policy skip for failed tasks and continues dependents", async () => {

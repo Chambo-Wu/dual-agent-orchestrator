@@ -1,5 +1,9 @@
 import type { ToolDefinition, WorkflowPlan, WorkflowTaskKind, WorkflowTaskSpec, WorkflowRole } from "./types.js";
 
+type VerifierProfile = NonNullable<NonNullable<WorkflowTaskSpec["constraints"]>["verifier_profile"]>;
+type RequiredArtifactType = NonNullable<NonNullable<WorkflowTaskSpec["constraints"]>["required_artifact_type"]>;
+type RequiredSchema = NonNullable<NonNullable<WorkflowTaskSpec["constraints"]>["required_schema"]>;
+
 const SUPPORTED_TASK_KINDS = new Set<WorkflowTaskKind>([
   "search",
   "fetch",
@@ -92,6 +96,11 @@ function parseWorkflowTaskSpec(value: unknown): WorkflowTaskSpec | undefined {
         max_tool_rounds: typeof value.constraints.max_tool_rounds === "number" ? value.constraints.max_tool_rounds : undefined,
         max_runtime_seconds: typeof value.constraints.max_runtime_seconds === "number" ? value.constraints.max_runtime_seconds : undefined,
         require_structured_output: typeof value.constraints.require_structured_output === "boolean" ? value.constraints.require_structured_output : undefined,
+        verifier_profile: isNonEmptyString(value.constraints.verifier_profile) ? value.constraints.verifier_profile.trim() as VerifierProfile : undefined,
+        verifier_agent_id: isNonEmptyString(value.constraints.verifier_agent_id) ? value.constraints.verifier_agent_id.trim() : undefined,
+        minimum_artifact_count: typeof value.constraints.minimum_artifact_count === "number" ? value.constraints.minimum_artifact_count : undefined,
+        required_artifact_type: isNonEmptyString(value.constraints.required_artifact_type) ? value.constraints.required_artifact_type.trim() as RequiredArtifactType : undefined,
+        required_schema: isNonEmptyString(value.constraints.required_schema) ? value.constraints.required_schema.trim() as RequiredSchema : undefined,
       }
     : undefined;
 
@@ -179,6 +188,41 @@ export function validateWorkflowPlan(plan: WorkflowPlan, tools: readonly ToolDef
     }
     if (task.retry_policy?.max_attempts !== undefined && task.retry_policy.max_attempts < 0) {
       issues.push(`task ${task.id} has invalid retry max_attempts`);
+    }
+    if (task.constraints?.verifier_profile !== undefined) {
+      if (task.kind !== "verify") {
+        issues.push(`task ${task.id} defines verifier_profile but is not a verify task`);
+      }
+      if (!["system", "system_and_model", "artifact", "file", "json"].includes(task.constraints.verifier_profile)) {
+        issues.push(`task ${task.id} has unsupported verifier_profile: ${task.constraints.verifier_profile}`);
+      }
+    }
+    if (task.constraints?.verifier_agent_id !== undefined && task.kind !== "verify") {
+      issues.push(`task ${task.id} defines verifier_agent_id but is not a verify task`);
+    }
+    if (task.constraints?.minimum_artifact_count !== undefined) {
+      if (task.kind !== "verify") {
+        issues.push(`task ${task.id} defines minimum_artifact_count but is not a verify task`);
+      }
+      if (!Number.isInteger(task.constraints.minimum_artifact_count) || task.constraints.minimum_artifact_count < 0) {
+        issues.push(`task ${task.id} has invalid minimum_artifact_count`);
+      }
+    }
+    if (task.constraints?.required_artifact_type !== undefined) {
+      if (task.kind !== "verify") {
+        issues.push(`task ${task.id} defines required_artifact_type but is not a verify task`);
+      }
+      if (!["file", "text", "json"].includes(task.constraints.required_artifact_type)) {
+        issues.push(`task ${task.id} has unsupported required_artifact_type: ${task.constraints.required_artifact_type}`);
+      }
+    }
+    if (task.constraints?.required_schema !== undefined) {
+      if (task.kind !== "verify") {
+        issues.push(`task ${task.id} defines required_schema but is not a verify task`);
+      }
+      if (task.constraints.required_schema !== "json") {
+        issues.push(`task ${task.id} has unsupported required_schema: ${task.constraints.required_schema}`);
+      }
     }
   }
 

@@ -178,6 +178,11 @@ export interface WorkflowTaskConstraints {
   max_tool_rounds?: number;
   max_runtime_seconds?: number;
   require_structured_output?: boolean;
+  verifier_profile?: "system" | "system_and_model" | "artifact" | "file" | "json";
+  verifier_agent_id?: string;
+  minimum_artifact_count?: number;
+  required_artifact_type?: ExecutorArtifact["type"];
+  required_schema?: "json";
 }
 
 export interface WorkflowTaskSpec {
@@ -293,6 +298,7 @@ export interface TaskRun {
   artifacts: Artifact[];
   attempts: number;
   executorHistory?: readonly ExecutorOutput[];
+  verificationResult?: VerificationResult;
 }
 
 export interface Plan {
@@ -353,6 +359,7 @@ export interface Job {
   artifacts: readonly Artifact[];
   memorySummary?: string;
   workflowGraph?: WorkflowGraph;
+  verificationResult?: VerificationResult;
 }
 
 export interface ToolDefinition {
@@ -373,6 +380,7 @@ export interface VerificationCheck {
   name: string;
   passed: boolean;
   detail: string;
+  status?: "passed" | "failed" | "insufficient";
 }
 
 export interface VerificationResult {

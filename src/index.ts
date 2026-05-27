@@ -292,7 +292,9 @@ async function verifyWorkflowPayload(
     : undefined;
   const verificationResult = await runVerifiers(verificationContext, activeVerifiers);
   const allPassed = verificationResultPassed(verificationResult);
-  const verifiedJob = allPassed ? payload.job : { ...payload.job, verified: false };
+  const verifiedJob = allPassed
+    ? { ...payload.job, verificationResult }
+    : { ...payload.job, verified: false, verificationResult };
   const verifierMeta = verifierAgent
     ? {
         verifier_agent_id: verifierAgent.id,

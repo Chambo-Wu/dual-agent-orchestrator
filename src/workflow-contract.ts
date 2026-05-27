@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, ExecutorArtifact, ExecutorOutput, Job, JobMode, JobStatus, Plan, TaskRun, TaskRunStatus, WorkflowGraph } from "./types.js";
+import type { Artifact, ExecutorArtifact, ExecutorOutput, Job, JobMode, JobStatus, Plan, TaskRun, TaskRunStatus, VerificationResult, WorkflowGraph } from "./types.js";
 
 function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
@@ -76,6 +76,7 @@ export function createTaskRunRecord(params: {
   artifacts?: readonly Artifact[];
   attempts?: number;
   executorHistory?: readonly ExecutorOutput[];
+  verificationResult?: VerificationResult;
 }): TaskRun {
   return {
     id: params.id ?? createId("taskrun"),
@@ -89,6 +90,7 @@ export function createTaskRunRecord(params: {
     artifacts: [...(params.artifacts ?? [])],
     attempts: params.attempts ?? 0,
     executorHistory: params.executorHistory ? [...params.executorHistory] : undefined,
+    verificationResult: params.verificationResult,
   };
 }
 
@@ -120,6 +122,7 @@ export function createJobRecord(params: {
   artifacts?: readonly Artifact[];
   memorySummary?: string;
   workflowGraph?: WorkflowGraph;
+  verificationResult?: VerificationResult;
 }): Job {
   return {
     id: params.id ?? createId("job"),
@@ -133,6 +136,7 @@ export function createJobRecord(params: {
     artifacts: [...(params.artifacts ?? params.taskRuns.flatMap((taskRun) => taskRun.artifacts))],
     memorySummary: params.memorySummary,
     workflowGraph: params.workflowGraph,
+    verificationResult: params.verificationResult,
   };
 }
 

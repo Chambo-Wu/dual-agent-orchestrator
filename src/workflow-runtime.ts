@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { RunLogger } from "./logger.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
-import type { ApprovalRequest, Artifact, OrchestratorConfig, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskRun, WorkflowPlan, WorkflowTaskSpec } from "./types.js";
+import type { ApprovalRequest, Artifact, OrchestratorConfig, PlannerOutput, RegisteredAgent, RoutePolicy, RunOptions, RunTaskResult, TaskRun, VerificationCheck, VerificationResult, WorkflowPlan, WorkflowTaskSpec } from "./types.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord, collectArtifactsFromExecutorHistory } from "./workflow-contract.js";
 import { assessWorkflowExecutionSupport, validateWorkflowPlan } from "./workflow-plan.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
-import { runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
+import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext, type Verifier } from "./verification.js";
 import { persistApprovalRequest } from "./job-store.js";
 import { readJobRecord, updateStoredJobRecord } from "./job-store.js";
 import { setApprovalResolver } from "./job-runtime.js";
@@ -21,6 +21,7 @@ type WorkflowTaskOutcome = {
   artifacts: Artifact[];
   executorHistory: RunTaskResult["executorHistory"];
   attempts: number;
+  verificationResult?: VerificationResult;
 };
 
 type WorkflowTaskOverride = {
@@ -198,6 +199,7 @@ function buildTaskRunFromOutcome(outcome: WorkflowTaskOutcome): TaskRun {
     artifacts: outcome.artifacts,
     attempts: outcome.attempts,
     executorHistory: outcome.executorHistory,
+    verificationResult: outcome.verificationResult,
   });
 }
 
@@ -229,6 +231,7 @@ function buildArchivedTaskRuns(
       artifacts: cloneArtifactsForArchivedTaskRun(outcome.artifacts, archivedTaskRunId),
       attempts: outcome.attempts,
       executorHistory: outcome.executorHistory,
+      verificationResult: outcome.verificationResult,
     });
   });
 }
@@ -330,6 +333,85 @@ function buildTaskLookup(plan: WorkflowPlan): Map<string, WorkflowTaskSpec> {
   return new Map(plan.tasks.map((task) => [task.id, task]));
 }
 
+function resolveVerifierAgent(config: OrchestratorConfig, agentId?: string): RegisteredAgent | undefined {
+  const agents = Object.values(config.agents ?? {});
+  if (agentId) {
+    return agents.find((agent) => agent.id === agentId);
+  }
+  return agents.find((agent) => {
+    const id = agent.id.toLowerCase();
+    const role = agent.role.toLowerCase();
+    return id === "verifier" || role === "verifier" || role.includes("verifier");
+  });
+}
+
+function resolveTaskVerifiers(
+  config: OrchestratorConfig,
+  task: WorkflowTaskSpec,
+  runtimeDeps: RuntimeDeps,
+  options?: RunOptions,
+): { verifiers?: Verifier[]; preflightChecks: VerificationCheck[] } {
+  const preflightChecks: VerificationCheck[] = [];
+  if (task.constraints?.verifier_profile === "system") {
+    return { verifiers: DEFAULT_VERIFIERS, preflightChecks };
+  }
+
+  const wantsModelVerifier = task.constraints?.verifier_profile === "system_and_model"
+    || task.constraints?.verifier_agent_id !== undefined
+    || task.constraints?.verifier_profile === undefined;
+  if (!wantsModelVerifier) {
+    return { verifiers: DEFAULT_VERIFIERS, preflightChecks };
+  }
+
+  const verifierAgent = resolveVerifierAgent(config, task.constraints?.verifier_agent_id);
+  if (!verifierAgent) {
+    if (task.constraints?.verifier_profile === "system_and_model" || task.constraints?.verifier_agent_id) {
+      preflightChecks.push({
+        name: "verifier_agent_resolution",
+        passed: false,
+        status: "failed",
+        detail: task.constraints?.verifier_agent_id
+          ? `Configured verifier_agent_id was not found: ${task.constraints.verifier_agent_id}.`
+          : "No registered verifier agent was found for system_and_model verification.",
+      });
+      return { verifiers: DEFAULT_VERIFIERS, preflightChecks };
+    }
+    return { verifiers: undefined, preflightChecks };
+  }
+  return {
+    verifiers: [
+      ...DEFAULT_VERIFIERS,
+      createModelVerifier(verifierAgent.model, {
+        runChat: runtimeDeps.runChatCompletionDetailed,
+        runOptions: options,
+      }),
+    ],
+    preflightChecks,
+  };
+}
+
+function mergePreflightChecks(result: VerificationResult, preflightChecks: VerificationCheck[]): VerificationResult {
+  if (preflightChecks.length === 0) {
+    return result;
+  }
+  const checks = [...preflightChecks, ...result.checks];
+  const failedChecks = checks.filter((check) => !check.passed);
+  const insufficientChecks = failedChecks.filter((check) => check.status === "insufficient");
+  const hardFailedChecks = failedChecks.filter((check) => check.status !== "insufficient");
+  const status: VerificationResult["status"] = hardFailedChecks.length > 0
+    ? "failed"
+    : insufficientChecks.length > 0
+      ? "insufficient"
+      : "verified";
+  return {
+    status,
+    summary: failedChecks.length === 0
+      ? result.summary
+      : failedChecks.map((check) => `${check.name}: ${check.detail}`).join("; "),
+    checks,
+  };
+}
+
 function buildDependencyOutputs(task: WorkflowTaskSpec, outcomes: Map<string, WorkflowTaskOutcome>): string[] {
   return task.depends_on
     .map((depId) => outcomes.get(depId)?.output ?? "")
@@ -346,6 +428,15 @@ function buildVerificationContext(
     .map((depId) => outcomes.get(depId))
     .filter((outcome): outcome is WorkflowTaskOutcome => Boolean(outcome));
   const taskRuns = dependencyOutcomes.map((outcome) => buildTaskRunFromOutcome(outcome));
+  const acceptance = task.constraints?.minimum_artifact_count !== undefined
+    || task.constraints?.required_artifact_type !== undefined
+    || task.constraints?.required_schema !== undefined
+    ? {
+        minimumArtifactCount: task.constraints.minimum_artifact_count,
+        requiredArtifactType: task.constraints.required_artifact_type,
+        requiredSchema: task.constraints.required_schema,
+      }
+    : undefined;
 
   return {
     jobId: options?.jobId ?? `workflow_${task.id}`,
@@ -355,6 +446,7 @@ function buildVerificationContext(
     taskRuns,
     workspaceRoot: WORKSPACE_ROOT,
     runtimeRoot: RUNTIME_ROOT,
+    acceptance,
   };
 }
 
@@ -1212,17 +1304,25 @@ export async function runWorkflowPlan(
 
       if (effectiveTask.kind === "verify") {
         const verificationContext = buildVerificationContext(goal, effectiveTask, outcomes, options);
-        const verificationResult = await runVerifiers(verificationContext);
+        const verifierSelection = resolveTaskVerifiers(config, effectiveTask, runtimeDeps, options);
+        const verificationResult = mergePreflightChecks(
+          await runVerifiers(verificationContext, verifierSelection.verifiers),
+          verifierSelection.preflightChecks,
+        );
         const passed = verificationResultPassed(verificationResult);
         const verificationSummary = summarizeVerification(verificationResult);
+        const failureStatus = verificationResult.status === "insufficient"
+          ? resolveFailureStatus(effectiveTask, "blocked")
+          : resolveFailureStatus(effectiveTask, "failed");
         let outcome: WorkflowTaskOutcome = {
           task: effectiveTask,
-          status: passed ? "completed" : resolveFailureStatus(effectiveTask, "failed"),
+          status: passed ? "completed" : failureStatus,
           verified: passed,
           output: verificationSummary || (passed ? "Verification passed." : "Verification failed."),
           artifacts: [],
           executorHistory: [],
           attempts: 1,
+          verificationResult,
         };
         const replannedResult = await maybeReplanWorkflow(goal, plan, effectiveTask, outcome, outcomes, routePolicy, step, logger, runtimeDeps, config, state, options);
         if (replannedResult) {

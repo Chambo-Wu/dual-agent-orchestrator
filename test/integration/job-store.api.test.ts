@@ -635,7 +635,10 @@ test("job create endpoint supports team mode with the same control-plane contrac
     assert.equal(body.job.status, "completed");
     assert.equal(body.plan.mode, "team");
     assert.equal(body.step_count, 2);
-    assert.notEqual(readJobRecord(body.job_id), null);
+    const record = readJobRecord(body.job_id);
+    assert.notEqual(record, null);
+    assert.equal(record?.job.verificationResult?.status, "verified");
+    assert.equal(record?.job.verificationResult?.checks.length, 5);
 
     const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
     await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${body.job_id}/events`), eventsRes);
@@ -717,6 +720,8 @@ test("team job create endpoint applies shared verifier result", async () => {
 
     const record = readJobRecord(body.job_id);
     assert.equal(record?.job.verified, false);
+    assert.equal(record?.job.verificationResult?.status, "insufficient");
+    assert.equal(record?.job.verificationResult?.checks.some((check) => check.name === "artifact_presence" && check.status === "insufficient"), true);
 
     const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
     await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${body.job_id}/events`), eventsRes);

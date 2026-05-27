@@ -57,7 +57,11 @@ Schema:
         "instruction": "string",
         "allowed_tools": ["tool1"],
         "depends_on": [],
-        "required": true
+        "required": true,
+        "constraints": {
+          "verifier_profile": "system | system_and_model",
+          "verifier_agent_id": "optional registered verifier agent id"
+        }
       }
     ],
     "finish_when": {

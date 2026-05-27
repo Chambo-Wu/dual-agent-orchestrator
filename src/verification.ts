@@ -12,6 +12,11 @@ export interface VerificationContext {
   taskRuns: TaskRun[];
   workspaceRoot: string;
   runtimeRoot: string;
+  acceptance?: {
+    minimumArtifactCount?: number;
+    requiredArtifactType?: Artifact["type"];
+    requiredSchema?: "json";
+  };
 }
 
 export interface Verifier {
@@ -75,13 +80,23 @@ const ArtifactPresenceVerifier: Verifier = {
     if (context.artifacts.length === 0) {
       const hasNativeTools = context.executorHistory.some((h) => h.tool_calls_made.length > 0);
       if (hasNativeTools) {
-        return { name: "artifact_presence", passed: false, detail: "Tool calls were made but no artifacts were produced." };
+        return {
+          name: "artifact_presence",
+          passed: false,
+          status: "insufficient",
+          detail: "Tool calls were made but no artifacts were produced.",
+        };
       }
       return { name: "artifact_presence", passed: true, detail: "No tools used, no artifacts expected." };
     }
     const emptyPreviews = context.artifacts.filter((a) => !a.contentPreview || a.contentPreview.trim() === "");
     if (emptyPreviews.length === context.artifacts.length) {
-      return { name: "artifact_presence", passed: false, detail: "All artifacts have empty previews." };
+      return {
+        name: "artifact_presence",
+        passed: false,
+        status: "insufficient",
+        detail: "All artifacts have empty previews.",
+      };
     }
     return { name: "artifact_presence", passed: true, detail: `${context.artifacts.length} artifacts present with content.` };
   },
@@ -119,12 +134,53 @@ const UrlReachableVerifier: Verifier = {
   },
 };
 
+const AcceptanceCriteriaVerifier: Verifier = {
+  name: "acceptance_criteria",
+  async verify(context) {
+    const acceptance = context.acceptance;
+    if (!acceptance) {
+      return { name: "acceptance_criteria", passed: true, detail: "No explicit acceptance criteria to check." };
+    }
+
+    const issues: string[] = [];
+    const minimumArtifactCount = acceptance.minimumArtifactCount;
+    if (minimumArtifactCount !== undefined && context.artifacts.length < minimumArtifactCount) {
+      issues.push(`Expected at least ${minimumArtifactCount} artifact(s), found ${context.artifacts.length}.`);
+    }
+
+    if (acceptance.requiredArtifactType) {
+      const matchingArtifacts = context.artifacts.filter((artifact) => artifact.type === acceptance.requiredArtifactType);
+      if (matchingArtifacts.length === 0) {
+        issues.push(`Expected at least one ${acceptance.requiredArtifactType} artifact.`);
+      }
+    }
+
+    if (acceptance.requiredSchema === "json") {
+      const jsonArtifacts = context.artifacts.filter((artifact) => artifact.type === "json");
+      if (jsonArtifacts.length === 0) {
+        issues.push("Expected at least one JSON artifact for required_schema=json.");
+      }
+    }
+
+    if (issues.length > 0) {
+      return {
+        name: "acceptance_criteria",
+        passed: false,
+        status: "insufficient",
+        detail: issues.join(" "),
+      };
+    }
+    return { name: "acceptance_criteria", passed: true, detail: "Explicit acceptance criteria satisfied." };
+  },
+};
+
 export const DEFAULT_VERIFIERS: Verifier[] = [
   FileExistsVerifier,
   SchemaCheckVerifier,
   ArtifactPresenceVerifier,
   GitDiffVerifier,
   UrlReachableVerifier,
+  AcceptanceCriteriaVerifier,
 ];
 
 function truncateForVerifier(value: string, limit = 1200): string {
@@ -213,13 +269,21 @@ export async function runVerifiers(
       v.verify(context).catch((err) => ({
         name: v.name,
         passed: false,
+        status: "failed" as const,
         detail: `Verifier error: ${err instanceof Error ? err.message : String(err)}`,
       })),
     ),
   );
   const failedChecks = checks.filter((check) => !check.passed);
+  const insufficientChecks = failedChecks.filter((check) => check.status === "insufficient");
+  const hardFailedChecks = failedChecks.filter((check) => check.status !== "insufficient");
+  const status: VerificationResult["status"] = hardFailedChecks.length > 0
+    ? "failed"
+    : insufficientChecks.length > 0
+      ? "insufficient"
+      : "verified";
   return {
-    status: failedChecks.length === 0 ? "verified" : "failed",
+    status,
     summary: failedChecks.length === 0
       ? "Verification completed successfully."
       : failedChecks.map((check) => `${check.name}: ${check.detail}`).join("; "),
