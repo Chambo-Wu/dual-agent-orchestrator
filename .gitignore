@@ -6,22 +6,38 @@ notes/
 *.bat
 *.pyc
 __pycache__/
+
+# Local notes and one-off reports
 相关参考.md
 manager-worker-优化规划.md
 2026年主流Ai编程工具分析20260526-01.md
-CLAUDE.md
+20260524-*.md
+yubao*.md
+国产AI大模型报告*.md
 多模型研究总结*.md
-server32124.bat
-*search_result*.json
-*search_results*.json
-*search_results*.txt
+
+# Local tool / assistant metadata
+CLAUDE.md
 open-multi-agent/
 .claude/
 .cao-tasks/
+.atomcode/
+
+# Temporary patches and review notes
 .tmp_patch.txt
 review_findings.txt
-yubao*.md
-国产AI大模型报告*.md
-.atomcode/
-20260524-*.md
+
+# Search artifacts and generated result files
+*search_result*.json
+*search_results*.json
+*search_results*.txt
+combined_search_results.txt
+github_search_result.json
+github_search_results.json
+github_search_raw.json
+github_search.json
+multi_model_search.json
+search_orchestration.json
+
+# Local runtime config
 config/config.yml

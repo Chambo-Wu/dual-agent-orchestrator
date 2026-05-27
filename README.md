@@ -1,31 +1,50 @@
 # Dual Agent Orchestrator
 
-Dual Agent Orchestrator is a generic `planner + executor` runtime for multi-model task execution. It exposes:
+Dual Agent Orchestrator is a local-first `planner + executor` runtime for multi-model task execution. It combines:
 
 - OpenAI-compatible chat APIs
 - Anthropic-style `messages` APIs
 - a job-oriented control plane for long-running work
-- realtime workflow progress streams for frontend clients
+- realtime workflow streams for frontend clients
+- built-in browser pages for job dashboards and timelines
 
 Chinese documentation: [Readme-CN.md](./Readme-CN.md)
 
 Additional project planning docs:
 
-- [路线图-分阶段持续推进与实施清单-20260526.md](./docs/路线图-分阶段持续推进与实施清单-20260526.md)
-
+- [Roadmap And Implementation Checklist](./docs/%E8%B7%AF%E7%BA%BF%E5%9B%BE-%E5%88%86%E9%98%B6%E6%AE%B5%E6%8C%81%E7%BB%AD%E6%8E%A8%E8%BF%9B%E4%B8%8E%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95-20260526.md)
 - [Frontend Recovery Status And CTA Contract](./docs/%E5%89%8D%E7%AB%AF%E6%81%A2%E5%A4%8D%E7%8A%B6%E6%80%81%E4%B8%8ECTA%E5%AF%B9%E6%8E%A5-20260527.md)
 
 ## Overview
 
-The system is built around two model roles:
+The runtime is built around two model roles:
 
-- `planner`: a stronger model that understands the goal, breaks work into steps, audits progress, decides retries, and produces final answers
-- `executor`: a cheaper or more local model that performs deterministic tool work such as reading files, writing files, searching, and fetching URLs
+- `planner`: the stronger model that understands the goal, breaks work into steps, audits progress, decides retries, and produces final answers
+- `executor`: the cheaper or more local model that performs deterministic tool work such as file I/O, shell commands, search, and URL fetching
 
 The current implementation supports both:
 
 - direct chat-style use through `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`
-- first-class task jobs through `/v1/jobs`
+- first-class jobs through `/v1/jobs`
+
+## Current Status
+
+This is now a working orchestration service rather than a CLI skeleton. The current codebase includes:
+
+- OpenAI-compatible and Anthropic-style chat endpoints
+- async job creation with persistent job records
+- task-mode and team-mode job execution
+- planner/executor iteration history, task runs, artifacts, and verification results
+- realtime workflow event streaming over SSE
+- workflow-plan parsing, validation, and runtime execution
+- runtime DAG summaries with active and superseded workflow lanes
+- workflow replan history preserved in job responses
+- structured verification checks carried through job responses, events, and the timeline UI
+- restart recovery with auto-resume, queue metadata, redirect/follow semantics, and CTA actions
+- built-in browser dashboard and timeline pages
+- Cherry Studio-friendly progress mirroring inside standard chat streams
+- protocol compatibility guards for OpenAI-style and Anthropic-style clients
+- file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
 
 ## Terminology
 
@@ -37,42 +56,21 @@ Use these terms consistently across the runtime, API, UI, and planning docs:
 - `task run`: the persisted runtime record for a task execution inside a job
 - `step`: a planner/executor iteration or an event-level progression marker; not the same thing as a `task`
 - `artifact`: a concrete output produced by tools or task execution and persisted for later verification or consumption
-- `verifier`: the system-first verification layer that checks whether outputs are real, valid, and sufficient
+- `verifier`: the verification layer that checks whether outputs are real, valid, and sufficient
 - `retry`: rerun the same job or task intent again
 - `resume`: continue from an interrupted or blocked job through the control plane
 - `replan`: replace or adjust the active workflow after failure or new information
 - `replay`: re-read persisted events from `/events` or `/stream` using `since_seq` or `Last-Event-ID`
 
-## Current Status
-
-This is no longer just a CLI skeleton. The current codebase includes:
-
-- async job creation with persistent job records
-- planner/executor iteration history, task runs, and artifacts
-- realtime workflow event streaming over SSE
-- HTML timeline rendering for jobs
-- workflow-plan parsing, validation, and runtime execution
-- explicit workflow DAG summaries with active and superseded lanes
-- runtime workflow replan history preserved in job responses
-- dependency-graph visualization in the built-in timeline UI
-- replan-to-graph focus interactions in the timeline UI
-- Cherry Studio-friendly progress mirroring inside standard chat streams
-- protocol compatibility guards for OpenAI-style and Anthropic-style clients
-- stronger file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
-
-Milestone note:
-
-- Milestone C is now effectively closed at the runtime and UI-contract level
-- the next phase is mainly Milestone D polish, richer workflow UX, and deeper observability
-
 ## Architecture
 
-- `src/orchestrator.ts`: planner/executor loop, protocol correction, evidence checks, file-write validation
-- `src/tools.ts`: native tools and search/fetch/file execution
-- `src/index.ts`: HTTP API server, chat adapters, job control plane, workflow progress mirroring
+- `src/orchestrator.ts`: planner/executor loop, protocol correction, evidence checks, and file-write validation
+- `src/tools.ts`: native tools plus search/fetch/file execution
+- `src/index.ts`: HTTP API server, chat adapters, job control plane, and browser routes
 - `src/workflow-ui-events.ts`: normalized frontend event schema
 - `src/job-event-bus.ts`: persisted event bus for job streams
 - `src/timeline.ts`: HTML timeline rendering
+- `src/jobs-dashboard.ts`: browser dashboard rendering
 - `src/workflow-plan.ts`: workflow plan schema parsing and validation
 - `src/workflow-runtime.ts`: workflow runtime execution and replan flow
 - `src/workflow-graph.ts`: DAG and replan-history view-model generation
@@ -106,13 +104,13 @@ Notes:
 
 Use `config/example.config.yml` as a template, then copy it to `config/config.yml`.
 
-Edit `config/config.yml`:
+Minimal example:
 
 ```yml
 planner:
-  base_url: "http://127.0.0.1:8790/v1"
+  base_url: "http://127.0.0.1:8080/v1"
   api_key: "env:PLANNER_API_KEY"
-  model: "glm5"
+  model: "GLM-5"
 
 executor:
   base_url: "http://127.0.0.1:1234/v1"
@@ -121,6 +119,7 @@ executor:
 
 policy:
   auto_resume_concurrency: 3
+  task_routing_path: "config/task-routing.yml"
 ```
 
 Put secrets in `.env`:
@@ -128,7 +127,14 @@ Put secrets in `.env`:
 ```env
 PLANNER_API_KEY=your-planner-api-key
 EXECUTOR_API_KEY=your-executor-api-key
+SEARCH_API_KEY=optional-search-api-key
 ```
+
+Notes:
+
+- the runtime loads `config/config.yml` by default
+- `config/example.config.yml` is a sample template and is not loaded automatically
+- `npm run config:validate` and `npm run doctor` validate `config/config.yml` unless you pass a custom path
 
 ## Install And Run
 
@@ -137,12 +143,6 @@ npm install
 npm run build
 npm run config:validate
 ```
-
-Notes:
-
-- the runtime loads `config/config.yml` by default
-- `config/example.config.yml` is only a sample template and is not loaded automatically
-- `npm run config:validate` and `npm run doctor` also validate `config/config.yml` unless you pass a custom path
 
 Run a one-off CLI task:
 
@@ -160,13 +160,18 @@ Default service URL:
 
 - `http://127.0.0.1:9898`
 
+Recommended first browser checks:
+
+- dashboard: `http://127.0.0.1:9898/jobs/dashboard`
+- health: `http://127.0.0.1:9898/health`
+
 Quick health/config self-check:
 
 ```powershell
 npm run doctor
 ```
 
-`npm run doctor` now returns a structured runtime diagnostics report, including:
+`npm run doctor` returns a structured runtime diagnostics report, including:
 
 - config load status
 - planner/executor model readiness
@@ -209,6 +214,8 @@ Job control plane:
 - `GET /v1/jobs/:id/timeline`
 - `POST /v1/jobs/:id/cancel`
 - `POST /v1/jobs/:id/retry`
+- `POST /v1/jobs/:id/approve`
+- `POST /v1/jobs/:id/resume`
 
 Browser-friendly built-in pages:
 
@@ -219,8 +226,6 @@ Browser-friendly built-in pages:
 - `GET /jobs/:id/stream`
 - `GET /jobs/:id/timeline`
 - `POST /jobs/:id/resume`
-- `POST /v1/jobs/:id/approve`
-- `POST /v1/jobs/:id/resume`
 
 ## Streaming Modes
 
@@ -237,7 +242,7 @@ There are two different streaming experiences:
 
 - use `/v1/jobs/:id/stream`
 - emits normalized workflow events for frontend UIs
-- intended for dashboards, timelines, and multi-agent collaboration views
+- intended for dashboards, timelines, and collaboration views
 - supports SSE resume with `Last-Event-ID`
 - supports replay from `since_seq`
 - emits SSE `id:` fields on `job.event` entries
@@ -248,7 +253,7 @@ Replay contract:
 - `GET /v1/jobs/:id/stream?since_seq=N` replays events with `seq > N` before live subscription
 - `GET /v1/jobs/:id/stream` with header `Last-Event-ID: N` resumes from `seq > N`
 - `job.snapshot` includes `replay.next_seq`, `replay.can_resume_from`, `replay.resumed_from_seq`, and `replay.replayed_count`
-- recovery-aware `job.snapshot` payloads also include `follow`, `actions`, and `recovery.auto_resume_status`
+- recovery-aware `job.snapshot` payloads also include `follow`, `actions`, and `snapshot.recovery`
 
 You can explicitly opt into raw workflow SSE events on compatible routes with:
 
@@ -257,7 +262,7 @@ You can explicitly opt into raw workflow SSE events on compatible routes with:
 
 ## Async Jobs
 
-`POST /v1/jobs` supports async task creation for frontend clients.
+`POST /v1/jobs` supports async job creation for frontend clients.
 
 Typical behavior:
 
@@ -274,26 +279,27 @@ The current progress system is designed for both custom frontends and generic cl
 - stage-style progress states such as `planning`, `research`, `evidence`, `filtering`, `synthesis`, and `writing`
 - aggregated tool summaries so repeated `web_search` or `url_fetch` calls do not flood the UI
 - card-style text progress in standard chat streams
-- built-in DAG lanes that now render real dependency graphs instead of simple task lists
+- built-in DAG lanes that render real dependency graphs instead of simple task lists
 - superseded workflow lanes and replan history focus interactions inside `/v1/jobs/:id/timeline`
 - a built-in runtime analysis panel for verification outcomes, artifact activity, tool activity, and common blockers
 - click-to-filter analysis chips that can jump from summary statistics to matching events and related workflow lanes
 - shareable timeline URLs that preserve `workflowFocus`, `analysisFilter`, and `analysisValue`
 - recovery-aware frontend signals such as `job.redirect`, `snapshot.follow`, `snapshot.actions`, and `snapshot.recovery`
+- a browser-friendly `/jobs/dashboard` that summarizes persisted jobs without requiring manual auth headers
 
 Example mirrored progress in chat streams:
 
 ```text
-[Step 2 · Research]
+[Step 2 | Research]
 Completed 3 search rounds, gathered 30 candidate results, and is filtering trustworthy sources.
 
-[Step 3 · Evidence]
+[Step 3 | Evidence]
 Read 5 saved artifacts and is extracting the key details.
 ```
 
 ## Report/File Output Validation
 
-The runtime now guards against false completion for local deliverables.
+The runtime guards against false completion for local deliverables.
 
 If the task says things like:
 
@@ -305,8 +311,6 @@ then a planner `final` answer is no longer enough. The run only completes if:
 
 - the executor actually performs `write_file`
 - and the write target matches the requested output path
-
-This closes the earlier bug where the final answer said a report had been saved even when no file existed on disk.
 
 ## Logs And Persistence
 
@@ -321,7 +325,7 @@ Logs include:
 - planner requests and parsed decisions
 - executor requests and parsed results
 - native tool call start/finish events
-- protocol-correction and loop-detection events
+- protocol-correction, recovery, and loop-detection events
 
 ## Tests
 
@@ -339,7 +343,8 @@ npm run test:e2e-lite
 
 ## Current Limitations
 
-- team-mode control plane is not finished yet; `/v1/jobs` currently supports `mode: "task"`
+- browser dashboard data is still loaded as one list response; very large job histories will benefit from future pagination
+- some integration tests around restart recovery still need cleanup to fully match the newer auto-resume behavior
 - the planner still depends on upstream model reliability
 - web search quality depends heavily on provider quality and query quality
 - some web pages remain JS-rendered or blocked by `403/401/429`, so degraded evidence synthesis is sometimes necessary
@@ -360,6 +365,7 @@ For custom apps:
 - fetch `/v1/jobs/:id/events` for replay or refresh
 - store the last seen SSE `id` and reconnect with `Last-Event-ID`
 - open `/v1/jobs/:id/timeline` for a built-in visualization
+- use `/jobs/dashboard` when you want a zero-setup browser view of persisted jobs
 
 ## Acknowledgments
 
