@@ -16,6 +16,13 @@ export interface JobControlState {
   resumeOf?: string;
   recoveredAt?: string;
   recoveryReason?: "service_restart";
+  autoResumeStatus?: "queued" | "running" | "succeeded" | "failed";
+  autoResumeQueuedAt?: string;
+  autoResumeQueuePosition?: number;
+  autoResumeBatchSize?: number;
+  autoResumeAttemptedAt?: string;
+  autoResumeFailedAt?: string;
+  autoResumeFailureMessage?: string;
 }
 
 export interface StoredJobRecord {

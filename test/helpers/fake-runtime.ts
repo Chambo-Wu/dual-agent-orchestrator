@@ -123,6 +123,7 @@ export function buildMinimalConfig(): OrchestratorConfig {
       plannerHistoryMaxEntries: 4,
       plannerHistoryPreviewChars: 160,
       maxRepeatedExecutorRequests: 2,
+      autoResumeConcurrency: 3,
     },
     taskRoutingPath: "config/task-routing.yml",
   };

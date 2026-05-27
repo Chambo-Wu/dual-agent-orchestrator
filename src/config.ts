@@ -348,6 +348,7 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
       plannerHistoryMaxEntries: readOptionalNumber(policySection, "policy", "planner_history_max_entries", 6, issues, { integer: true, min: 1 }),
       plannerHistoryPreviewChars: readOptionalNumber(policySection, "policy", "planner_history_preview_chars", 180, issues, { integer: true, min: 1 }),
       maxRepeatedExecutorRequests: readOptionalNumber(policySection, "policy", "max_repeated_executor_requests", 2, issues, { integer: true, min: 1 }),
+      autoResumeConcurrency: readOptionalNumber(policySection, "policy", "auto_resume_concurrency", 3, issues, { integer: true, min: 1, max: 32 }),
     },
     taskRoutingPath,
   };

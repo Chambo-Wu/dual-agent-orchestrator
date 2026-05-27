@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { SearchConfig, ToolDefinition, ToolExecutionResult } from "./types.js";
@@ -574,6 +574,15 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
   if (name === "read_file") {
     const path = safePath(args.path);
     try {
+      const stat = statSync(path);
+      if (!stat.isFile()) {
+        return {
+          ok: false,
+          summary: `Failed to read: ${path}`,
+          rawResult: "",
+          error: `Path is not a readable file: ${path}`,
+        };
+      }
       const content = readFileSync(path, "utf8");
       return {
         ok: true,

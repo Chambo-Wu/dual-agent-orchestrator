@@ -1,6 +1,19 @@
+fact_research:
+  matchers: "latest, official, release, releases, announcement, announcing, highlights, changelog, release notes, source, sources, summary"
+  planner_instruction: "Task type: fact_research. Gather official evidence, read artifacts back, and produce a concise sourced summary. Do not force candidate ranking unless the user explicitly asked for comparison."
+  enable_ranking: false
+  require_evidence_before_final: true
+  min_grounded_candidates: 0
+  require_artifact_readback: true
+  require_non_empty_artifact: true
+  preferred_tools: "shell_command, list_files, read_file"
+  artifact_priority: "search result artifact, captured page content, structured JSON output"
+  completion_checklist: "collect official or primary-source evidence, read back at least one non-empty artifact, identify the strongest source for the answer, final answer cites the strongest artifacts and states any evidence gap"
+  fallback_rule: "If official evidence is weak or ambiguous, return a constrained answer that states the evidence gap instead of inventing comparisons."
+
 research:
-  matchers: "github, repository, repositories, research, literature, survey"
-  planner_instruction: "Task type: research. Gather evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion."
+  matchers: "github, repository, repositories, comparison, compare, ranking, rank, evaluate, survey, benchmark"
+  planner_instruction: "Task type: research. Gather comparison evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion."
   enable_ranking: true
   require_evidence_before_final: true
   min_grounded_candidates: 3

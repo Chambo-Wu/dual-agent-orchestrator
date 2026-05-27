@@ -5,9 +5,28 @@ import type { RoutePolicy, TaskType } from "./types.js";
 
 const DEFAULT_TASK_ROUTING: RoutePolicy[] = [
   {
+    type: "fact_research",
+    matchers: ["latest", "official", "release", "releases", "announcement", "announcing", "highlights", "changelog", "release notes", "source", "sources", "summary"],
+    plannerInstruction: "Task type: fact_research. Gather official evidence, read artifacts back, and produce a concise sourced summary. Do not force candidate ranking unless the user explicitly asked for comparison.",
+    enableRanking: false,
+    requireEvidenceBeforeFinal: true,
+    minGroundedCandidates: 0,
+    requireArtifactReadback: true,
+    requireNonEmptyArtifact: true,
+    preferredTools: ["shell_command", "list_files", "read_file"],
+    artifactPriority: ["search result artifact", "captured page content", "structured JSON output"],
+    completionChecklist: [
+      "collect official or primary-source evidence",
+      "read back at least one non-empty artifact",
+      "identify the strongest source for the answer",
+      "final answer cites the strongest artifacts and states any evidence gap",
+    ],
+    fallbackRule: "If official evidence is weak or ambiguous, return a constrained answer that states the evidence gap instead of inventing comparisons.",
+  },
+  {
     type: "research",
-    matchers: ["github", "repository", "repositories", "research", "literature", "survey"],
-    plannerInstruction: "Task type: research. Gather evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion.",
+    matchers: ["github", "repository", "repositories", "comparison", "compare", "ranking", "rank", "evaluate", "survey", "benchmark"],
+    plannerInstruction: "Task type: research. Gather comparison evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion.",
     enableRanking: true,
     requireEvidenceBeforeFinal: true,
     minGroundedCandidates: 3,
@@ -286,4 +305,3 @@ export function loadTaskRoutingConfig(configPath = "config/task-routing.yml"): R
 
   return policies;
 }
-

@@ -60,6 +60,7 @@ policy:
   planner_history_max_entries: 6
   planner_history_preview_chars: 180
   max_repeated_executor_requests: 2
+  auto_resume_concurrency: 3
   task_routing_path: "config/task-routing.yml"
 
 # Search provider configuration (optional)

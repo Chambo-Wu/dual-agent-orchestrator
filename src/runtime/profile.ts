@@ -1,4 +1,4 @@
-import { RUNTIME_ROOT, WORKSPACE_ROOT } from "../paths.js";
+import { ARTIFACTS_ROOT, RUNTIME_ROOT, WORKSPACE_ROOT } from "../paths.js";
 import { TOOL_DEFINITIONS } from "../tools.js";
 import type { OrchestratorConfig, RuntimeProfile } from "../types.js";
 
@@ -85,13 +85,14 @@ export function buildRuntimeProfile(config: OrchestratorConfig): RuntimeProfile 
     filesystem: {
       workspaceRoot: WORKSPACE_ROOT,
       runtimeRoot: RUNTIME_ROOT,
-      writableRoots: [WORKSPACE_ROOT, RUNTIME_ROOT],
+      writableRoots: [WORKSPACE_ROOT, RUNTIME_ROOT, ARTIFACTS_ROOT],
     },
     network,
     diagnostics: {
       configPath: "config/config.yml",
       taskRoutingPath: config.taskRoutingPath ?? "config/task-routing.yml",
       searchProvider: config.search?.provider ?? null,
+      autoResumeConcurrency: config.policy.autoResumeConcurrency,
       dependencyChecks,
     },
     executor: {

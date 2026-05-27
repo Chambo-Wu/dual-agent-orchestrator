@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { __testables as orchestratorTestables } from "../../src/orchestrator.js";
+import { WORKSPACE_ROOT } from "../../src/paths.js";
 import type { ModelResponse } from "../../src/types.js";
 import { buildMinimalConfig, buildRoutePolicy, createFakeChatRunner, createFakeRuntimeDeps, modelResponseFromJson } from "../helpers/fake-runtime.js";
 
@@ -163,6 +166,37 @@ test("assessTaskComplexity keeps comparison-heavy research as orchestrated", () 
   assert.ok(result.score < 4);
 });
 
+test("detectTaskType routes release-note fact research away from comparative research", () => {
+  const routing = [
+    buildRoutePolicy({
+      type: "fact_research",
+      matchers: ["latest", "official", "release", "highlights"],
+      enableRanking: false,
+      minGroundedCandidates: 0,
+      requireEvidenceBeforeFinal: true,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+    }),
+    buildRoutePolicy({
+      type: "research",
+      matchers: ["github", "repository", "compare", "ranking"],
+      enableRanking: true,
+      minGroundedCandidates: 3,
+      requireEvidenceBeforeFinal: true,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+    }),
+    buildRoutePolicy(),
+  ];
+
+  const taskType = orchestratorTestables.detectTaskType(
+    "Research the latest official TypeScript 5.x release highlights and provide a concise sourced summary",
+    routing,
+  );
+
+  assert.equal(taskType, "fact_research");
+});
+
 test("runPlannerStep records and degrades workflow plans during milestone A", async () => {
   const config = buildMinimalConfig();
   const routePolicy = buildRoutePolicy();
@@ -233,4 +267,168 @@ test("runPlannerStep records and degrades workflow plans during milestone A", as
       "workflow.planner.decision",
     ],
   );
+});
+
+test("runPlannerStep scopes research readback requests to current-run artifact paths", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = {
+    ...buildRoutePolicy(),
+    type: "research" as const,
+    requireEvidenceBeforeFinal: true,
+    requireArtifactReadback: true,
+    requireNonEmptyArtifact: true,
+    enableRanking: true,
+    minGroundedCandidates: 1,
+  };
+
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "final",
+      step: "finalize_from_partial_evidence",
+      answer: "Tentative answer without enough grounded readback.",
+      audit: {
+        verdict: "approved",
+        notes: "Attempting to finalize from currently available evidence.",
+      },
+    }),
+  ]);
+
+  const result = await orchestratorTestables.runPlannerStep(
+    config,
+    "Research the latest official TypeScript 5.x release highlights and provide a concise sourced summary",
+    [
+      {
+        status: "success",
+        summary: "Found 10 results",
+        tool_calls_made: [{ tool: "web_search", arguments: { query: "TypeScript 5.x" } }],
+        artifacts: [
+          {
+            type: "json",
+            path: "runtime/command-results/001-web-search.json",
+            content_preview: "[{\"title\":\"TypeScript\"}]",
+          },
+        ],
+        raw_result: "[{\"title\":\"TypeScript\"}]",
+        source: "native_tool",
+      },
+      {
+        status: "success",
+        summary: "Fetched official page",
+        tool_calls_made: [{ tool: "url_fetch", arguments: { url: "https://www.typescriptlang.org/docs" } }],
+        artifacts: [
+          {
+            type: "file",
+            path: "runtime/command-results/002-url-fetch.txt",
+            content_preview: "official docs content",
+          },
+        ],
+        raw_result: "official docs content",
+        source: "native_tool",
+      },
+    ],
+    0,
+    routePolicy,
+    1,
+    undefined,
+    createFakeRuntimeDeps({
+      runChatCompletionDetailed: fakeChat.runner,
+    }),
+  );
+
+  assert.equal(result.status, "need_executor");
+  assert.equal(result.executor_request?.allowed_tools.includes("list_files"), false);
+  assert.equal(result.executor_request?.allowed_tools.includes("read_file"), true);
+  assert.equal(result.executor_request?.instruction.includes("Read only these current-run artifact files"), true);
+  assert.equal(result.executor_request?.instruction.includes("runtime/command-results/001-web-search.json"), true);
+  assert.equal(result.executor_request?.instruction.includes("runtime/command-results/002-url-fetch.txt"), true);
+  assert.equal(result.executor_request?.instruction.includes("Do not inspect unrelated workspace files"), true);
+});
+
+test("runOrchestrator main loop rewrites broad research readback requests to current-run artifact paths", async () => {
+  const config = buildMinimalConfig();
+  config.policy.maxSteps = 3;
+  const routePolicy = {
+    ...buildRoutePolicy(),
+    type: "research" as const,
+    requireEvidenceBeforeFinal: true,
+    requireArtifactReadback: true,
+    requireNonEmptyArtifact: true,
+    enableRanking: true,
+    minGroundedCandidates: 1,
+  };
+
+  const commandDir = resolve(WORKSPACE_ROOT, "runtime", "command-results");
+  const webSearchPath = resolve(commandDir, "test-main-loop-web-search.json");
+  mkdirSync(commandDir, { recursive: true });
+  writeFileSync(webSearchPath, "[{\"title\":\"TypeScript 5.9\"}]", "utf8");
+
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "search",
+      executor_request: {
+        instruction: "Search official TypeScript release sources.",
+        allowed_tools: ["web_search"],
+        expected_output: "search results",
+      },
+      audit: { verdict: "not_applicable", notes: "" },
+    }),
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "readback",
+      executor_request: {
+        instruction: "List and read the strongest non-empty search result artifact, then produce a grounded ranking with inclusion reasons and concerns. Do not invent projects that are not present in the evidence.",
+        allowed_tools: ["read_file", "list_files"],
+        expected_output: "grounded ranking",
+      },
+      audit: { verdict: "retry", notes: "" },
+    }),
+    modelResponseFromJson({
+      status: "final",
+      step: "finalize",
+      answer: "done",
+      audit: { verdict: "approved", notes: "" },
+    }),
+  ]);
+
+  const executorRequests: string[] = [];
+  const result = await orchestratorTestables.runOrchestrator(
+    config,
+    "Research the latest official TypeScript 5.x release highlights and provide a concise sourced summary",
+    undefined,
+    createFakeRuntimeDeps({
+      runChatCompletionDetailed: fakeChat.runner,
+      loadTaskRoutingConfig: () => routePolicy,
+      runExecutorStep: async (_config, planner) => {
+        executorRequests.push(planner.executor_request?.instruction ?? "");
+        if (executorRequests.length === 1) {
+          return {
+            status: "success",
+            summary: "Found search results",
+            tool_calls_made: [{ tool: "web_search", arguments: { query: "TypeScript 5.x latest" } }],
+            artifacts: [{ type: "json", path: webSearchPath, content_preview: "[{\"title\":\"TypeScript 5.9\"}]" }],
+            raw_result: "[{\"title\":\"TypeScript 5.9\"}]",
+            source: "native_tool",
+          };
+        }
+        return {
+          status: "success",
+          summary: `Read file ${webSearchPath}`,
+          tool_calls_made: [{ tool: "read_file", arguments: { path: webSearchPath } }],
+          artifacts: [{ type: "file", path: webSearchPath, content_preview: "[{\"title\":\"TypeScript 5.9\"}]" }],
+          raw_result: "[{\"title\":\"TypeScript 5.9\"}]",
+          source: "native_tool",
+        };
+      },
+    }),
+  );
+
+  assert.equal(result.status, "final");
+  assert.equal(executorRequests.length >= 2, true);
+  assert.equal(executorRequests[1]?.includes("Read only these current-run artifact files"), true);
+  assert.equal(executorRequests[1]?.includes("Do not inspect unrelated workspace files"), true);
+  assert.equal(executorRequests[1]?.includes(webSearchPath), true);
+  assert.equal(executorRequests[1]?.includes("list and read the strongest non-empty search result artifact"), false);
+
+  rmSync(webSearchPath, { force: true });
 });

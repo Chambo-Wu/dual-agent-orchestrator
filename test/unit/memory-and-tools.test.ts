@@ -59,6 +59,18 @@ test("file tools resolve relative paths from workspace root", async () => {
   rmSync(fixtureDir, { recursive: true, force: true });
 });
 
+test("read_file rejects directory paths instead of reading them like files", async () => {
+  const fixtureDir = resolve(WORKSPACE_ROOT, "tmp-tool-dir-read-test");
+  rmSync(fixtureDir, { recursive: true, force: true });
+  mkdirSync(fixtureDir, { recursive: true });
+
+  const readResult = await executeTool("read_file", { path: "tmp-tool-dir-read-test" });
+  assert.equal(readResult.ok, false);
+  assert.equal(readResult.error?.includes("not a readable file"), true);
+
+  rmSync(fixtureDir, { recursive: true, force: true });
+});
+
 test("extended tools reject invalid arguments predictably", async () => {
   resetSearchCache();
   const missingQuery = await executeTool("web_search", {});

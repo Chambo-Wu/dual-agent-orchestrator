@@ -194,6 +194,13 @@ export const CONFIG_SCHEMA: Record<string, ConfigFieldSchema> = {
     default: 2,
     constraints: { integer: true, min: 1 },
   },
+  "policy.auto_resume_concurrency": {
+    type: "number",
+    required: false,
+    description: "Maximum number of interrupted jobs the service auto-resumes concurrently after restart",
+    default: 3,
+    constraints: { integer: true, min: 1, max: 32 },
+  },
   "policy.task_routing_path": {
     type: "string",
     required: false,

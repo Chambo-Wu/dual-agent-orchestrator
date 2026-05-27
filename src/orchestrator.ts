@@ -1,5 +1,5 @@
 import { EXECUTOR_PROMPT, PLANNER_PROMPT } from "./prompts.js";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { parseModelJson } from "./json.js";
@@ -78,7 +78,12 @@ function previewText(input: string, limit = 400): string {
 
 function safeReadTextFile(path: string): string {
   try {
-    return readFileSync(path, "utf8");
+    const resolvedPath = resolve(WORKSPACE_ROOT, path);
+    const stat = statSync(resolvedPath);
+    if (!stat.isFile()) {
+      return "";
+    }
+    return readFileSync(resolvedPath, "utf8");
   } catch {
     return "";
   }
@@ -87,6 +92,165 @@ function safeReadTextFile(path: string): string {
 function safeWriteTextFile(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content, "utf8");
+}
+
+function isReadableFilePath(path: string | undefined): path is string {
+  if (!isNonEmptyString(path)) {
+    return false;
+  }
+  try {
+    return statSync(resolve(WORKSPACE_ROOT, path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isNonEmptyArtifactPreview(preview: string | undefined): boolean {
+  return typeof preview === "string"
+    && preview.trim().length > 0
+    && preview !== "(no output)";
+}
+
+function isEmptyRankingArtifact(artifact: ExecutorOutput["artifacts"][number]): boolean {
+  return typeof artifact.path === "string"
+    && artifact.path.endsWith("-ranking.json")
+    && artifact.content_preview.trim() === "[]";
+}
+
+function isUsableCommandArtifact(artifact: ExecutorOutput["artifacts"][number]): boolean {
+  return isReadableFilePath(artifact.path)
+    && Boolean(artifact.path?.includes("command-results"))
+    && isNonEmptyArtifactPreview(artifact.content_preview)
+    && !isEmptyRankingArtifact(artifact);
+}
+
+function hasUsableRankingArtifact(path: string | undefined): boolean {
+  if (!isReadableFilePath(path)) {
+    return false;
+  }
+  const text = safeReadTextFile(path).trim();
+  return text.length > 0 && text !== "[]";
+}
+
+function getReadableResearchArtifactPaths(executorHistory: ExecutorOutput[], limit = 3): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+
+  for (const item of [...executorHistory].reverse()) {
+    for (const artifact of [...item.artifacts].reverse()) {
+      if (!isUsableCommandArtifact(artifact) || !artifact.path) {
+        continue;
+      }
+      if (seen.has(artifact.path)) {
+        continue;
+      }
+      seen.add(artifact.path);
+      paths.push(artifact.path);
+      if (paths.length >= limit) {
+        return paths;
+      }
+    }
+  }
+
+  return paths;
+}
+
+function buildExplicitArtifactReadInstruction(
+  artifactPaths: readonly string[],
+  purpose: string,
+  options: {
+    rankingArtifactPath?: string;
+    includeRanking?: boolean;
+    fallbackInstruction: string;
+  },
+): PlannerExecutorRequest {
+  const readablePaths = artifactPaths.filter((path) => isReadableFilePath(path));
+  const rankingPath = options.includeRanking && isReadableFilePath(options.rankingArtifactPath)
+    ? options.rankingArtifactPath
+    : undefined;
+
+  const targets = [...(rankingPath ? [rankingPath] : []), ...readablePaths].slice(0, rankingPath ? 4 : 3);
+  if (targets.length === 0) {
+    return {
+      instruction: options.fallbackInstruction,
+      allowed_tools: ["list_files", "read_file"],
+      expected_output: purpose,
+    };
+  }
+
+  const joined = targets.map((path, index) => `${index + 1}. ${path}`).join("\n");
+  return {
+    instruction: `Read only these current-run artifact files and use them to ${purpose}:\n${joined}\nDo not inspect unrelated workspace files. Do not call read_file on any path outside this list.`,
+    allowed_tools: ["read_file"],
+    expected_output: purpose,
+  };
+}
+
+function isBroadResearchReadbackRequest(request: PlannerExecutorRequest | undefined): boolean {
+  if (!request) {
+    return false;
+  }
+  const normalized = request.instruction.toLowerCase();
+  if (!request.allowed_tools.includes("read_file")) {
+    return false;
+  }
+  return normalized.includes("strongest non-empty search result artifact")
+    || normalized.includes("most relevant recent")
+    || normalized.includes("list and read")
+    || normalized.includes("under runtime/command-results")
+    || normalized.includes("list files under runtime/command-results")
+    || normalized.includes("current-run readable artifact") === false && normalized.includes("artifact");
+}
+
+function maybeScopePlannerExecutorRequestToArtifacts(
+  planner: PlannerOutput,
+  executorHistory: ExecutorOutput[],
+  rankingArtifactPath: string | undefined,
+): PlannerOutput {
+  if (planner.status !== "need_executor" || !planner.executor_request) {
+    return planner;
+  }
+
+  if (!isBroadResearchReadbackRequest(planner.executor_request)) {
+    return planner;
+  }
+
+  const readableArtifactPaths = getReadableResearchArtifactPaths(executorHistory);
+  const usableRankingArtifactPath = hasUsableRankingArtifact(rankingArtifactPath) ? rankingArtifactPath : undefined;
+  const scopedRequest = buildExplicitArtifactReadInstruction(
+    readableArtifactPaths,
+    planner.executor_request.expected_output,
+    {
+      rankingArtifactPath: usableRankingArtifactPath,
+      includeRanking: true,
+      fallbackInstruction: planner.executor_request.instruction,
+    },
+  );
+
+  return {
+    ...planner,
+    audit: {
+      verdict: planner.audit.verdict,
+      notes: planner.audit.notes
+        ? `${planner.audit.notes} Runtime corrected the executor request to use only current-run artifact paths.`
+        : "Runtime corrected the executor request to use only current-run artifact paths.",
+    },
+    executor_request: scopedRequest,
+  };
+}
+
+function applyResearchArtifactScoping(
+  planner: PlannerOutput,
+  executorHistory: ExecutorOutput[],
+  rankingArtifactPath: string | undefined,
+): PlannerOutput {
+  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
+
+  if (scopedPlanner.status !== "final") {
+    return scopedPlanner;
+  }
+
+  return maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -502,7 +666,7 @@ export function assessTaskComplexity(userGoal: string, taskType: TaskType, route
   let score = 0;
   const reasons: string[] = [];
 
-  if (taskType === "research" || taskType === "code" || taskType === "data_analysis") {
+  if (taskType === "fact_research" || taskType === "research" || taskType === "code" || taskType === "data_analysis") {
     score -= 5;
     reasons.push(`task type ${taskType} defaults to orchestration`);
   }
@@ -912,8 +1076,8 @@ function hasRecentFetchAccessFailures(executorHistory: ExecutorOutput[]): boolea
 function hasUsableResearchArtifacts(executorHistory: ExecutorOutput[]): boolean {
   return executorHistory.some((item) =>
     item.artifacts.some((artifact) =>
-      Boolean(artifact.path)
-      && artifact.content_preview.trim().length > 0
+      isReadableFilePath(artifact.path)
+      && isNonEmptyArtifactPreview(artifact.content_preview)
       && (artifact.type === "file" || artifact.type === "json")
     )
   );
@@ -922,12 +1086,7 @@ function hasUsableResearchArtifacts(executorHistory: ExecutorOutput[]): boolean 
 function hasReadableFetchedEvidence(executorHistory: ExecutorOutput[]): boolean {
   return executorHistory.some((item) =>
     item.source === "native_tool"
-    && item.artifacts.some((artifact) =>
-      typeof artifact.path === "string"
-      && artifact.path.includes("command-results")
-      && artifact.content_preview.trim().length > 0
-      && artifact.content_preview !== "(no output)"
-    )
+    && item.artifacts.some((artifact) => isUsableCommandArtifact(artifact))
   );
 }
 
@@ -1255,12 +1414,7 @@ function persistRankingArtifact(executorHistory: ExecutorOutput[], logger?: RunL
 export function hasNonEmptyCommandArtifact(executorHistory: ExecutorOutput[]): boolean {
   return executorHistory.some((item) =>
     item.source === "native_tool"
-    && item.artifacts.some((artifact) =>
-      !!artifact.path
-      && artifact.path.includes("command-results")
-      && artifact.content_preview.trim().length > 0
-      && artifact.content_preview !== "(no output)"
-    )
+    && item.artifacts.some((artifact) => isUsableCommandArtifact(artifact))
   );
 }
 
@@ -1269,6 +1423,7 @@ export function hasUsefulArtifactRead(history: ExecutorOutput[]): boolean {
     item.source === "native_tool"
     && item.tool_calls_made.some((call) => call.tool === "read_file")
     && item.status === "success"
+    && item.artifacts.some((artifact) => isReadableFilePath(artifact.path))
   );
 }
 
@@ -1574,63 +1729,74 @@ async function runPlannerStep(
     };
   }
   const planner = parsePlannerOutputRecord(userGoal, parsed, executorHistory.length > 0);
+  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
 
   // Protocol: final with executor_request but no answer
-  if (planner.status === "final" && planner.executor_request && !isNonEmptyString(planner.final_answer)) {
-    planner.status = "need_executor";
-    planner.audit = { verdict: "retry", notes: "Protocol corrected: final with executor_request and no answer." };
+  if (scopedPlanner.status === "final" && scopedPlanner.executor_request && !isNonEmptyString(scopedPlanner.final_answer)) {
+    scopedPlanner.status = "need_executor";
+    scopedPlanner.audit = { verdict: "retry", notes: "Protocol corrected: final with executor_request and no answer." };
   }
 
   // R4+: Research finalization requires actual evidence, even if a markdown file was already written.
-  if (planner.status === "final" && routePolicy.requireEvidenceBeforeFinal) {
+  if (scopedPlanner.status === "final" && routePolicy.requireEvidenceBeforeFinal) {
     const researchAccessDegraded = hasRecentFetchAccessFailures(executorHistory)
       && hasReadableFetchedEvidence(executorHistory)
       && hasUsableResearchArtifacts(executorHistory);
 
+    const usableRankingArtifactPath = hasUsableRankingArtifact(rankingArtifactPath) ? rankingArtifactPath : undefined;
+    const readableArtifactPaths = getReadableResearchArtifactPaths(executorHistory);
+
     if (researchAccessDegraded && !hasUsefulArtifactRead(executorHistory)) {
-      planner.status = "need_executor";
-      planner.audit = {
+      scopedPlanner.status = "need_executor";
+      scopedPlanner.audit = {
         verdict: "retry",
         notes: "Research degraded: recent url_fetch calls were blocked by source-site access limits, so continue from the artifacts already collected instead of expanding search.",
       };
-      planner.executor_request = {
-        instruction: rankingArtifactPath
-          ? `Read the ranking artifact at ${rankingArtifactPath} plus the strongest already-fetched evidence artifact, then write a constrained evidence summary. Clearly separate confirmed facts from gaps caused by 403/401/429 source restrictions. Do not call web_search or url_fetch again unless a local artifact is unreadable.`
-          : "Read the strongest already-fetched evidence artifact under runtime/command-results, then write a constrained evidence summary. Clearly separate confirmed facts from gaps caused by 403/401/429 source restrictions. Do not call web_search or url_fetch again unless a local artifact is unreadable.",
-        allowed_tools: rankingArtifactPath ? ["read_file"] : ["list_files", "read_file"],
-        expected_output: "Grounded summary based only on the existing readable artifacts, with explicit evidence gaps.",
-      };
-      planner.final_answer = undefined;
+      scopedPlanner.executor_request = buildExplicitArtifactReadInstruction(
+        readableArtifactPaths,
+        "write a constrained evidence summary with explicit evidence gaps",
+        {
+          rankingArtifactPath: usableRankingArtifactPath,
+          includeRanking: true,
+          fallbackInstruction: "List files under runtime/command-results and read only a current-run readable artifact to produce a constrained evidence summary with explicit evidence gaps.",
+        },
+      );
+      scopedPlanner.final_answer = undefined;
     } else if (!researchAccessDegraded
       && routePolicy.requireArtifactReadback
       && !hasUsefulArtifactRead(executorHistory)
       && executorHistory.some((i) => i.artifacts.some((a) => a.path?.includes("command-results")))) {
-      planner.status = "need_executor";
-      planner.audit = { verdict: "retry", notes: "Research: search results exist but were not read back." };
-      planner.executor_request = {
-        instruction: "Read the most relevant recent file under runtime/command-results and extract the strongest candidates.",
-        allowed_tools: ["list_files", "read_file"],
-        expected_output: "Structured summary of candidates.",
-      };
-      planner.final_answer = undefined;
+      scopedPlanner.status = "need_executor";
+      scopedPlanner.audit = { verdict: "retry", notes: "Research: search results exist but were not read back." };
+      scopedPlanner.executor_request = buildExplicitArtifactReadInstruction(
+        readableArtifactPaths,
+        "extract the strongest candidates into a structured summary",
+        {
+          fallbackInstruction: "List files under runtime/command-results and read only a current-run readable artifact file, then extract the strongest candidates into a structured summary.",
+        },
+      );
+      scopedPlanner.final_answer = undefined;
     } else if (!researchAccessDegraded && !hasSufficientEvidenceForRoute(executorHistory, routePolicy)) {
-      planner.status = "need_executor";
-      planner.audit = {
+      scopedPlanner.status = "need_executor";
+      scopedPlanner.audit = {
         verdict: "retry",
         notes: `Insufficient evidence for final answer. Candidate count=${getGroundedCandidateCount(executorHistory)}; required minimum=${routePolicy.minGroundedCandidates}; readback=${routePolicy.requireArtifactReadback}; non_empty_artifact=${routePolicy.requireNonEmptyArtifact}.`,
       };
-      planner.executor_request = {
-        instruction: rankingArtifactPath
-          ? `Read the ranking artifact at ${rankingArtifactPath} and the strongest non-empty search result artifact, then produce a grounded ranking with inclusion reasons and concerns. Do not invent projects that are not present in the evidence.`
-          : "List and read the strongest non-empty search result artifact, then produce a grounded ranking with inclusion reasons and concerns. Do not invent projects that are not present in the evidence.",
-        allowed_tools: rankingArtifactPath ? ["read_file"] : ["list_files", "read_file"],
-        expected_output: `Structured evidence summary with at least ${routePolicy.minGroundedCandidates} grounded candidate projects when candidate comparison applies, each including full_name, url, stars when available, inclusion reason, and concerns.`,
-      };
-      planner.final_answer = undefined;
+      scopedPlanner.executor_request = buildExplicitArtifactReadInstruction(
+        readableArtifactPaths,
+        `produce a grounded ranking with at least ${routePolicy.minGroundedCandidates} grounded candidate projects when candidate comparison applies, each including full_name, url, stars when available, inclusion reason, and concerns`,
+        {
+          rankingArtifactPath: usableRankingArtifactPath,
+          includeRanking: true,
+          fallbackInstruction: "List files under runtime/command-results and read only current-run readable search artifacts, then produce a grounded ranking with inclusion reasons and concerns.",
+        },
+      );
+      scopedPlanner.final_answer = undefined;
     }
   }
 
-  const normalizedPlanner = applyWorkflowMilestoneAFallback(planner, stepNumber, logger, options);
+  const fullyScopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath);
+  const normalizedPlanner = applyWorkflowMilestoneAFallback(fullyScopedPlanner, stepNumber, logger, options);
 
   logger?.log("planner.response.parsed", { step: stepNumber, parsed: normalizedPlanner });
   options?.onEvent?.({
@@ -2087,11 +2253,13 @@ export async function runOrchestrator(
         verdict: "retry",
         notes: "Protocol corrected: search results exist in artifacts but were not read back for synthesis before final answer.",
       };
-      planner.executor_request = {
-        instruction: "Read the most relevant recent file under runtime/command-results and extract the strongest candidate projects with reasons they match the user goal.",
-        allowed_tools: ["list_files", "read_file"],
-        expected_output: "Structured summary of the recent search artifact with candidate projects, relevance reasons, and ranking evidence.",
-      };
+      planner.executor_request = buildExplicitArtifactReadInstruction(
+        getReadableResearchArtifactPaths(executorHistory),
+        "extract the strongest candidate projects with reasons they match the user goal",
+        {
+          fallbackInstruction: "List files under runtime/command-results, select a readable non-directory artifact file with non-empty content, then read it and extract the strongest candidate projects with reasons they match the user goal. Never call read_file on a directory path.",
+        },
+      );
       planner.final_answer = undefined;
     }
 
@@ -2111,17 +2279,26 @@ export async function runOrchestrator(
         verdict: "retry",
         notes: "Protocol corrected: research final answer requires at least one non-empty search artifact and one successful artifact read.",
       };
-      planner.executor_request = {
-        instruction: rankingArtifactPath
-          ? `Read the ranking artifact at ${rankingArtifactPath} and the most relevant recent search result artifact under runtime/command-results, then produce a structured evidence summary for final answering.`
-          : "List files under runtime/command-results and read the most relevant recent non-empty search result artifact, then produce a structured evidence summary for final answering.",
-        allowed_tools: rankingArtifactPath ? ["read_file"] : ["list_files", "read_file"],
-        expected_output: "Structured evidence summary derived from recent non-empty research artifacts.",
-      };
+      const usableRankingArtifactPath = hasUsableRankingArtifact(rankingArtifactPath) ? rankingArtifactPath : undefined;
+      planner.executor_request = buildExplicitArtifactReadInstruction(
+        getReadableResearchArtifactPaths(executorHistory),
+        "produce a structured evidence summary derived from recent non-empty research artifacts",
+        {
+          rankingArtifactPath: usableRankingArtifactPath,
+          includeRanking: true,
+          fallbackInstruction: "List files under runtime/command-results and read the most relevant recent non-empty search result artifact, then produce a structured evidence summary for final answering.",
+        },
+      );
       planner.final_answer = undefined;
     }
 
-    const normalizedPlanner = applyWorkflowMilestoneAFallback(planner, step + 1, logger, options);
+    const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
+    const normalizedPlanner = applyWorkflowMilestoneAFallback(
+      maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath),
+      step + 1,
+      logger,
+      options,
+    );
 
     const currentRequestKey = normalizedPlanner.status === "need_executor" && normalizedPlanner.executor_request
       ? normalizeRequestKey(normalizedPlanner.executor_request)
@@ -2286,7 +2463,10 @@ export async function runOrchestrator(
 
 export const __testables = {
   assessTaskComplexity,
+  detectTaskType,
+  getRoutePolicy,
   runPlannerStep,
+  runOrchestrator,
   finalizeExecutorResult,
   buildPlannerMessages,
   buildExecutorMessages,

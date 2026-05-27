@@ -1,0 +1,74 @@
+planner:
+  # Use the most stable reasoning-capable model you have available here.
+  # Keep the planner focused on short, deterministic control decisions.
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "env:PLANNER_API_KEY"
+  model: "REPLACE_WITH_STABLE_PLANNER_MODEL"
+  timeout_ms: 45000
+  max_tokens: 4096
+  temperature: 0
+
+executor:
+  # Use a tool-calling model with proven low-latency behavior on your gateway.
+  base_url: "http://127.0.0.1:1234/v1"
+  api_key: "env:EXECUTOR_API_KEY"
+  model: "REPLACE_WITH_STABLE_EXECUTOR_MODEL"
+  timeout_ms: 30000
+  max_tokens: 3072
+  temperature: 0
+
+# Demo-first split: keep research/search on a dedicated executor profile so the
+# planner is not also carrying large writing/synthesis behavior during lookup.
+default_executor_agent: "researcher"
+agents:
+  researcher:
+    role: "researcher"
+    model:
+      base_url: "http://127.0.0.1:1234/v1"
+      api_key: "env:EXECUTOR_API_KEY"
+      model: "REPLACE_WITH_STABLE_RESEARCH_EXECUTOR"
+      timeout_ms: 30000
+      max_tokens: 3072
+      temperature: 0
+    tools:
+      allow: ["web_search", "url_fetch", "read_file"]
+      deny: ["write_file", "shell_command"]
+    limits:
+      max_concurrency: 1
+
+  writer:
+    role: "writer"
+    model:
+      base_url: "http://127.0.0.1:1235/v1"
+      api_key: "env:EXECUTOR_API_KEY"
+      model: "REPLACE_WITH_STABLE_WRITER_EXECUTOR"
+      timeout_ms: 30000
+      max_tokens: 3072
+      temperature: 0
+    tools:
+      allow: ["read_file", "write_file"]
+      deny: ["web_search", "shell_command"]
+    limits:
+      max_concurrency: 1
+
+policy:
+  # Conservative limits for demo reliability. Fail fast and keep prompts small.
+  max_steps: 6
+  max_replans: 1
+  max_tool_retries: 1
+  planner_history_max_entries: 3
+  planner_history_preview_chars: 120
+  max_repeated_executor_requests: 1
+  auto_resume_concurrency: 2
+  task_routing_path: "config/task-routing.yml"
+
+search:
+  # Prefer a stable API-backed provider for demos.
+  # Avoid HTML scraping unless it is the only option in your environment.
+  provider: bing_api
+  fallback_enabled: false
+  api_key: "env:SEARCH_API_KEY"
+  timeout_ms: 10000
+  bing_api:
+    endpoint: "https://api.bing.microsoft.com/v7.0/search"
+    market: "en-US"

@@ -68,6 +68,7 @@ export interface OrchestratorConfig {
     plannerHistoryMaxEntries: number;
     plannerHistoryPreviewChars: number;
     maxRepeatedExecutorRequests: number;
+    autoResumeConcurrency: number;
   };
   taskRoutingPath?: string;
 }
@@ -94,6 +95,7 @@ export interface RuntimeProfile {
     configPath: string;
     taskRoutingPath: string;
     searchProvider: string | null;
+    autoResumeConcurrency: number;
     dependencyChecks: Array<{
       name: string;
       status: "ok" | "warning";
@@ -114,7 +116,7 @@ export interface RuntimeProfile {
   }>;
 }
 
-export type TaskType = "research" | "web_search" | "code" | "data_analysis" | "file_ops" | "shell_ops" | "general";
+export type TaskType = "fact_research" | "research" | "web_search" | "code" | "data_analysis" | "file_ops" | "shell_ops" | "general";
 export type ExecutionMode = "direct" | "orchestrated";
 
 export interface TaskComplexityAssessment {

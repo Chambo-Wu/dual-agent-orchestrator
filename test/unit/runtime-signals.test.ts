@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { compressJsonOutput, compressToolOutput } from "../../src/compress.js";
 import { LoopDetector } from "../../src/loop-detector.js";
 import { hasNonEmptyCommandArtifact, hasSuccessfulWrite, hasUsefulArtifactRead } from "../../src/orchestrator.js";
+import { WORKSPACE_ROOT } from "../../src/paths.js";
 import type { ExecutorOutput } from "../../src/types.js";
 
 test("loop detector identifies repeated missing-file failures", () => {
@@ -67,12 +70,21 @@ test("loop detector attributes repeated tool failure to the last failed tool cal
 });
 
 test("artifact signal helpers distinguish command artifacts, readback, and writes", () => {
+  const commandDir = resolve(WORKSPACE_ROOT, "tmp-runtime-signals", "command-results");
+  const noteDir = resolve(WORKSPACE_ROOT, "tmp-runtime-signals", "notes");
+  const commandFile = resolve(commandDir, "out.json");
+  const noteFile = resolve(noteDir, "out.md");
+  mkdirSync(commandDir, { recursive: true });
+  mkdirSync(noteDir, { recursive: true });
+  writeFileSync(commandFile, "{\"items\":[]}", "utf8");
+  writeFileSync(noteFile, "ok", "utf8");
+
   const history: ExecutorOutput[] = [
     {
       status: "success",
       summary: "command output",
       tool_calls_made: [{ tool: "shell_command", arguments: {} }],
-      artifacts: [{ type: "file", path: "/tmp/runtime/command-results/out.json", content_preview: "{\"items\":[]}" }],
+      artifacts: [{ type: "file", path: commandFile, content_preview: "{\"items\":[]}" }],
       raw_result: "{\"items\":[]}",
       source: "native_tool",
     },
@@ -80,7 +92,7 @@ test("artifact signal helpers distinguish command artifacts, readback, and write
       status: "success",
       summary: "read output",
       tool_calls_made: [{ tool: "read_file", arguments: {} }],
-      artifacts: [{ type: "file", path: "/tmp/runtime/command-results/out.json", content_preview: "content" }],
+      artifacts: [{ type: "file", path: commandFile, content_preview: "content" }],
       raw_result: "content",
       source: "native_tool",
     },
@@ -88,7 +100,7 @@ test("artifact signal helpers distinguish command artifacts, readback, and write
       status: "success",
       summary: "wrote output",
       tool_calls_made: [{ tool: "write_file", arguments: {} }],
-      artifacts: [{ type: "file", path: "/tmp/runtime/notes/out.md", content_preview: "ok" }],
+      artifacts: [{ type: "file", path: noteFile, content_preview: "ok" }],
       raw_result: "ok",
       source: "native_tool",
     },
@@ -97,6 +109,39 @@ test("artifact signal helpers distinguish command artifacts, readback, and write
   assert.equal(hasNonEmptyCommandArtifact(history), true);
   assert.equal(hasUsefulArtifactRead(history), true);
   assert.equal(hasSuccessfulWrite(history), true);
+
+  rmSync(resolve(WORKSPACE_ROOT, "tmp-runtime-signals"), { recursive: true, force: true });
+});
+
+test("artifact signal helpers ignore empty ranking artifacts and directory paths", () => {
+  const fixtureDir = resolve(WORKSPACE_ROOT, "tmp-runtime-signals-empty-ranking");
+  const rankingFile = resolve(fixtureDir, "empty-ranking.json");
+  mkdirSync(fixtureDir, { recursive: true });
+  writeFileSync(rankingFile, "[]", "utf8");
+
+  const history: ExecutorOutput[] = [
+    {
+      status: "success",
+      summary: "directory listing artifact",
+      tool_calls_made: [{ tool: "list_files", arguments: {} }],
+      artifacts: [{ type: "json", path: fixtureDir, content_preview: "[\"a.json\"]" }],
+      raw_result: "[\"a.json\"]",
+      source: "native_tool",
+    },
+    {
+      status: "success",
+      summary: "empty ranking artifact",
+      tool_calls_made: [{ tool: "read_file", arguments: {} }],
+      artifacts: [{ type: "file", path: rankingFile, content_preview: "[]" }],
+      raw_result: "[]",
+      source: "native_tool",
+    },
+  ];
+
+  assert.equal(hasNonEmptyCommandArtifact(history), false);
+  assert.equal(hasUsefulArtifactRead(history), true);
+
+  rmSync(fixtureDir, { recursive: true, force: true });
 });
 
 test("compression keeps short text intact and summarizes long JSON", () => {

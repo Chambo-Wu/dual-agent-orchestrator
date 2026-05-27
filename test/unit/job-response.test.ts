@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { __testables } from "../../src/index.js";
-import { renderTimelineHtml } from "../../src/timeline.js";
+import { readTimelineUiStateFromUrl, reduceTimelineUiState, renderTimelineHtml, writeTimelineUiStateToUrl } from "../../src/timeline.js";
 import { normalizeWorkflowEvent } from "../../src/workflow-ui-events.js";
+import { WORKSPACE_ROOT } from "../../src/paths.js";
 import type { StoredJobRecord } from "../../src/job-store.js";
 import type { Artifact, Job, Plan, TaskRun } from "../../src/types.js";
 
@@ -280,6 +283,176 @@ test("buildJobEvents classifies failure categories for blocked and failed record
   assert.equal(recoveryEvent?.meta.failure_category, "environment_failure");
 });
 
+test("buildJobResponse reflects live executor status and artifact count from persisted events", () => {
+  const taskRunId = "task_live";
+  const record = buildRecord([
+    {
+      id: taskRunId,
+      title: "Live task",
+      description: "running",
+      status: "in_progress",
+      assignee: "worker",
+      dependsOn: [],
+      verified: false,
+      output: "running",
+      artifacts: [],
+      attempts: 2,
+    },
+  ]);
+  record.job.id = "job_live_snapshot";
+  record.plan.id = "plan_live_snapshot";
+  record.job.status = "running";
+  record.job.output = "running";
+
+  const jobDir = resolve(WORKSPACE_ROOT, "runtime", "jobs", record.job.id);
+  mkdirSync(jobDir, { recursive: true });
+  writeFileSync(resolve(jobDir, "events.jsonl"), [
+    JSON.stringify({
+      id: "evt_1",
+      jobId: record.job.id,
+      seq: 1,
+      time: new Date().toISOString(),
+      agent: "executor",
+      phase: "result",
+      type: "executor.failed",
+      title: "Executor result",
+      summary: "failed summary",
+      status: "failed",
+      step: 2,
+      taskRunId,
+      meta: {
+        executor_status: "failed",
+        artifact_count: 2,
+      },
+    }),
+  ].join("\n"), "utf8");
+
+  const response = __testables.buildJobResponse(record) as {
+    artifact_count: number;
+    latest_step: { latest_executor_status: string | null };
+  };
+
+  assert.equal(response.artifact_count, 2);
+  assert.equal(response.latest_step.latest_executor_status, "failed");
+
+  rmSync(jobDir, { recursive: true, force: true });
+});
+
+test("buildJobResponse exposes follow target when a job has been resumed", () => {
+  const record = buildRecord([
+    {
+      id: "task_resumed_source",
+      title: "Resumed source",
+      description: "source",
+      status: "blocked",
+      assignee: "worker",
+      dependsOn: [],
+      verified: false,
+      output: "interrupted",
+      artifacts: [],
+      attempts: 1,
+    },
+  ]);
+  record.job.id = "job_resumed_source";
+  record.job.status = "blocked";
+  record.control = {
+    recoveredAt: new Date().toISOString(),
+    recoveryReason: "service_restart",
+    resumedToJobId: "job_resumed_target",
+  };
+
+  const response = __testables.buildJobResponse(record) as {
+    follow?: { type?: string; job_id?: string; stream_url?: string };
+    actions?: Array<{ id?: string; label?: string; href?: string }>;
+  };
+
+  assert.equal(response.follow?.type, "resumed_job");
+  assert.equal(response.follow?.job_id, "job_resumed_target");
+  assert.equal(response.follow?.stream_url, "/v1/jobs/job_resumed_target/stream");
+  assert.equal(response.actions?.some((action) => action.id === "open_resumed_timeline"), true);
+});
+
+test("buildJobEvents and snapshot expose structured auto-resume failure state", () => {
+  const record = buildRecord([
+    {
+      id: "task_resume_failed",
+      title: "Resume failed source",
+      description: "source",
+      status: "blocked",
+      assignee: "worker",
+      dependsOn: [],
+      verified: false,
+      output: "interrupted",
+      artifacts: [],
+      attempts: 1,
+    },
+  ]);
+  record.job.id = "job_resume_failed_source";
+  record.job.status = "blocked";
+  record.control = {
+    recoveredAt: new Date().toISOString(),
+    recoveryReason: "service_restart",
+    autoResumeAttemptedAt: new Date().toISOString(),
+    autoResumeFailedAt: new Date().toISOString(),
+    autoResumeFailureMessage: "planner unavailable",
+  };
+
+  const events = __testables.buildJobEvents(record);
+  const recoveryEvent = events.find((event) => event.type === "job.recovered");
+  assert.equal(recoveryEvent?.summary.includes("Automatic resume failed"), true);
+  assert.equal(recoveryEvent?.meta.auto_resume_failure_message, "planner unavailable");
+
+  const response = __testables.buildJobResponse(record) as {
+    control?: { autoResumeFailedAt?: string; autoResumeFailureMessage?: string };
+    actions?: Array<{ id?: string; label?: string; href?: string; method?: string }>;
+  };
+  assert.equal(typeof response.control?.autoResumeFailedAt, "string");
+  assert.equal(response.control?.autoResumeFailureMessage, "planner unavailable");
+  assert.equal(response.actions?.some((action) => action.id === "resume_now" && action.method === "POST"), true);
+});
+
+test("timeline html renders CTA actions and queued recovery details", () => {
+  const html = renderTimelineHtml(
+    "job_cta_test",
+    [],
+    "CTA test",
+    "blocked",
+    undefined,
+    {
+      actions: [
+        {
+          id: "resume_now",
+          label: "Resume Now",
+          kind: "api",
+          href: "/v1/jobs/job_cta_test/resume",
+          method: "POST",
+          emphasis: "primary",
+        },
+        {
+          id: "open_resumed_timeline",
+          label: "Open Resumed Timeline",
+          kind: "link",
+          href: "/v1/jobs/job_new/timeline",
+          emphasis: "secondary",
+        },
+      ],
+      recovery: {
+        auto_resume_status: "queued",
+        auto_resume_queue_position: 2,
+        auto_resume_batch_size: 5,
+        auto_resume_concurrency: 3,
+      },
+    },
+  );
+
+  assert.equal(html.includes("Automatic Resume Queued"), true);
+  assert.equal(html.includes("Resume Now"), true);
+  assert.equal(html.includes("data-api-action=\"/v1/jobs/job_cta_test/resume\""), true);
+  assert.equal(html.includes("Open Resumed Timeline"), true);
+  assert.equal(html.includes("2 of 5"), true);
+  assert.equal(html.includes("service concurrency is 3"), true);
+});
+
 test("timeline html renders workflow summary details in the header", () => {
   const html = renderTimelineHtml(
     "job_workflow_1",
@@ -408,6 +581,9 @@ test("timeline html renders runtime analysis summaries", () => {
         taskRunId: "t2",
         meta: {
           artifact_id: "artifact_report_1",
+          artifact_type: "file",
+          path: "runtime/command-results/report.md",
+          content_preview: "# Report\n\nCollected evidence:\n- item 1\n- item 2",
           related_task_run_id: "t2",
         },
       },
@@ -469,6 +645,11 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes("Tool activity"), true);
   assert.equal(html.includes("web_search"), true);
   assert.equal(html.includes("Common issues"), true);
+  assert.equal(html.includes('id="detail-pane"'), true);
+  assert.equal(html.includes('id="detail-content"'), true);
+  assert.equal(html.includes("Select a task, artifact, or verification check to inspect its details."), true);
+  assert.equal(html.includes("selectionKind"), true);
+  assert.equal(html.includes("selectionValue"), true);
   assert.equal(html.includes("verification_failure"), true);
   assert.equal(html.includes('data-analysis-filter="verifier"'), true);
   assert.equal(html.includes('data-analysis-filter="verification_check"'), true);
@@ -486,6 +667,9 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes('data-artifact-id="artifact_report_1"'), true);
   assert.equal(html.includes('data-task-run-id="t2"'), true);
   assert.equal(html.includes('data-related-task-run-id="t2"'), true);
+  assert.equal(html.includes('data-task-status="completed"'), true);
+  assert.equal(html.includes('data-attempts="1"'), true);
+  assert.equal(html.includes('data-artifact-path="runtime/command-results/report.md"'), true);
   assert.equal(html.includes('data-event-tool="web_search"'), true);
   assert.equal(html.includes('data-failure-category="verification_failure"'), true);
   assert.equal(html.includes('data-assignee="verifier"'), true);
@@ -493,6 +677,8 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes('data-clear-analysis-filter'), true);
   assert.equal(html.includes("Show all events"), true);
   assert.equal(html.includes("is-analysis-match"), true);
+  assert.equal(html.includes('&quot;content_preview&quot;: &quot;# Report\\n\\nCollected evidence:\\n- item 1\\n- item 2&quot;'), true);
+  assert.equal(html.includes("Related Artifacts"), true);
 });
 
 test("timeline html renders dependency graph lanes with SVG edges", () => {
@@ -663,6 +849,70 @@ test("timeline html renders replan history focus hooks", () => {
   assert.equal(html.includes('Focused: superseded lane'), true);
   assert.equal(html.includes('Focused: replacement lane'), true);
   assert.equal(html.includes('Click again to switch to replacement lane'), true);
+});
+
+test("timeline UI state keeps task selection while clearing analysis filter", () => {
+  const state = reduceTimelineUiState(
+    {
+      workflowFocus: null,
+      analysisFilter: { kind: "tool", value: "web_search" },
+      selection: { kind: "task", taskId: "t2" },
+    },
+    { type: "clear_analysis_filter" },
+  );
+
+  assert.deepEqual(state.analysisFilter, null);
+  assert.deepEqual(state.selection, { kind: "task", taskId: "t2" });
+});
+
+test("timeline UI state syncs artifact selection into artifact filter", () => {
+  const state = reduceTimelineUiState(
+    {
+      workflowFocus: null,
+      analysisFilter: null,
+      selection: { kind: "task", taskId: "t1" },
+    },
+    { type: "select_artifact", artifactId: "artifact_report_1" },
+  );
+
+  assert.deepEqual(state.analysisFilter, { kind: "artifact", value: "artifact_report_1" });
+  assert.deepEqual(state.selection, { kind: "artifact", artifactId: "artifact_report_1" });
+});
+
+test("timeline UI state applies verification filter and selection together", () => {
+  const state = reduceTimelineUiState(
+    {
+      workflowFocus: null,
+      analysisFilter: null,
+      selection: null,
+    },
+    { type: "apply_analysis_filter", kind: "verification_check", value: "artifact_presence:insufficient" },
+  );
+
+  assert.deepEqual(state.analysisFilter, { kind: "verification_check", value: "artifact_presence:insufficient" });
+  assert.deepEqual(state.selection, { kind: "verification_check", checkKey: "artifact_presence:insufficient" });
+});
+
+test("timeline UI state round-trips URL state for history restoration", () => {
+  const baseUrl = "https://example.test/v1/jobs/job_1/timeline";
+  const taskState = reduceTimelineUiState(
+    {
+      workflowFocus: null,
+      analysisFilter: null,
+      selection: null,
+    },
+    { type: "select_task", taskId: "t2" },
+  );
+  const artifactState = reduceTimelineUiState(taskState, { type: "select_artifact", artifactId: "artifact_report_1" });
+  const focusedState = reduceTimelineUiState(artifactState, { type: "apply_workflow_focus", workflowId: "wf_analysis" });
+
+  const taskUrl = writeTimelineUiStateToUrl(baseUrl, taskState);
+  const artifactUrl = writeTimelineUiStateToUrl(baseUrl, artifactState);
+  const focusedUrl = writeTimelineUiStateToUrl(baseUrl, focusedState);
+
+  assert.deepEqual(readTimelineUiStateFromUrl(taskUrl), taskState);
+  assert.deepEqual(readTimelineUiStateFromUrl(artifactUrl), artifactState);
+  assert.deepEqual(readTimelineUiStateFromUrl(focusedUrl), focusedState);
 });
 
 test("workflow UI normalizes replanned and superseded events", () => {

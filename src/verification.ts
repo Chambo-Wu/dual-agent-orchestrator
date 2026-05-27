@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { parseModelJson } from "./json.js";
@@ -54,7 +54,16 @@ const FileExistsVerifier: Verifier = {
 const SchemaCheckVerifier: Verifier = {
   name: "schema_check",
   async verify(context) {
-    const jsonArtifacts = context.artifacts.filter((a) => a.type === "json" && a.path);
+    const jsonArtifacts = context.artifacts.filter((a) => {
+      if (a.type !== "json" || !a.path || !existsSync(a.path)) {
+        return false;
+      }
+      try {
+        return statSync(a.path).isFile();
+      } catch {
+        return false;
+      }
+    });
     const relatedArtifactIds = jsonArtifacts.map((artifact) => artifact.id);
     if (jsonArtifacts.length === 0) {
       return { name: "schema_check", passed: true, detail: "No JSON artifacts to check." };

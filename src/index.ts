@@ -17,13 +17,14 @@ import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
 import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
-import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
+import { ARTIFACTS_ROOT, RUNTIME_ROOT, WORKSPACE_ROOT, ensureRuntimeDirectories } from "./paths.js";
 import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, updateStoredJobRecord, type StoredJobRecord } from "./job-store.js";
 import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, setApprovalResolver, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
 import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
 import { renderTimelineHtml } from "./timeline.js";
+import { renderJobsDashboardHtml } from "./jobs-dashboard.js";
 import { buildWorkflowGraph } from "./workflow-graph.js";
 import { describeJobState, mapJobStatusToLifecycleType, mapJobStatusToUiStatus, mapTaskRunStatusToUiStatus } from "./status-semantics.js";
 import { classifyFailure, getFailureCategoryLabel, listFailureCategories } from "./failure-classification.js";
@@ -33,6 +34,7 @@ const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
 const PLANNER_FAILURE_THRESHOLD = 3;
 const PLANNER_COOLDOWN_MS = 60_000;
+const DEFAULT_AUTO_RESUME_CONCURRENCY = 3;
 const MAX_TOOL_RESULT_CHARS = 2000;
 const MAX_TOOL_MODE_ROUNDS = 4;
 const MAX_TOOL_CONTEXT_CHARS = 1200;
@@ -250,6 +252,7 @@ function resolveTeamAgents(config: OrchestratorConfig, envValue = process.env.TE
 }
 
 function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): string {
+  ensureRuntimeDirectories();
   return persistJobRecord({
     job: payload.job,
     plan: payload.plan,
@@ -418,6 +421,91 @@ function persistTeamApprovalSnapshot(jobId: string, event: OrchestratorEvent): v
       plan,
       taskRuns,
       workflowGraph: job.workflowGraph,
+    };
+  });
+}
+
+function updateActiveTaskJobSnapshot(jobId: string, taskRunId: string, event: WorkflowUiEvent): void {
+  updateStoredJobRecord(jobId, (record) => {
+    if (record.job.mode !== "task") {
+      return record;
+    }
+
+    const currentTaskRun = record.taskRuns.find((taskRun) => taskRun.id === taskRunId)
+      ?? createTaskRunRecord({
+        id: taskRunId,
+        title: "Primary Task",
+        description: record.job.goal,
+        status: "pending",
+        verified: false,
+        output: "",
+        attempts: 0,
+        artifacts: [],
+      });
+
+    const isTerminalJobEvent = event.type === "job.completed"
+      || event.type === "job.failed"
+      || event.type === "job.cancelled";
+
+    const nextTaskRun = {
+      ...currentTaskRun,
+      status: event.type === "job.completed"
+        ? "completed" as const
+        : event.type === "job.failed"
+          ? "failed" as const
+          : event.type === "job.cancelled"
+            ? "blocked" as const
+            : event.type === "system.verification_failed"
+              ? "blocked" as const
+              : event.type === "executor.result" || event.type === "executor.partial_success"
+                ? "in_progress" as const
+                : event.type === "planner.start" || event.type === "planner.decision" || event.type === "executor.start"
+                  ? "in_progress" as const
+                  : currentTaskRun.status,
+      output: !isTerminalJobEvent && typeof event.summary === "string" && event.summary.trim().length > 0
+        ? event.summary
+        : currentTaskRun.output,
+      verified: typeof event.meta?.verified === "boolean"
+        ? event.meta.verified
+        : currentTaskRun.verified,
+      attempts: event.step ? Math.max(currentTaskRun.attempts, event.step) : currentTaskRun.attempts,
+    };
+
+    if (event.type === "workflow.executor.result" || event.type === "executor.result" || event.type === "executor.partial_success") {
+      const artifactCount = typeof event.meta?.artifact_count === "number" ? event.meta.artifact_count : undefined;
+      void artifactCount;
+    }
+
+    const taskRuns = record.taskRuns.some((taskRun) => taskRun.id === taskRunId)
+      ? record.taskRuns.map((taskRun) => taskRun.id === taskRunId ? nextTaskRun : taskRun)
+      : [nextTaskRun];
+
+    const latestTaskRun = taskRuns.find((taskRun) => taskRun.id === taskRunId) ?? nextTaskRun;
+    const nextJobStatus = event.type === "job.completed"
+      ? "completed" as const
+      : event.type === "job.failed"
+        ? "failed" as const
+        : event.type === "job.cancelled"
+          ? "cancelled" as const
+          : event.type === "system.verification_failed"
+            ? "blocked" as const
+            : "running" as const;
+
+    const job = {
+      ...record.job,
+      status: nextJobStatus,
+      verified: typeof event.meta?.verified === "boolean" ? event.meta.verified : record.job.verified,
+      output: nextJobStatus === "running"
+        ? latestTaskRun.output || record.job.output
+        : record.job.output,
+      taskRuns,
+    };
+
+    return {
+      ...record,
+      savedAt: event.time,
+      job,
+      taskRuns,
     };
   });
 }
@@ -1103,7 +1191,7 @@ function buildModelsResponse(config = loadConfig()): unknown {
   };
 }
 
-function buildHealthResponse(config = loadConfig()): { status: string; planner: Record<string, unknown>; executor: Record<string, unknown>; models: string[] } {
+function buildHealthResponse(config = loadConfig()): { status: string; planner: Record<string, unknown>; executor: Record<string, unknown>; runtime: Record<string, unknown>; models: string[] } {
   const circuitOpen = isPlannerCircuitOpen();
   return {
     status: circuitOpen ? "degraded" : "ok",
@@ -1119,6 +1207,9 @@ function buildHealthResponse(config = loadConfig()): { status: string; planner: 
     executor: {
       model: config.executor.model,
       base_url: config.executor.baseUrl,
+    },
+    runtime: {
+      auto_resume_concurrency: config.policy.autoResumeConcurrency,
     },
     models: getExposedModels(config).map((model) => model.id),
   };
@@ -1406,6 +1497,7 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
         artifact_id: artifact.id,
         artifact_type: artifact.type,
         path: artifact.path ?? null,
+        content_preview: artifact.contentPreview ?? null,
         source: artifact.source,
         trust_level: artifact.trustLevel ?? null,
         related_task_run_id: artifact.relatedTaskRunId ?? artifact.sourceTaskRunId ?? null,
@@ -1528,43 +1620,164 @@ function createRecoveryEvent(record: StoredJobRecord, seq: number): WorkflowUiEv
   if (!record.control?.recoveredAt || record.control.recoveryReason !== "service_restart") {
     return null;
   }
+  const autoResumedToJobId = record.control.resumedToJobId;
+  const autoResumeStatus = record.control.autoResumeStatus ?? (autoResumedToJobId ? "succeeded" : record.control.autoResumeFailedAt ? "failed" : "queued");
+  const autoResumeFailedAt = record.control.autoResumeFailedAt;
+  const autoResumeFailureMessage = record.control.autoResumeFailureMessage;
+  const queueText = typeof record.control.autoResumeQueuePosition === "number" && typeof record.control.autoResumeBatchSize === "number"
+    ? ` Queue position ${record.control.autoResumeQueuePosition} of ${record.control.autoResumeBatchSize}.`
+    : "";
+  const summary = autoResumedToJobId
+    ? `The previous in-memory run session was lost after a service restart. A resumed job was created automatically: ${autoResumedToJobId}.`
+    : autoResumeFailedAt
+      ? "The previous in-memory run session was lost after a service restart. Automatic resume failed and manual intervention is required."
+      : autoResumeStatus === "running"
+        ? "The previous in-memory run session was lost after a service restart. Automatic resume is now running."
+        : `The previous in-memory run session was lost after a service restart. Automatic resume is queued.${queueText}`;
   return createLifecycleEvent({
     jobId: record.job.id,
     seq,
     time: record.control.recoveredAt,
     type: "job.recovered",
     title: "Job recovered after restart",
-    summary: "The previous in-memory run session was lost after a service restart. The job is now recoverable.",
+    summary,
     status: "blocked",
       meta: {
         recovery_reason: record.control.recoveryReason,
         recovered_at: record.control.recoveredAt,
-        recoverable: true,
+        recoverable: !autoResumedToJobId,
+        resumed_to_job_id: autoResumedToJobId ?? null,
+        auto_resume_status: autoResumeStatus,
+        auto_resume_queued_at: record.control.autoResumeQueuedAt ?? null,
+        auto_resume_queue_position: record.control.autoResumeQueuePosition ?? null,
+        auto_resume_batch_size: record.control.autoResumeBatchSize ?? null,
+        auto_resume_attempted_at: record.control.autoResumeAttemptedAt ?? null,
+        auto_resume_failed_at: autoResumeFailedAt ?? null,
+        auto_resume_failure_message: autoResumeFailureMessage ?? null,
         job_status: record.job.status,
         affected_task_run_ids: getRecoveredTaskRunIds(record),
         failure_category: classifyFailure({
           type: "job.recovered",
           status: "blocked",
-          summary: "The previous in-memory run session was lost after a service restart. The job is now recoverable.",
+          summary,
           recoveryReason: record.control.recoveryReason,
         }),
       },
     });
 }
 
-function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[]): Record<string, unknown> | null {
+function buildJobRouteSet(jobId: string, routeBasePath = "/v1/jobs"): {
+  job_url: string;
+  events_url: string;
+  stream_url: string;
+  timeline_url: string;
+} {
+  return {
+    job_url: `${routeBasePath}/${jobId}`,
+    events_url: `${routeBasePath}/${jobId}/events`,
+    stream_url: `${routeBasePath}/${jobId}/stream`,
+    timeline_url: `${routeBasePath}/${jobId}/timeline`,
+  };
+}
+
+function buildResumeFollowTarget(
+  sourceJobId: string,
+  resumedToJobId: string | undefined,
+  routeBasePath = "/v1/jobs",
+): Record<string, unknown> | null {
+  if (!resumedToJobId) {
+    return null;
+  }
+  return {
+    type: "resumed_job",
+    source_job_id: sourceJobId,
+    job_id: resumedToJobId,
+    ...buildJobRouteSet(resumedToJobId, routeBasePath),
+  };
+}
+
+function buildControlActions(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Array<Record<string, unknown>> {
+  const actions: Array<Record<string, unknown>> = [];
+  const follow = buildResumeFollowTarget(record.job.id, record.control?.resumedToJobId, routeBasePath);
+  if (follow) {
+    actions.push({
+      id: "open_resumed_timeline",
+      label: "Open Resumed Timeline",
+      kind: "link",
+      href: follow.timeline_url,
+      emphasis: "primary",
+    });
+    actions.push({
+      id: "open_resumed_job",
+      label: "Open Resumed Job",
+      kind: "link",
+      href: follow.job_url,
+      emphasis: "secondary",
+    });
+  }
+  if (record.control?.autoResumeFailedAt) {
+    actions.push({
+      id: "resume_now",
+      label: "Resume Now",
+      kind: "api",
+      method: "POST",
+      href: `${routeBasePath}/${record.job.id}/resume`,
+      emphasis: "primary",
+    });
+    actions.push({
+      id: "open_job_events",
+      label: "Open Job Events",
+      kind: "link",
+      href: `${routeBasePath}/${record.job.id}/events`,
+      emphasis: "secondary",
+    });
+  }
+  return actions;
+}
+
+function isRecoveryLifecycleEvent(type: string): boolean {
+  return type === "job.recovered"
+    || type === "job.auto_resume_started"
+    || type === "job.resumed"
+    || type === "job.failed";
+}
+
+function getConfiguredAutoResumeConcurrency(): number {
+  try {
+    return loadConfig().policy.autoResumeConcurrency;
+  } catch {
+    return DEFAULT_AUTO_RESUME_CONCURRENCY;
+  }
+}
+
+function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[], routeBasePath = "/v1/jobs"): Record<string, unknown> | null {
   if (events.length === 0) {
     return null;
   }
 
   const latestByAgent = (agent: WorkflowUiEvent["agent"]) => [...events].reverse().find((event) => event.agent === agent) ?? null;
+  const latestExecutorEvent = latestByAgent("executor");
   const failureSummary = buildFailureSummary(events);
+  const autoResumedToJobId = record.control?.resumedToJobId;
+  const follow = buildResumeFollowTarget(record.job.id, autoResumedToJobId, routeBasePath);
+  const actions = buildControlActions(record, routeBasePath);
+  const autoResumeStatus = record.control?.autoResumeStatus ?? (autoResumedToJobId ? "succeeded" : record.control?.autoResumeFailedAt ? "failed" : null);
+  const autoResumeConcurrency = getConfiguredAutoResumeConcurrency();
   const recovery = record.control?.recoveredAt && record.control.recoveryReason
     ? {
         status: "recovered",
         reason: record.control.recoveryReason,
         recovered_at: record.control.recoveredAt,
-        recoverable: true,
+        recoverable: !autoResumedToJobId,
+        resumed_to_job_id: autoResumedToJobId ?? null,
+        auto_resume_status: autoResumeStatus,
+        auto_resume_concurrency: autoResumeConcurrency,
+        auto_resume_queued_at: record.control.autoResumeQueuedAt ?? null,
+        auto_resume_queue_position: record.control.autoResumeQueuePosition ?? null,
+        auto_resume_batch_size: record.control.autoResumeBatchSize ?? null,
+        auto_resume_attempted_at: record.control.autoResumeAttemptedAt ?? null,
+        auto_resume_failed_at: record.control.autoResumeFailedAt ?? null,
+        auto_resume_failure_message: record.control.autoResumeFailureMessage ?? null,
         affected_task_run_ids: getRecoveredTaskRunIds(record),
       }
     : null;
@@ -1577,12 +1790,20 @@ function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[]):
       next_seq: (events.at(-1)?.seq ?? 0) + 1,
       can_resume_from: Math.max(0, events.at(0)?.seq ?? 0),
     },
+    follow,
+    actions,
     failure_summary: failureSummary,
     recovery,
     latest_planner: latestByAgent("planner"),
-    latest_executor: latestByAgent("executor"),
+    latest_executor: latestExecutorEvent,
     latest_tool: latestByAgent("tool"),
     latest_system: latestByAgent("system"),
+    latest_executor_status: typeof latestExecutorEvent?.meta.executor_status === "string"
+      ? latestExecutorEvent.meta.executor_status
+      : null,
+    live_artifact_count: events
+      .filter((event) => event.agent === "executor" && typeof event.meta.artifact_count === "number")
+      .reduce((total, event) => total + Number(event.meta.artifact_count ?? 0), 0),
   };
 }
 
@@ -1599,24 +1820,28 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
   }
 
   const fallbackEvents = buildJobEvents(record);
-  const seen = new Set(fallbackEvents.map((event) => `${event.type}|${event.taskRunId ?? ""}|${event.step ?? ""}`));
-  const merged = [...fallbackEvents];
-  for (const event of persistedEvents) {
+  const merged = [...fallbackEvents, ...persistedEvents]
+    .sort((a, b) => a.time.localeCompare(b.time) || a.seq - b.seq);
+  const deduped: WorkflowUiEvent[] = [];
+  const seen = new Set<string>();
+  for (let index = merged.length - 1; index >= 0; index -= 1) {
+    const event = merged[index]!;
     const key = `${event.type}|${event.taskRunId ?? ""}|${event.step ?? ""}`;
     if (seen.has(key)) {
       continue;
     }
-    merged.push(event);
     seen.add(key);
+    deduped.push(event);
   }
 
-  return merged
-    .sort((a, b) => a.time.localeCompare(b.time) || a.seq - b.seq)
+  return deduped
+    .reverse()
     .map((event, index) => ({ ...event, seq: index + 1 }));
 }
 
-function recoverInterruptedJobs(): string[] {
+async function recoverInterruptedJobs(autoResumeConcurrency = DEFAULT_AUTO_RESUME_CONCURRENCY): Promise<string[]> {
   const recoveredJobIds: string[] = [];
+  const recoveryCandidates: StoredJobRecord[] = [];
   for (const stored of listStoredJobs()) {
     if (stored.status !== "running") {
       continue;
@@ -1628,6 +1853,7 @@ function recoverInterruptedJobs(): string[] {
       }
 
       const recoveredAt = new Date().toISOString();
+      const queuedAt = recoveredAt;
       return {
         ...record,
         savedAt: recoveredAt,
@@ -1635,7 +1861,7 @@ function recoverInterruptedJobs(): string[] {
           ...record.job,
           status: "blocked",
           verified: false,
-          output: "Execution was interrupted by a service restart. The job can be resumed from the control plane.",
+          output: "Execution was interrupted by a service restart. The job is being resumed automatically.",
         },
         taskRuns: record.taskRuns.map((taskRun) => (
           taskRun.status === "completed" || taskRun.status === "failed" || taskRun.status === "blocked" || taskRun.status === "skipped"
@@ -1650,6 +1876,9 @@ function recoverInterruptedJobs(): string[] {
           ...record.control,
           recoveredAt,
           recoveryReason: "service_restart",
+          autoResumeStatus: "queued",
+          autoResumeQueuedAt: queuedAt,
+          autoResumeQueuePosition: recoveredJobIds.length + 1,
         },
       };
     });
@@ -1658,39 +1887,195 @@ function recoverInterruptedJobs(): string[] {
       continue;
     }
 
-    const recoveryEvent = createRecoveryEvent(updated, getNextSeq(stored.id));
-    if (recoveryEvent) {
-      appendEvent(recoveryEvent);
-    }
+    recoveryCandidates.push(updated);
     recoveredJobIds.push(stored.id);
   }
 
+  const batchSize = recoveryCandidates.length;
+  for (let index = 0; index < recoveryCandidates.length; index += 1) {
+    updateJobControlState(recoveryCandidates[index]!.job.id, {
+      autoResumeBatchSize: batchSize,
+      autoResumeQueuePosition: index + 1,
+    });
+    const queuedRecord = readJobRecord(recoveryCandidates[index]!.job.id);
+    const queuedRecoveryEvent = queuedRecord ? createRecoveryEvent(queuedRecord, getNextSeq(recoveryCandidates[index]!.job.id)) : null;
+    if (queuedRecoveryEvent) {
+      appendEvent(queuedRecoveryEvent);
+    }
+  }
+
+  const workerCount = Math.min(autoResumeConcurrency, recoveryCandidates.length);
+  const workers = Array.from({ length: workerCount }, (_, workerIndex) => (async () => {
+    for (let index = workerIndex; index < recoveryCandidates.length; index += workerCount) {
+      const candidate = recoveryCandidates[index]!;
+      const attemptedAt = new Date().toISOString();
+      updateJobControlState(candidate.job.id, {
+        autoResumeStatus: "running",
+        autoResumeAttemptedAt: attemptedAt,
+        autoResumeFailedAt: undefined,
+        autoResumeFailureMessage: undefined,
+      });
+      appendEvent(createLifecycleEvent({
+        jobId: candidate.job.id,
+        seq: getNextSeq(candidate.job.id),
+        time: attemptedAt,
+        type: "job.auto_resume_started",
+        title: "Automatic resume started",
+        summary: "The service started automatic resume for this interrupted job.",
+        status: "running",
+        meta: {
+          recovery_reason: "service_restart",
+          auto_resume_status: "running",
+          auto_resume_queue_position: index + 1,
+          auto_resume_batch_size: batchSize,
+        },
+      }));
+
+      try {
+        const resumed = await executeJobByMode(candidate.job.mode, candidate.job.goal, undefined, {
+          requirePlannerCircuit: false,
+        });
+        updateJobControlState(candidate.job.id, {
+          resumedAt: new Date().toISOString(),
+          resumedToJobId: resumed.job.id,
+          autoResumeStatus: "succeeded",
+          autoResumeFailedAt: undefined,
+          autoResumeFailureMessage: undefined,
+        });
+        updateJobControlState(resumed.job.id, {
+          resumeOf: candidate.job.id,
+        });
+        appendEvent(createLifecycleEvent({
+          jobId: candidate.job.id,
+          seq: getNextSeq(candidate.job.id),
+          time: new Date().toISOString(),
+          type: "job.resumed",
+          title: "Job auto-resumed",
+          summary: `The service created a resumed job after restart: ${resumed.job.id}.`,
+          status: "success",
+          meta: {
+            resumed_to_job_id: resumed.job.id,
+            resumed_automatically: true,
+            recovery_reason: "service_restart",
+            auto_resume_status: "succeeded",
+          },
+        }));
+      } catch (error) {
+        const failureMessage = error instanceof Error ? error.message : String(error);
+        updateJobControlState(candidate.job.id, {
+          autoResumeStatus: "failed",
+          autoResumeFailedAt: new Date().toISOString(),
+          autoResumeFailureMessage: failureMessage,
+        });
+        appendEvent(createLifecycleEvent({
+          jobId: candidate.job.id,
+          seq: getNextSeq(candidate.job.id),
+          time: new Date().toISOString(),
+          type: "job.failed",
+          title: "Automatic resume failed",
+          summary: "The service restarted but could not automatically resume this job.",
+          status: "failed",
+          meta: attachFailureCategory(
+            "job.failed",
+            "failed",
+            "The service restarted but could not automatically resume this job.",
+            {
+              error: failureMessage,
+              recovery_reason: "service_restart",
+              attempted_auto_resume: true,
+              auto_resume_status: "failed",
+            },
+          ),
+        }));
+      }
+    }
+  })());
+
+  await Promise.all(workers);
   return recoveredJobIds;
 }
 
-function buildJobResponse(record: StoredJobRecord): unknown {
+function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): unknown {
+  const persistedEvents = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
+  const liveSnapshot = buildEventSnapshot(record, persistedEvents, routeBasePath);
   const latestStep = record.taskRuns.at(-1);
+  const liveJobStatus = typeof liveSnapshot?.job_status === "string" ? liveSnapshot.job_status : record.job.status;
+  const liveArtifactCount = typeof liveSnapshot?.live_artifact_count === "number"
+    ? Math.max(record.artifacts.length, liveSnapshot.live_artifact_count)
+    : record.artifacts.length;
+  const liveExecutorStatus = typeof liveSnapshot?.latest_executor_status === "string"
+    ? liveSnapshot.latest_executor_status
+    : latestExecutorStatus(record);
+  const follow = buildResumeFollowTarget(record.job.id, record.control?.resumedToJobId, routeBasePath);
+  const actions = buildControlActions(record, routeBasePath);
   const workflowSummary = buildWorkflowSummary(record);
   return {
     saved_at: record.savedAt,
-    job: record.job,
+    job: {
+      ...record.job,
+      status: liveJobStatus,
+    },
     plan: record.plan,
     taskRuns: record.taskRuns,
     artifacts: record.artifacts,
     step_count: record.taskRuns.length,
-    artifact_count: record.artifacts.length,
+    artifact_count: liveArtifactCount,
     latest_step: latestStep
       ? {
           id: latestStep.id,
           status: latestStep.status,
           verified: latestStep.verified,
           attempts: latestStep.attempts,
-          latest_executor_status: latestExecutorStatus(record),
+          latest_executor_status: liveExecutorStatus,
         }
       : null,
     workflow_summary: workflowSummary,
     control: record.control ?? {},
+    follow,
+    actions,
   };
+}
+
+function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Record<string, unknown> {
+  const persistedEvents = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
+  const snapshot = buildEventSnapshot(record, persistedEvents, routeBasePath) as {
+    recovery?: Record<string, unknown> | null;
+  } | null;
+  const response = buildJobResponse(record, routeBasePath) as Record<string, unknown>;
+  const job = response.job as Record<string, unknown> | undefined;
+
+  return {
+    id: record.job.id,
+    goal: record.job.goal,
+    mode: record.job.mode,
+    status: typeof job?.status === "string" ? job.status : record.job.status,
+    verified: record.job.verified,
+    saved_at: response.saved_at,
+    step_count: response.step_count,
+    artifact_count: response.artifact_count,
+    latest_step: response.latest_step,
+    control: response.control,
+    follow: response.follow,
+    actions: response.actions,
+    ...buildJobRouteSet(record.job.id, routeBasePath),
+    recovery: snapshot?.recovery ?? null,
+  };
+}
+
+function buildListedJobsResponse(routeBasePath = "/v1/jobs"): Array<Record<string, unknown>> {
+  return listStoredJobs().flatMap((stored) => {
+    const record = readJobRecord(stored.id);
+    if (!record) {
+      return [{
+        id: stored.id,
+        goal: stored.goal,
+        status: stored.status,
+        saved_at: stored.savedAt,
+        ...buildJobRouteSet(stored.id, routeBasePath),
+      }];
+    }
+    return [buildJobListItem(record, routeBasePath)];
+  });
 }
 
 function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> {
@@ -2299,12 +2684,14 @@ async function executeTaskGoal(
   fixedIds?: FixedTaskIds,
   onRegistered?: (jobId: string) => void,
 ): Promise<TaskExecutionPayload> {
+  ensureRuntimeDirectories();
   const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
   const planId = fixedIds?.planId ?? `plan_${randomUUID()}`;
   const taskRunId = fixedIds?.taskRunId ?? `taskrun_${randomUUID()}`;
   const abortController = new AbortController();
   const emitUiEvent = (event: WorkflowUiEvent) => {
     appendEvent(event);
+    updateActiveTaskJobSnapshot(jobId, taskRunId, event);
   };
   const emitLifecycle = (type: string, title: string, summary: string, status: WorkflowUiEvent["status"], meta: Record<string, unknown> = {}, phase: WorkflowUiEvent["phase"] = "result") => {
     emitUiEvent(createLifecycleEvent({
@@ -2510,12 +2897,14 @@ async function executeTeamGoal(
   fixedIds?: FixedTaskIds,
   approvalMode?: string,
 ): Promise<TaskExecutionPayload> {
+  ensureRuntimeDirectories();
   const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
   const planId = fixedIds?.planId ?? `plan_${randomUUID()}`;
   const taskRunId = fixedIds?.taskRunId ?? `taskrun_${randomUUID()}`;
   const abortController = new AbortController();
   const emitUiEvent = (event: WorkflowUiEvent) => {
     appendEvent(event);
+    updateActiveTaskJobSnapshot(jobId, taskRunId, event);
   };
   const emitLifecycle = (type: string, title: string, summary: string, status: WorkflowUiEvent["status"], meta: Record<string, unknown> = {}, phase: WorkflowUiEvent["phase"] = "result") => {
     emitUiEvent(createLifecycleEvent({
@@ -2836,7 +3225,28 @@ async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise
 async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   jsonResponse(res, 200, {
     object: "list",
-    data: listStoredJobs(),
+    data: buildListedJobsResponse(),
+  });
+}
+
+async function handleJobsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const html = renderJobsDashboardHtml([] as Array<{
+    id: string;
+    goal: string;
+    mode?: string;
+    status: string;
+  }>, {
+    dataUrl: "/jobs/data",
+  });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
+}
+
+async function handleBrowserListJobs(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  jsonResponse(res, 200, {
+    object: "list",
+    data: buildListedJobsResponse("/jobs"),
   });
 }
 
@@ -2936,7 +3346,12 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
   });
 }
 
-async function handleGetJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+async function handleGetJob(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  jobId: string,
+  routeBasePath = "/v1/jobs",
+): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
     jsonResponse(res, 404, {
@@ -2947,7 +3362,7 @@ async function handleGetJob(_req: IncomingMessage, res: ServerResponse, jobId: s
     });
     return;
   }
-  jsonResponse(res, 200, buildJobResponse(record));
+  jsonResponse(res, 200, buildJobResponse(record, routeBasePath));
 }
 
 async function handleGetJobArtifacts(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
@@ -3012,7 +3427,12 @@ async function handleGetJobRuntimeProfile(_req: IncomingMessage, res: ServerResp
   });
 }
 
-async function handleGetJobEvents(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+async function handleGetJobEvents(
+  req: IncomingMessage,
+  res: ServerResponse,
+  jobId: string,
+  routeBasePath = "/v1/jobs",
+): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
     jsonResponse(res, 404, {
@@ -3039,12 +3459,17 @@ async function handleGetJobEvents(req: IncomingMessage, res: ServerResponse, job
   jsonResponse(res, 200, {
     job_id: jobId,
     count: events.length,
-    snapshot: buildEventSnapshot(record, events),
+    snapshot: buildEventSnapshot(record, events, routeBasePath),
     events,
   });
 }
 
-async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+async function handleJobStream(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  jobId: string,
+  routeBasePath = "/v1/jobs",
+): Promise<void> {
   // Verify job exists
   const record = readJobRecord(jobId);
   if (!record) {
@@ -3081,7 +3506,7 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
   res.setHeader("Connection", "keep-alive");
 
   // Send initial snapshot
-  const snapshot = buildEventSnapshot(record, existingEvents);
+  const snapshot = buildEventSnapshot(record, existingEvents, routeBasePath);
   if (snapshot) {
     sseWriteEvent(res, "job.snapshot", JSON.stringify({
       ...snapshot,
@@ -3091,6 +3516,9 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
         replayed_count: replayEvents.length,
       },
     }));
+    if (isObjectRecord(snapshot.follow) && typeof snapshot.follow.type === "string") {
+      sseWriteEvent(res, "job.redirect", JSON.stringify(snapshot.follow));
+    }
   }
 
   // Send replay events
@@ -3102,6 +3530,27 @@ async function handleJobStream(_req: IncomingMessage, res: ServerResponse, jobId
   const unsubscribe = subscribe(jobId, (event) => {
     try {
       sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
+      if (event.type === "job.resumed" && isObjectRecord(event.meta) && typeof event.meta.resumed_to_job_id === "string") {
+        const follow = buildResumeFollowTarget(jobId, event.meta.resumed_to_job_id, routeBasePath);
+        if (follow) {
+          sseWriteEvent(res, "job.redirect", JSON.stringify(follow), event.seq);
+        }
+      }
+      if (isRecoveryLifecycleEvent(event.type)) {
+        const latestRecord = readJobRecord(jobId);
+        const latestEvents = latestRecord ? mergeJobEvents(latestRecord, loadEventsFromDisk(jobId)) : null;
+        const latestSnapshot = latestRecord && latestEvents ? buildEventSnapshot(latestRecord, latestEvents, routeBasePath) : null;
+        if (latestSnapshot) {
+          sseWriteEvent(res, "job.snapshot", JSON.stringify({
+            ...latestSnapshot,
+            replay: {
+              ...(isObjectRecord(latestSnapshot.replay) ? latestSnapshot.replay : {}),
+              resumed_from_seq: replayCursor ?? null,
+              replayed_count: replayEvents.length,
+            },
+          }), event.seq);
+        }
+      }
     } catch {
       // Client disconnected
       unsubscribe();
@@ -3235,7 +3684,12 @@ async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId:
   });
 }
 
-async function handleJobTimeline(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+async function handleJobTimeline(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  jobId: string,
+  routeBasePath = "/v1/jobs",
+): Promise<void> {
   const record = readJobRecord(jobId);
   if (!record) {
     jsonResponse(res, 404, {
@@ -3262,6 +3716,12 @@ async function handleJobTimeline(_req: IncomingMessage, res: ServerResponse, job
       awaiting_approval_task?: { title?: string; status?: string } | null;
       task_counts?: Record<string, number>;
     },
+    buildEventSnapshot(record, timelineEvents, routeBasePath) as {
+      follow?: { type?: string; job_id?: string; job_url?: string; timeline_url?: string; stream_url?: string; events_url?: string } | null;
+      actions?: Array<{ id?: string; label?: string; kind?: string; href?: string; method?: string; emphasis?: string }>;
+      recovery?: { auto_resume_failed_at?: string | null; auto_resume_failure_message?: string | null } | null;
+    },
+    { routeBasePath },
   );
 
   res.statusCode = 200;
@@ -4035,6 +4495,46 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
   try {
+    if (method === "GET" && url.pathname === "/jobs/dashboard") {
+      await handleJobsDashboard(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/jobs/data") {
+      await handleBrowserListJobs(req, res);
+      return;
+    }
+
+    const browserJobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
+    if (method === "GET" && browserJobMatch) {
+      await handleGetJob(req, res, decodeURIComponent(browserJobMatch[1]!), "/jobs");
+      return;
+    }
+
+    const browserJobEventsMatch = url.pathname.match(/^\/jobs\/([^/]+)\/events$/);
+    if (method === "GET" && browserJobEventsMatch) {
+      await handleGetJobEvents(req, res, decodeURIComponent(browserJobEventsMatch[1]!), "/jobs");
+      return;
+    }
+
+    const browserJobStreamMatch = url.pathname.match(/^\/jobs\/([^/]+)\/stream$/);
+    if (method === "GET" && browserJobStreamMatch) {
+      await handleJobStream(req, res, decodeURIComponent(browserJobStreamMatch[1]!), "/jobs");
+      return;
+    }
+
+    const browserJobTimelineMatch = url.pathname.match(/^\/jobs\/([^/]+)\/timeline$/);
+    if (method === "GET" && browserJobTimelineMatch) {
+      await handleJobTimeline(req, res, decodeURIComponent(browserJobTimelineMatch[1]!), "/jobs");
+      return;
+    }
+
+    const browserJobResumeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/resume$/);
+    if (method === "POST" && browserJobResumeMatch) {
+      await handleResumeJob(req, res, decodeURIComponent(browserJobResumeMatch[1]!));
+      return;
+    }
+
     if (url.pathname.startsWith("/v1/") && !isAuthorized(req)) {
       unauthorizedResponse(res);
       return;
@@ -4052,6 +4552,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     if (method === "GET" && url.pathname === "/v1/jobs") {
       await handleListJobs(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/jobs/dashboard") {
+      await handleJobsDashboard(req, res);
       return;
     }
 
@@ -4200,6 +4705,7 @@ function runConfigValidation(configPath?: string): void {
     planner_model: config.planner.model,
     executor_model: config.executor.model,
     task_routing_path: config.taskRoutingPath,
+    auto_resume_concurrency: config.policy.autoResumeConcurrency,
     route_types: routing.map((route) => route.type),
   }, null, 2));
 }
@@ -4424,6 +4930,7 @@ function runWritableCheck(targetDir: string, label: string): DoctorCheck {
 }
 
 function buildDoctorReport(configPath?: string): Record<string, unknown> {
+  ensureRuntimeDirectories();
   const resolvedPath = configPath?.trim() || "config/config.yml";
   const checks: DoctorCheck[] = [];
 
@@ -4433,11 +4940,12 @@ function buildDoctorReport(configPath?: string): Record<string, unknown> {
       name: "config_load",
       ok: true,
       summary: "Configuration loaded successfully.",
-      detail: {
-        planner_model: config.planner.model,
-        executor_model: config.executor.model,
-      },
-    });
+        detail: {
+          planner_model: config.planner.model,
+          executor_model: config.executor.model,
+          auto_resume_concurrency: config.policy.autoResumeConcurrency,
+        },
+      });
     checks.push(buildModelConfigCheck("planner_model_config", "planner", config.planner));
     checks.push(buildModelConfigCheck("executor_model_config", "executor", config.executor));
 
@@ -4472,6 +4980,7 @@ function buildDoctorReport(configPath?: string): Record<string, unknown> {
 
     checks.push(runWritableCheck(WORKSPACE_ROOT, "workspace"));
     checks.push(runWritableCheck(RUNTIME_ROOT, "runtime"));
+    checks.push(runWritableCheck(ARTIFACTS_ROOT, "artifacts"));
 
     checks.push(buildSearchProviderCheck(config));
 
@@ -4575,9 +5084,10 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
 }
 
 function runServer(port: number): void {
+  ensureRuntimeDirectories();
   const config = loadConfig();
   configureSearchTools(config.search);
-  const recoveredJobIds = recoverInterruptedJobs();
+  const recoveryPromise = recoverInterruptedJobs(config.policy.autoResumeConcurrency);
   const server = createServer((req, res) => {
     void handleRequest(req, res);
   });
@@ -4585,9 +5095,15 @@ function runServer(port: number): void {
     console.log(`Dual Agent Orchestrator API listening on http://127.0.0.1:${port}`);
     console.log(`API key: ${getServerApiKey()}`);
     console.log(`Models: ${getExposedModels(config).map((model) => model.id).join(", ")}`);
-    if (recoveredJobIds.length > 0) {
-      console.log(`Recovered interrupted jobs after restart: ${recoveredJobIds.join(", ")}`);
-    }
+    void recoveryPromise
+      .then((recoveredJobIds) => {
+        if (recoveredJobIds.length > 0) {
+          console.log(`Recovered interrupted jobs after restart: ${recoveredJobIds.join(", ")}`);
+        }
+      })
+      .catch((error) => {
+        console.error(`Failed to recover interrupted jobs after restart: ${error instanceof Error ? error.message : String(error)}`);
+      });
   });
 }
 
@@ -4634,6 +5150,7 @@ if (import.meta.url === entryHref) {
 
 export const __testables = {
   handleRequest,
+  buildHealthResponse,
   parseTeamCliArgs,
   buildJobResponse,
   buildStepList,

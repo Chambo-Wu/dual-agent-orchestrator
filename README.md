@@ -13,6 +13,8 @@ Additional project planning docs:
 
 - [路线图-分阶段持续推进与实施清单-20260526.md](./docs/路线图-分阶段持续推进与实施清单-20260526.md)
 
+- [Frontend Recovery Status And CTA Contract](./docs/%E5%89%8D%E7%AB%AF%E6%81%A2%E5%A4%8D%E7%8A%B6%E6%80%81%E4%B8%8ECTA%E5%AF%B9%E6%8E%A5-20260527.md)
+
 ## Overview
 
 The system is built around two model roles:
@@ -116,6 +118,9 @@ executor:
   base_url: "http://127.0.0.1:1234/v1"
   api_key: "env:EXECUTOR_API_KEY"
   model: "qwen/qwen3-4b-2507"
+
+policy:
+  auto_resume_concurrency: 3
 ```
 
 Put secrets in `.env`:
@@ -193,6 +198,7 @@ Standard endpoints:
 Job control plane:
 
 - `GET /v1/jobs`
+- `GET /v1/jobs/dashboard`
 - `POST /v1/jobs`
 - `GET /v1/jobs/:id`
 - `GET /v1/jobs/:id/steps`
@@ -203,6 +209,16 @@ Job control plane:
 - `GET /v1/jobs/:id/timeline`
 - `POST /v1/jobs/:id/cancel`
 - `POST /v1/jobs/:id/retry`
+
+Browser-friendly built-in pages:
+
+- `GET /jobs/dashboard`
+- `GET /jobs/data`
+- `GET /jobs/:id`
+- `GET /jobs/:id/events`
+- `GET /jobs/:id/stream`
+- `GET /jobs/:id/timeline`
+- `POST /jobs/:id/resume`
 - `POST /v1/jobs/:id/approve`
 - `POST /v1/jobs/:id/resume`
 
@@ -232,6 +248,7 @@ Replay contract:
 - `GET /v1/jobs/:id/stream?since_seq=N` replays events with `seq > N` before live subscription
 - `GET /v1/jobs/:id/stream` with header `Last-Event-ID: N` resumes from `seq > N`
 - `job.snapshot` includes `replay.next_seq`, `replay.can_resume_from`, `replay.resumed_from_seq`, and `replay.replayed_count`
+- recovery-aware `job.snapshot` payloads also include `follow`, `actions`, and `recovery.auto_resume_status`
 
 You can explicitly opt into raw workflow SSE events on compatible routes with:
 
@@ -262,6 +279,7 @@ The current progress system is designed for both custom frontends and generic cl
 - a built-in runtime analysis panel for verification outcomes, artifact activity, tool activity, and common blockers
 - click-to-filter analysis chips that can jump from summary statistics to matching events and related workflow lanes
 - shareable timeline URLs that preserve `workflowFocus`, `analysisFilter`, and `analysisValue`
+- recovery-aware frontend signals such as `job.redirect`, `snapshot.follow`, `snapshot.actions`, and `snapshot.recovery`
 
 Example mirrored progress in chat streams:
 
