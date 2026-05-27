@@ -1139,19 +1139,20 @@ function finalizeExecutorResult(
 ): ExecutorOutput {
   const rawExecutorText = executorResponse.content || executorResponse.reasoning || "";
   const usedNativeToolCalls = conversation.executedCalls.length > 0;
-  const usefulProgress = hasUsefulExecutorProgress(conversation);
   const parsed = parseExecutorOutput(rawExecutorText);
+  const isFormatError = parsed.summary === "AI 返回的格式异常，请重试或更换模型"
+    || parsed.summary === "Executor returned malformed output. Retry or switch the model."
+    || parsed.error?.startsWith("Unable to parse executor output as JSON");
+  const modelReturnedStructuredJson = !isFormatError;
   const parsedSummary = parsed.summary.trim();
   const parsedRawResult = parsed.raw_result.trim();
   const conversationSummary = conversation.lastSummary.trim();
-  const parsedAddsSynthesis = parsedSummary.length > 0
+  const parsedAddsSynthesis = modelReturnedStructuredJson
+    && parsedSummary.length > 0
     && parsedSummary !== conversationSummary
     && !/^Command (succeeded|failed|exited)\b/i.test(parsedSummary)
     && !/^Listed \d+ entries\b/i.test(parsedSummary)
     && !/^Read file\b/i.test(parsedSummary);
-  const isFormatError = parsed.summary === "AI 返回的格式异常，请重试或更换模型"
-    || parsed.error?.startsWith("Unable to parse executor output as JSON");
-  const modelReturnedStructuredJson = !isFormatError;
   const honorModelTerminalAssessment = usedNativeToolCalls
     && modelReturnedStructuredJson
     && (parsed.status === "failed" || parsed.status === "blocked");

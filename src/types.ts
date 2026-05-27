@@ -381,6 +381,7 @@ export interface VerificationCheck {
   passed: boolean;
   detail: string;
   status?: "passed" | "failed" | "insufficient";
+  relatedArtifactIds?: string[];
 }
 
 export interface VerificationResult {

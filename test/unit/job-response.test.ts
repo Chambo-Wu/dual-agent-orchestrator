@@ -391,6 +391,7 @@ test("timeline html renders runtime analysis summaries", () => {
           verification_check_status: "insufficient",
           verification_status: "insufficient",
           failure_category: "verification_failure",
+          related_artifact_ids: ["artifact_report_1"],
         },
       },
       {
@@ -406,6 +407,7 @@ test("timeline html renders runtime analysis summaries", () => {
         status: "success",
         taskRunId: "t2",
         meta: {
+          artifact_id: "artifact_report_1",
           related_task_run_id: "t2",
         },
       },
@@ -476,8 +478,11 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes('data-event-type="system.verification_check_insufficient"'), true);
   assert.equal(html.includes('data-verification-check-name="artifact_presence"'), true);
   assert.equal(html.includes('data-verification-check-status="insufficient"'), true);
+  assert.equal(html.includes('data-related-artifact-ids="artifact_report_1"'), true);
   assert.equal(html.includes('data-event-type="artifact.created"'), true);
+  assert.equal(html.includes('data-artifact-id="artifact_report_1"'), true);
   assert.equal(html.includes('data-task-run-id="t2"'), true);
+  assert.equal(html.includes('data-related-task-run-id="t2"'), true);
   assert.equal(html.includes('data-event-tool="web_search"'), true);
   assert.equal(html.includes('data-failure-category="verification_failure"'), true);
   assert.equal(html.includes('data-assignee="verifier"'), true);

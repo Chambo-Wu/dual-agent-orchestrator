@@ -34,6 +34,7 @@ const FileExistsVerifier: Verifier = {
   name: "file_exists",
   async verify(context) {
     const fileArtifacts = context.artifacts.filter((a) => a.type === "file" && a.path);
+    const relatedArtifactIds = fileArtifacts.map((artifact) => artifact.id);
     if (fileArtifacts.length === 0) {
       return { name: "file_exists", passed: true, detail: "No file artifacts to check." };
     }
@@ -43,9 +44,10 @@ const FileExistsVerifier: Verifier = {
         name: "file_exists",
         passed: false,
         detail: `Missing files: ${missing.map((a) => a.path).join(", ")}`,
+        relatedArtifactIds: missing.map((artifact) => artifact.id),
       };
     }
-    return { name: "file_exists", passed: true, detail: `All ${fileArtifacts.length} file artifacts exist.` };
+    return { name: "file_exists", passed: true, detail: `All ${fileArtifacts.length} file artifacts exist.`, relatedArtifactIds };
   },
 };
 
@@ -53,6 +55,7 @@ const SchemaCheckVerifier: Verifier = {
   name: "schema_check",
   async verify(context) {
     const jsonArtifacts = context.artifacts.filter((a) => a.type === "json" && a.path);
+    const relatedArtifactIds = jsonArtifacts.map((artifact) => artifact.id);
     if (jsonArtifacts.length === 0) {
       return { name: "schema_check", passed: true, detail: "No JSON artifacts to check." };
     }
@@ -68,9 +71,9 @@ const SchemaCheckVerifier: Verifier = {
       }
     }
     if (errors.length > 0) {
-      return { name: "schema_check", passed: false, detail: `Invalid JSON: ${errors.join("; ")}` };
+      return { name: "schema_check", passed: false, detail: `Invalid JSON: ${errors.join("; ")}`, relatedArtifactIds };
     }
-    return { name: "schema_check", passed: true, detail: `All ${jsonArtifacts.length} JSON artifacts are valid.` };
+    return { name: "schema_check", passed: true, detail: `All ${jsonArtifacts.length} JSON artifacts are valid.`, relatedArtifactIds };
   },
 };
 
@@ -85,6 +88,7 @@ const ArtifactPresenceVerifier: Verifier = {
           passed: false,
           status: "insufficient",
           detail: "Tool calls were made but no artifacts were produced.",
+          relatedArtifactIds: [],
         };
       }
       return { name: "artifact_presence", passed: true, detail: "No tools used, no artifacts expected." };
@@ -96,9 +100,10 @@ const ArtifactPresenceVerifier: Verifier = {
         passed: false,
         status: "insufficient",
         detail: "All artifacts have empty previews.",
+        relatedArtifactIds: emptyPreviews.map((artifact) => artifact.id),
       };
     }
-    return { name: "artifact_presence", passed: true, detail: `${context.artifacts.length} artifacts present with content.` };
+    return { name: "artifact_presence", passed: true, detail: `${context.artifacts.length} artifacts present with content.`, relatedArtifactIds: context.artifacts.map((artifact) => artifact.id) };
   },
 };
 
@@ -127,10 +132,11 @@ const UrlReachableVerifier: Verifier = {
   name: "url_reachable",
   async verify(context) {
     const urlArtifacts = context.artifacts.filter((a) => a.type === "json" && a.contentPreview.includes("http"));
+    const relatedArtifactIds = urlArtifacts.map((artifact) => artifact.id);
     if (urlArtifacts.length === 0) {
       return { name: "url_reachable", passed: true, detail: "No URL artifacts to check." };
     }
-    return { name: "url_reachable", passed: true, detail: `Skipped URL reachability check for ${urlArtifacts.length} artifacts.` };
+    return { name: "url_reachable", passed: true, detail: `Skipped URL reachability check for ${urlArtifacts.length} artifacts.`, relatedArtifactIds };
   },
 };
 
@@ -143,6 +149,7 @@ const AcceptanceCriteriaVerifier: Verifier = {
     }
 
     const issues: string[] = [];
+    const relatedArtifactIds = new Set<string>();
     const minimumArtifactCount = acceptance.minimumArtifactCount;
     if (minimumArtifactCount !== undefined && context.artifacts.length < minimumArtifactCount) {
       issues.push(`Expected at least ${minimumArtifactCount} artifact(s), found ${context.artifacts.length}.`);
@@ -150,6 +157,7 @@ const AcceptanceCriteriaVerifier: Verifier = {
 
     if (acceptance.requiredArtifactType) {
       const matchingArtifacts = context.artifacts.filter((artifact) => artifact.type === acceptance.requiredArtifactType);
+      matchingArtifacts.forEach((artifact) => relatedArtifactIds.add(artifact.id));
       if (matchingArtifacts.length === 0) {
         issues.push(`Expected at least one ${acceptance.requiredArtifactType} artifact.`);
       }
@@ -157,6 +165,7 @@ const AcceptanceCriteriaVerifier: Verifier = {
 
     if (acceptance.requiredSchema === "json") {
       const jsonArtifacts = context.artifacts.filter((artifact) => artifact.type === "json");
+      jsonArtifacts.forEach((artifact) => relatedArtifactIds.add(artifact.id));
       if (jsonArtifacts.length === 0) {
         issues.push("Expected at least one JSON artifact for required_schema=json.");
       }
@@ -168,9 +177,10 @@ const AcceptanceCriteriaVerifier: Verifier = {
         passed: false,
         status: "insufficient",
         detail: issues.join(" "),
+        relatedArtifactIds: [...relatedArtifactIds],
       };
     }
-    return { name: "acceptance_criteria", passed: true, detail: "Explicit acceptance criteria satisfied." };
+    return { name: "acceptance_criteria", passed: true, detail: "Explicit acceptance criteria satisfied.", relatedArtifactIds: [...relatedArtifactIds] };
   },
 };
 

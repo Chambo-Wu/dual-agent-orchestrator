@@ -962,6 +962,77 @@ test("job stream supports since_seq replay and Last-Event-ID resume", async () =
   lastEventIdRes.end();
 });
 
+test("job stream replays verification check events", async () => {
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_stream_verification_check",
+    title: "Verify evidence",
+    description: "Verify evidence artifacts",
+    status: "completed",
+    assignee: "verifier",
+    verified: true,
+    output: "Verification passed.",
+    attempts: 1,
+    artifacts: [],
+    verificationResult: {
+      status: "verified",
+      summary: "Verification completed successfully.",
+      checks: [
+        { name: "artifact_presence", passed: true, status: "passed", detail: "1 artifact present with content." },
+      ],
+    },
+  });
+  const plan = createPlanRecord({
+    id: "plan_stream_verification_check",
+    goal: "Stream verification check events",
+    mode: "task",
+    taskRunIds: [taskRun.id],
+  });
+  const job = createJobRecord({
+    id: "job_stream_verification_check",
+    goal: "Stream verification check events",
+    mode: "task",
+    status: "completed",
+    verified: true,
+    output: "done",
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+    verificationResult: taskRun.verificationResult,
+  });
+  persistJobRecord({ job, plan, taskRuns: [taskRun], artifacts: [] });
+
+  const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_stream_verification_check/events"), eventsRes);
+  const eventsBody = JSON.parse(eventsRes.body) as {
+    events: Array<{ seq: number; type: string; meta?: Record<string, unknown> }>;
+  };
+
+  const checkEvent = eventsBody.events.find((event) => event.type.startsWith("system.verification_check_"));
+  assert.equal(Boolean(checkEvent), true);
+
+  const streamRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_stream_verification_check/stream"), streamRes);
+  assert.equal(streamRes.statusCode, 200);
+  assert.equal(streamRes.body.includes("event: job.event"), true);
+  assert.equal(streamRes.body.includes("system.verification_check_"), true);
+  assert.equal(streamRes.body.includes("verification_check_name"), true);
+  streamRes.end();
+
+  const replayCursor = Math.max(0, (checkEvent?.seq ?? 1) - 1);
+  const replayRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest({
+    ...buildAuthorizedRequest("/v1/jobs/job_stream_verification_check/stream"),
+    headers: {
+      authorization: "Bearer dual-agent-local",
+      "last-event-id": String(replayCursor),
+    },
+  } as IncomingMessage, replayRes);
+  assert.equal(replayRes.statusCode, 200);
+  assert.equal(replayRes.body.includes(`"resumed_from_seq":${replayCursor}`), true);
+  assert.equal(replayRes.body.includes("system.verification_check_"), true);
+  replayRes.end();
+});
+
 test("job cancel endpoint updates control metadata", async () => {
   const res = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest({

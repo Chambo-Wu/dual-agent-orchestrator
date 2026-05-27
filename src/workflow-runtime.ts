@@ -436,6 +436,7 @@ function emitVerificationCheckEvents(
         verification_check_status: checkStatus,
         verification_status: result.status,
         verification_source: "task_run",
+        related_artifact_ids: check.relatedArtifactIds ?? [],
         passed: check.passed,
         detail: check.detail,
         summary: `${check.name}: ${check.detail}`,

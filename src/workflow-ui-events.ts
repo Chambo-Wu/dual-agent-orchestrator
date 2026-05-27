@@ -499,6 +499,9 @@ export function normalizeWorkflowEvent(
           verification_check_status: asString(internal.data.verification_check_status) || (passed ? "passed" : insufficient ? "insufficient" : "failed"),
           verification_status: asString(internal.data.verification_status),
           verification_source: asString(internal.data.verification_source),
+          related_artifact_ids: Array.isArray(internal.data.related_artifact_ids)
+            ? internal.data.related_artifact_ids.filter((item): item is string => typeof item === "string")
+            : [],
           passed,
           detail: asString(internal.data.detail),
           failure_category: passed

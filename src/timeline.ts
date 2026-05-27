@@ -590,14 +590,19 @@ export function renderTimelineHtml(
       const failureCategoryLabel = typeof event.meta?.failure_category_label === 'string'
         ? event.meta.failure_category_label
         : (failureCategory ? escapeHtml(failureCategory) : '');
+      const artifactId = typeof event.meta?.artifact_id === 'string' ? event.meta.artifact_id : '';
+      const relatedTaskRunId = typeof event.meta?.related_task_run_id === 'string' ? event.meta.related_task_run_id : '';
       const card = document.createElement('div');
       card.className = 'event-card agent-' + event.agent + ' status-' + event.status;
       card.setAttribute('data-event-type', event.type || '');
       if (event.taskRunId) card.setAttribute('data-task-run-id', event.taskRunId);
+      if (artifactId) card.setAttribute('data-artifact-id', artifactId);
+      if (relatedTaskRunId) card.setAttribute('data-related-task-run-id', relatedTaskRunId);
       if (event.meta?.tool) card.setAttribute('data-event-tool', event.meta.tool);
       if (failureCategory) card.setAttribute('data-failure-category', failureCategory);
       if (event.meta?.verification_check_name) card.setAttribute('data-verification-check-name', event.meta.verification_check_name);
       if (event.meta?.verification_check_status) card.setAttribute('data-verification-check-status', event.meta.verification_check_status);
+      if (Array.isArray(event.meta?.related_artifact_ids)) card.setAttribute('data-related-artifact-ids', event.meta.related_artifact_ids.join(','));
       card.innerHTML = \`
         <div class="event-header">
           <span class="event-title">\${escapeHtml(event.title)}</span>
@@ -781,6 +786,7 @@ export function renderTimelineHtml(
         writeAnalysisFilterToUrl(kind, value);
         let firstMatch = null;
         const matchedTaskIds = new Set();
+        const matchedArtifactIds = new Set();
         const matchedWorkflowIds = new Set();
         analysisChips.forEach((chip) => chip.classList.toggle('is-active', chip === sourceChip));
         eventCards.forEach((card) => {
@@ -789,7 +795,10 @@ export function renderTimelineHtml(
           const eventType = card.getAttribute('data-event-type');
           const verificationCheckName = card.getAttribute('data-verification-check-name');
           const verificationCheckStatus = card.getAttribute('data-verification-check-status');
+          const relatedArtifactIds = (card.getAttribute('data-related-artifact-ids') || '').split(',').filter(Boolean);
           const taskRunId = card.getAttribute('data-task-run-id');
+          const relatedTaskRunId = card.getAttribute('data-related-task-run-id');
+          const artifactId = card.getAttribute('data-artifact-id');
           const matches = kind === 'tool'
             ? eventTool === value
             : kind === 'failure_category'
@@ -812,6 +821,15 @@ export function renderTimelineHtml(
           if (matches && taskRunId) {
             matchedTaskIds.add(taskRunId);
           }
+          if (matches && relatedTaskRunId) {
+            matchedTaskIds.add(relatedTaskRunId);
+          }
+          if (matches && artifactId) {
+            matchedArtifactIds.add(artifactId);
+          }
+          if (matches) {
+            relatedArtifactIds.forEach((item) => matchedArtifactIds.add(item));
+          }
         });
         analysisTaskCards.forEach((card) => {
           const taskId = card.getAttribute('data-task-id');
@@ -821,7 +839,7 @@ export function renderTimelineHtml(
           const matches = kind === 'verifier' || kind === 'verification_check'
             ? assignee === 'verifier' || verified === 'true'
             : kind === 'artifact'
-              ? !!taskId && matchedTaskIds.has(taskId)
+              ? !!taskId && (matchedTaskIds.has(taskId) || matchedArtifactIds.size > 0)
               : !!taskId && matchedTaskIds.has(taskId);
           if (kind === 'verifier' || kind === 'verification_check' || kind === 'artifact') {
             card.classList.toggle('is-analysis-match', matches);
@@ -1038,7 +1056,12 @@ function renderEventCard(event: WorkflowUiEvent): string {
   const eventTool = typeof event.meta.tool === "string" ? event.meta.tool : "";
   const verificationCheckName = typeof event.meta.verification_check_name === "string" ? event.meta.verification_check_name : "";
   const verificationCheckStatus = typeof event.meta.verification_check_status === "string" ? event.meta.verification_check_status : "";
-  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""} onclick="this.classList.toggle('expanded')">
+  const relatedArtifactIds = Array.isArray(event.meta.related_artifact_ids)
+    ? event.meta.related_artifact_ids.filter((item): item is string => typeof item === "string")
+    : [];
+  const artifactId = typeof event.meta.artifact_id === "string" ? event.meta.artifact_id : "";
+  const relatedTaskRunId = typeof event.meta.related_task_run_id === "string" ? event.meta.related_task_run_id : "";
+  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${artifactId ? ` data-artifact-id="${escapeHtmlAttribute(artifactId)}"` : ""}${relatedTaskRunId ? ` data-related-task-run-id="${escapeHtmlAttribute(relatedTaskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""}${relatedArtifactIds.length > 0 ? ` data-related-artifact-ids="${escapeHtmlAttribute(relatedArtifactIds.join(","))}"` : ""} onclick="this.classList.toggle('expanded')">
   <div class="event-header">
     <span class="event-title">${escapeHtml(event.title)}</span>
     <span class="event-time">${formatTime(event.time)}</span>
