@@ -808,7 +808,7 @@ export function renderTimelineHtml(
                 : kind === 'verification_check'
                   ? (verificationCheckName + ':' + verificationCheckStatus) === value
                   : kind === 'artifact'
-                    ? eventType === 'artifact.created'
+                    ? artifactId === value || relatedArtifactIds.includes(value)
                     : false;
           card.classList.toggle('is-analysis-match', matches);
           card.classList.toggle('is-analysis-dimmed', !matches);
@@ -1134,11 +1134,15 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
   blockerPoints: Array<{ label: string; count: number }>;
   verificationSignals: { passed: number; failed: number };
   verificationChecks: Array<{ name: string; status: string; count: number }>;
-  artifactSignals: { created: number };
+  artifactSignals: {
+    created: number;
+    items: Array<{ id: string; label: string; count: number }>;
+  };
 } {
   const toolCounts = new Map<string, number>();
   const blockerCounts = new Map<string, number>();
   const verificationCheckCounts = new Map<string, { name: string; status: string; count: number }>();
+  const artifactCounts = new Map<string, { id: string; label: string; count: number }>();
   let verificationPassed = 0;
   let verificationFailed = 0;
   let artifactCreated = 0;
@@ -1169,6 +1173,18 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     }
     if (event.type === "artifact.created") {
       artifactCreated += 1;
+      const artifactId = typeof event.meta.artifact_id === "string" && event.meta.artifact_id.trim().length > 0
+        ? event.meta.artifact_id.trim()
+        : "";
+      if (artifactId) {
+        const path = typeof event.meta.path === "string" && event.meta.path.trim().length > 0
+          ? event.meta.path.trim()
+          : "";
+        const label = path ? path.split(/[\\/]/).pop() || artifactId : artifactId;
+        const current = artifactCounts.get(artifactId) ?? { id: artifactId, label, count: 0 };
+        current.count += 1;
+        artifactCounts.set(artifactId, current);
+      }
     }
 
     if (event.status === "blocked" || event.status === "awaiting_approval" || event.type.endsWith(".failed")) {
@@ -1188,9 +1204,11 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
   const verificationChecks = [...verificationCheckCounts.values()]
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name) || a.status.localeCompare(b.status));
+  const artifactItems = [...artifactCounts.values()]
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   return {
-    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0 || verificationChecks.length > 0,
+    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0 || verificationChecks.length > 0 || artifactCreated > 0,
     toolUsage,
     blockerPoints,
     verificationSignals: {
@@ -1200,6 +1218,7 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     verificationChecks,
     artifactSignals: {
       created: artifactCreated,
+      items: artifactItems,
     },
   };
 }
@@ -1369,7 +1388,10 @@ function renderWorkflowAnalysisPanel(
     : "";
   const artifactSection = runtimeAnalysis.artifactSignals.created > 0
     ? `<div class="subtle">Artifact output</div><div class="history-list" style="margin-bottom:12px">
-        <button type="button" class="analysis-chip" data-analysis-filter="artifact" data-analysis-value="artifact.created"><strong>Artifacts created</strong> · ${runtimeAnalysis.artifactSignals.created}</button>
+        <button type="button" class="analysis-chip" data-analysis-filter="artifact_group" data-analysis-value="artifact.created"><strong>Artifacts created</strong> · ${runtimeAnalysis.artifactSignals.created}</button>
+        ${runtimeAnalysis.artifactSignals.items.slice(0, 6).map((entry) => `
+          <button type="button" class="analysis-chip" data-analysis-filter="artifact" data-analysis-value="${escapeHtmlAttribute(entry.id)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
+        `).join("")}
       </div>`
     : "";
   const toolSection = runtimeAnalysis.toolUsage.length > 0

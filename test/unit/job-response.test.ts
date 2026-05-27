@@ -462,6 +462,7 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes("Verification: 0 passed, 1 failed"), true);
   assert.equal(html.includes("Artifact output"), true);
   assert.equal(html.includes("Artifacts created"), true);
+  assert.equal(html.includes("report.md"), true);
   assert.equal(html.includes("Verification failed"), true);
   assert.equal(html.includes("Verification checks"), true);
   assert.equal(html.includes("artifact_presence"), true);
@@ -472,6 +473,8 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes('data-analysis-filter="verifier"'), true);
   assert.equal(html.includes('data-analysis-filter="verification_check"'), true);
   assert.equal(html.includes('data-analysis-filter="artifact"'), true);
+  assert.equal(html.includes('data-analysis-filter="artifact_group"'), true);
+  assert.equal(html.includes('data-analysis-value="artifact_report_1"'), true);
   assert.equal(html.includes('data-analysis-filter="tool"'), true);
   assert.equal(html.includes('data-analysis-filter="failure_category"'), true);
   assert.equal(html.includes('data-event-type="system.verification_failed"'), true);
