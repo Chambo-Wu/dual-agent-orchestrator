@@ -470,6 +470,49 @@ export function normalizeWorkflowEvent(
         },
       });
 
+    case "system.verification_check_passed":
+    case "system.verification_check_failed":
+    case "system.verification_check_insufficient": {
+      const passed = internal.type === "system.verification_check_passed";
+      const insufficient = internal.type === "system.verification_check_insufficient";
+      const status: UiEventStatus = passed ? "success" : insufficient ? "blocked" : "failed";
+      const summary = asString(internal.data.summary)
+        || `${asString(internal.data.verification_check_name) || "verification_check"}: ${asString(internal.data.detail) || "Verification check completed."}`;
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: taskRunId || asString(internal.data.task_id) || undefined,
+        agent: "verifier",
+        phase: "result",
+        type: internal.type,
+        title: passed ? "Verification check passed" : insufficient ? "Verification check insufficient" : "Verification check failed",
+        summary,
+        status,
+        step: internal.step,
+        meta: {
+          task_id: asString(internal.data.task_id),
+          title: asString(internal.data.title),
+          kind: asString(internal.data.kind),
+          role: asString(internal.data.role),
+          verification_check_name: asString(internal.data.verification_check_name),
+          verification_check_status: asString(internal.data.verification_check_status) || (passed ? "passed" : insufficient ? "insufficient" : "failed"),
+          verification_status: asString(internal.data.verification_status),
+          verification_source: asString(internal.data.verification_source),
+          passed,
+          detail: asString(internal.data.detail),
+          failure_category: passed
+            ? null
+            : classifyFailure({
+                type: internal.type,
+                status,
+                summary,
+                verificationStatus: asString(internal.data.verification_status),
+              }),
+        },
+      });
+    }
+
     case "workflow.complexity.assessed": {
       const mode = asString(internal.data.execution_mode) || "orchestrated";
       const score = typeof internal.data.complexity_score === "number" ? internal.data.complexity_score : 0;

@@ -11,7 +11,7 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { ApprovalRequest, Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, Task, TaskRun } from "./types.js";
+import type { ApprovalRequest, Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, Task, TaskRun, VerificationCheck } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
@@ -273,6 +273,7 @@ async function verifyWorkflowPayload(
       meta?: Record<string, unknown>,
       phase?: WorkflowUiEvent["phase"],
     ) => void;
+    emitVerificationCheck?: (check: VerificationCheck, verificationStatus: string, meta?: Record<string, unknown>) => void;
   },
 ): Promise<Job> {
   const executorHistory = payload.taskRuns.flatMap((taskRun) => taskRun.executorHistory ?? []);
@@ -314,6 +315,23 @@ async function verifyWorkflowPayload(
       verification_status: verificationResult.status,
       ...verifierMeta,
     });
+  }
+  for (const check of verificationResult.checks) {
+    const meta = {
+      verifier_count: verificationResult.checks.length,
+      verification_status: verificationResult.status,
+      verification_check_name: check.name,
+      verification_check_status: check.status ?? (check.passed ? "passed" : "failed"),
+      verification_source: "job",
+      passed: check.passed,
+      detail: check.detail,
+      ...verifierMeta,
+    };
+    if (input.emitVerificationCheck) {
+      input.emitVerificationCheck(check, verificationResult.status, meta);
+    } else {
+      input.emitLifecycle(mapVerificationCheckType(check), check.passed ? "Verification check passed" : "Verification check reported issues", check.detail, mapVerificationCheckStatus(check), meta);
+    }
   }
   return verifiedJob;
 }
@@ -1180,6 +1198,60 @@ function createLifecycleEvent(input: {
   });
 }
 
+function mapVerificationCheckType(check: VerificationCheck): string {
+  if (check.passed) {
+    return "system.verification_check_passed";
+  }
+  return check.status === "insufficient"
+    ? "system.verification_check_insufficient"
+    : "system.verification_check_failed";
+}
+
+function mapVerificationCheckStatus(check: VerificationCheck): WorkflowUiEvent["status"] {
+  if (check.passed) {
+    return "success";
+  }
+  return check.status === "insufficient" ? "blocked" : "failed";
+}
+
+function createVerificationCheckEvent(input: {
+  jobId: string;
+  seq: number;
+  time: string;
+  check: VerificationCheck;
+  taskRunId?: string;
+  source: "task_run" | "job";
+  verificationStatus?: string;
+}): WorkflowUiEvent {
+  const type = mapVerificationCheckType(input.check);
+  const status = mapVerificationCheckStatus(input.check);
+  const checkStatus = input.check.status ?? (input.check.passed ? "passed" : "failed");
+  return createUiEvent({
+    jobId: input.jobId,
+    seq: input.seq,
+    time: input.time,
+    taskRunId: input.taskRunId,
+    agent: "verifier",
+    phase: "result",
+    type,
+    title: input.check.passed
+      ? "Verification check passed"
+      : checkStatus === "insufficient"
+        ? "Verification check insufficient"
+        : "Verification check failed",
+    summary: `${input.check.name}: ${input.check.detail}`,
+    status,
+    meta: attachFailureCategory(type, status, input.check.detail, {
+      verification_check_name: input.check.name,
+      verification_check_status: checkStatus,
+      verification_status: input.verificationStatus ?? null,
+      verification_source: input.source,
+      passed: input.check.passed,
+      detail: input.check.detail,
+    }),
+  });
+}
+
 function attachFailureCategory(
   type: string,
   status: WorkflowUiEvent["status"],
@@ -1291,6 +1363,29 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
         },
       }));
     }
+
+    for (const check of taskRun.verificationResult?.checks ?? []) {
+      push(createVerificationCheckEvent({
+        jobId: record.job.id,
+        seq,
+        time: record.savedAt,
+        check,
+        taskRunId: taskRun.id,
+        source: "task_run",
+        verificationStatus: taskRun.verificationResult?.status,
+      }));
+    }
+  }
+
+  for (const check of record.job.verificationResult?.checks ?? []) {
+    push(createVerificationCheckEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.savedAt,
+      check,
+      source: "job",
+      verificationStatus: record.job.verificationResult?.status,
+    }));
   }
 
   for (const artifact of record.artifacts) {
@@ -2223,6 +2318,17 @@ async function executeTaskGoal(
       meta: attachFailureCategory(type, status, summary, meta),
     }));
   };
+  const emitVerificationCheck = (check: VerificationCheck, verificationStatus: string, meta: Record<string, unknown> = {}) => {
+    emitUiEvent(createVerificationCheckEvent({
+      jobId,
+      seq: getNextSeq(jobId),
+      time: new Date().toISOString(),
+      check,
+      taskRunId,
+      source: "job",
+      verificationStatus,
+    }));
+  };
   const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
     persistTeamApprovalSnapshot(jobId, event);
     emitUiEvent(normalizeWorkflowEvent(
@@ -2341,6 +2447,7 @@ async function executeTaskGoal(
       goal: userGoal,
       config: verificationConfig,
       emitLifecycle,
+      emitVerificationCheck,
     });
 
     const jobRecordPath = persistWorkflowPayload({
@@ -2420,6 +2527,17 @@ async function executeTeamGoal(
       phase,
       taskRunId,
       meta: attachFailureCategory(type, status, summary, meta),
+    }));
+  };
+  const emitVerificationCheck = (check: VerificationCheck, verificationStatus: string, meta: Record<string, unknown> = {}) => {
+    emitUiEvent(createVerificationCheckEvent({
+      jobId,
+      seq: getNextSeq(jobId),
+      time: new Date().toISOString(),
+      check,
+      taskRunId,
+      source: "job",
+      verificationStatus,
     }));
   };
   const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
@@ -2525,6 +2643,7 @@ async function executeTeamGoal(
       goal: userGoal,
       config: verificationConfig,
       emitLifecycle,
+      emitVerificationCheck,
     });
 
     const jobRecordPath = persistWorkflowPayload({

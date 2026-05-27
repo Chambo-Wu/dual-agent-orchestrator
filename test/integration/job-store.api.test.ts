@@ -638,15 +638,18 @@ test("job create endpoint supports team mode with the same control-plane contrac
     const record = readJobRecord(body.job_id);
     assert.notEqual(record, null);
     assert.equal(record?.job.verificationResult?.status, "verified");
-    assert.equal(record?.job.verificationResult?.checks.length, 5);
+    assert.equal(record?.job.verificationResult?.checks.length, 6);
 
     const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
     await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${body.job_id}/events`), eventsRes);
-    const eventsBody = JSON.parse(eventsRes.body) as { events: Array<{ type: string; agent: string; status: string }> };
+    const eventsBody = JSON.parse(eventsRes.body) as { events: Array<{ type: string; agent: string; status: string; meta?: Record<string, unknown> }> };
     const verificationEvent = eventsBody.events.find((event) => event.type === "system.verification_passed");
     assert.equal(Boolean(verificationEvent), true);
     assert.equal(verificationEvent?.agent, "system");
     assert.equal(verificationEvent?.status, "success");
+    const checkEvent = eventsBody.events.find((event) => event.type === "system.verification_check_passed" && event.meta?.verification_check_name === "artifact_presence");
+    assert.equal(Boolean(checkEvent), true);
+    assert.equal(checkEvent?.agent, "verifier");
   } finally {
     __testables.setTeamExecutorForTests(null);
   }

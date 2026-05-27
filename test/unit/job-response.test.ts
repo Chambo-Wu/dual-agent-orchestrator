@@ -379,6 +379,25 @@ test("timeline html renders runtime analysis summaries", () => {
         jobId: "job_analysis_1",
         seq: 3,
         time: new Date().toISOString(),
+        agent: "verifier",
+        phase: "result",
+        type: "system.verification_check_insufficient",
+        title: "Verification check insufficient",
+        summary: "artifact_presence: Tool calls were made but no artifacts were produced.",
+        status: "blocked",
+        taskRunId: "t2",
+        meta: {
+          verification_check_name: "artifact_presence",
+          verification_check_status: "insufficient",
+          verification_status: "insufficient",
+          failure_category: "verification_failure",
+        },
+      },
+      {
+        id: "evt_4",
+        jobId: "job_analysis_1",
+        seq: 4,
+        time: new Date().toISOString(),
         agent: "system",
         phase: "result",
         type: "artifact.created",
@@ -442,15 +461,21 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes("Artifact output"), true);
   assert.equal(html.includes("Artifacts created"), true);
   assert.equal(html.includes("Verification failed"), true);
+  assert.equal(html.includes("Verification checks"), true);
+  assert.equal(html.includes("artifact_presence"), true);
   assert.equal(html.includes("Tool activity"), true);
   assert.equal(html.includes("web_search"), true);
   assert.equal(html.includes("Common issues"), true);
   assert.equal(html.includes("verification_failure"), true);
   assert.equal(html.includes('data-analysis-filter="verifier"'), true);
+  assert.equal(html.includes('data-analysis-filter="verification_check"'), true);
   assert.equal(html.includes('data-analysis-filter="artifact"'), true);
   assert.equal(html.includes('data-analysis-filter="tool"'), true);
   assert.equal(html.includes('data-analysis-filter="failure_category"'), true);
   assert.equal(html.includes('data-event-type="system.verification_failed"'), true);
+  assert.equal(html.includes('data-event-type="system.verification_check_insufficient"'), true);
+  assert.equal(html.includes('data-verification-check-name="artifact_presence"'), true);
+  assert.equal(html.includes('data-verification-check-status="insufficient"'), true);
   assert.equal(html.includes('data-event-type="artifact.created"'), true);
   assert.equal(html.includes('data-task-run-id="t2"'), true);
   assert.equal(html.includes('data-event-tool="web_search"'), true);
@@ -684,6 +709,31 @@ test("workflow UI classifies replan rejections and verification failures", () =>
   assert.equal(replanRejected.type, "planner.workflow_replan_rejected");
   assert.equal(replanRejected.meta.failure_category, "validation_failure");
   assert.equal(verificationFailed.meta.failure_category, "verification_failure");
+});
+
+test("workflow UI normalizes verification check events", () => {
+  const check = normalizeWorkflowEvent({
+    type: "system.verification_check_insufficient",
+    step: 3,
+    data: {
+      task_id: "t_verify",
+      title: "Verify artifact",
+      kind: "verify",
+      role: "verifier",
+      verification_check_name: "artifact_presence",
+      verification_check_status: "insufficient",
+      verification_status: "insufficient",
+      verification_source: "task_run",
+      passed: false,
+      detail: "Tool calls were made but no artifacts were produced.",
+    },
+  }, "job_1", 5);
+
+  assert.equal(check.agent, "verifier");
+  assert.equal(check.status, "blocked");
+  assert.equal(check.taskRunId, "t_verify");
+  assert.equal(check.meta.verification_check_name, "artifact_presence");
+  assert.equal(check.meta.failure_category, "verification_failure");
 });
 
 test("workflow UI prefers normalized planner and executor contract fields", () => {

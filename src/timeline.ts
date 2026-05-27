@@ -592,6 +592,12 @@ export function renderTimelineHtml(
         : (failureCategory ? escapeHtml(failureCategory) : '');
       const card = document.createElement('div');
       card.className = 'event-card agent-' + event.agent + ' status-' + event.status;
+      card.setAttribute('data-event-type', event.type || '');
+      if (event.taskRunId) card.setAttribute('data-task-run-id', event.taskRunId);
+      if (event.meta?.tool) card.setAttribute('data-event-tool', event.meta.tool);
+      if (failureCategory) card.setAttribute('data-failure-category', failureCategory);
+      if (event.meta?.verification_check_name) card.setAttribute('data-verification-check-name', event.meta.verification_check_name);
+      if (event.meta?.verification_check_status) card.setAttribute('data-verification-check-status', event.meta.verification_check_status);
       card.innerHTML = \`
         <div class="event-header">
           <span class="event-title">\${escapeHtml(event.title)}</span>
@@ -781,6 +787,8 @@ export function renderTimelineHtml(
           const eventTool = card.getAttribute('data-event-tool');
           const failureCategory = card.getAttribute('data-failure-category');
           const eventType = card.getAttribute('data-event-type');
+          const verificationCheckName = card.getAttribute('data-verification-check-name');
+          const verificationCheckStatus = card.getAttribute('data-verification-check-status');
           const taskRunId = card.getAttribute('data-task-run-id');
           const matches = kind === 'tool'
             ? eventTool === value
@@ -788,9 +796,11 @@ export function renderTimelineHtml(
               ? failureCategory === value
               : kind === 'verifier'
                 ? eventType === value
-                : kind === 'artifact'
-                  ? eventType === 'artifact.created'
-                  : false;
+                : kind === 'verification_check'
+                  ? (verificationCheckName + ':' + verificationCheckStatus) === value
+                  : kind === 'artifact'
+                    ? eventType === 'artifact.created'
+                    : false;
           card.classList.toggle('is-analysis-match', matches);
           card.classList.toggle('is-analysis-dimmed', !matches);
           if (matches && !firstMatch) {
@@ -808,12 +818,12 @@ export function renderTimelineHtml(
           const assignee = card.getAttribute('data-assignee');
           const verified = card.getAttribute('data-verified');
           const workflowId = card.getAttribute('data-workflow-id');
-          const matches = kind === 'verifier'
+          const matches = kind === 'verifier' || kind === 'verification_check'
             ? assignee === 'verifier' || verified === 'true'
             : kind === 'artifact'
               ? !!taskId && matchedTaskIds.has(taskId)
               : !!taskId && matchedTaskIds.has(taskId);
-          if (kind === 'verifier' || kind === 'artifact') {
+          if (kind === 'verifier' || kind === 'verification_check' || kind === 'artifact') {
             card.classList.toggle('is-analysis-match', matches);
             card.classList.toggle('is-analysis-dimmed', !matches);
             if (matches && workflowId) {
@@ -1026,7 +1036,9 @@ function renderEventCard(event: WorkflowUiEvent): string {
     ? event.meta.failure_category_label
     : (failureCategory ? getFailureCategoryLabel(failureCategory) : "");
   const eventTool = typeof event.meta.tool === "string" ? event.meta.tool : "";
-  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""} onclick="this.classList.toggle('expanded')">
+  const verificationCheckName = typeof event.meta.verification_check_name === "string" ? event.meta.verification_check_name : "";
+  const verificationCheckStatus = typeof event.meta.verification_check_status === "string" ? event.meta.verification_check_status : "";
+  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""} onclick="this.classList.toggle('expanded')">
   <div class="event-header">
     <span class="event-title">${escapeHtml(event.title)}</span>
     <span class="event-time">${formatTime(event.time)}</span>
@@ -1098,10 +1110,12 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
   toolUsage: Array<{ name: string; count: number }>;
   blockerPoints: Array<{ label: string; count: number }>;
   verificationSignals: { passed: number; failed: number };
+  verificationChecks: Array<{ name: string; status: string; count: number }>;
   artifactSignals: { created: number };
 } {
   const toolCounts = new Map<string, number>();
   const blockerCounts = new Map<string, number>();
+  const verificationCheckCounts = new Map<string, { name: string; status: string; count: number }>();
   let verificationPassed = 0;
   let verificationFailed = 0;
   let artifactCreated = 0;
@@ -1117,6 +1131,18 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     }
     if (event.type === "system.verification_failed") {
       verificationFailed += 1;
+    }
+    if (event.type.startsWith("system.verification_check_")) {
+      const name = typeof event.meta.verification_check_name === "string" && event.meta.verification_check_name.trim().length > 0
+        ? event.meta.verification_check_name.trim()
+        : "verification_check";
+      const status = typeof event.meta.verification_check_status === "string" && event.meta.verification_check_status.trim().length > 0
+        ? event.meta.verification_check_status.trim()
+        : event.status;
+      const key = `${name}:${status}`;
+      const current = verificationCheckCounts.get(key) ?? { name, status, count: 0 };
+      current.count += 1;
+      verificationCheckCounts.set(key, current);
     }
     if (event.type === "artifact.created") {
       artifactCreated += 1;
@@ -1137,15 +1163,18 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
   const blockerPoints = [...blockerCounts.entries()]
     .map(([label, count]) => ({ label, count }))
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const verificationChecks = [...verificationCheckCounts.values()]
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name) || a.status.localeCompare(b.status));
 
   return {
-    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0,
+    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0 || verificationChecks.length > 0,
     toolUsage,
     blockerPoints,
     verificationSignals: {
       passed: verificationPassed,
       failed: verificationFailed,
     },
+    verificationChecks,
     artifactSignals: {
       created: artifactCreated,
     },
@@ -1310,6 +1339,11 @@ function renderWorkflowAnalysisPanel(
         ${runtimeAnalysis.verificationSignals.failed > 0 ? `<button type="button" class="analysis-chip" data-analysis-filter="verifier" data-analysis-value="system.verification_failed"><strong>Verification failed</strong> · ${runtimeAnalysis.verificationSignals.failed}</button>` : ""}
       </div>`
     : "";
+  const verificationCheckSection = runtimeAnalysis.verificationChecks.length > 0
+    ? `<div class="subtle">Verification checks</div><div class="history-list" style="margin-bottom:12px">${runtimeAnalysis.verificationChecks.slice(0, 8).map((entry) => `
+        <button type="button" class="analysis-chip" data-analysis-filter="verification_check" data-analysis-value="${escapeHtmlAttribute(`${entry.name}:${entry.status}`)}"><strong>${escapeHtml(entry.name)}</strong> · ${escapeHtml(entry.status)} · ${entry.count}</button>
+      `).join("")}</div>`
+    : "";
   const artifactSection = runtimeAnalysis.artifactSignals.created > 0
     ? `<div class="subtle">Artifact output</div><div class="history-list" style="margin-bottom:12px">
         <button type="button" class="analysis-chip" data-analysis-filter="artifact" data-analysis-value="artifact.created"><strong>Artifacts created</strong> · ${runtimeAnalysis.artifactSignals.created}</button>
@@ -1325,7 +1359,7 @@ function renderWorkflowAnalysisPanel(
         <button type="button" class="analysis-chip" data-analysis-filter="failure_category" data-analysis-value="${escapeHtmlAttribute(entry.label)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
       `).join("")}</div>`
     : `<div class="subtle" style="margin-top:12px">No issue signals recorded.</div>`;
-  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${artifactSection}${toolSection}${blockerSection}</div>`;
+  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${verificationCheckSection}${artifactSection}${toolSection}${blockerSection}</div>`;
 }
 
 function assignTaskLevels(

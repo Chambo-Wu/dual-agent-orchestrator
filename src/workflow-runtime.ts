@@ -412,6 +412,38 @@ function mergePreflightChecks(result: VerificationResult, preflightChecks: Verif
   };
 }
 
+function emitVerificationCheckEvents(
+  task: WorkflowTaskSpec,
+  result: VerificationResult,
+  step: number,
+  options?: RunOptions,
+): void {
+  for (const check of result.checks) {
+    const checkStatus = check.status ?? (check.passed ? "passed" : "failed");
+    options?.onEvent?.({
+      type: check.passed
+        ? "system.verification_check_passed"
+        : checkStatus === "insufficient"
+          ? "system.verification_check_insufficient"
+          : "system.verification_check_failed",
+      step,
+      data: {
+        task_id: task.id,
+        title: task.title,
+        kind: task.kind,
+        role: task.role,
+        verification_check_name: check.name,
+        verification_check_status: checkStatus,
+        verification_status: result.status,
+        verification_source: "task_run",
+        passed: check.passed,
+        detail: check.detail,
+        summary: `${check.name}: ${check.detail}`,
+      },
+    });
+  }
+}
+
 function buildDependencyOutputs(task: WorkflowTaskSpec, outcomes: Map<string, WorkflowTaskOutcome>): string[] {
   return task.depends_on
     .map((depId) => outcomes.get(depId)?.output ?? "")
@@ -1309,6 +1341,7 @@ export async function runWorkflowPlan(
           await runVerifiers(verificationContext, verifierSelection.verifiers),
           verifierSelection.preflightChecks,
         );
+        emitVerificationCheckEvents(effectiveTask, verificationResult, step, options);
         const passed = verificationResultPassed(verificationResult);
         const verificationSummary = summarizeVerification(verificationResult);
         const failureStatus = verificationResult.status === "insufficient"
