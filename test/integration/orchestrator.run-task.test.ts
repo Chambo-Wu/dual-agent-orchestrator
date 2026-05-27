@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RunCancelledError, runTask } from "../../src/orchestrator.js";
+import { createServer } from "node:http";
+import { RunCancelledError, runExecutorStep, runTask } from "../../src/orchestrator.js";
 import { buildMinimalConfig, buildRoutePolicy, createFakeRuntimeDeps, executorSuccess, fakeRunTaskResult, plannerFinal, plannerNeedExecutor } from "../helpers/fake-runtime.js";
 
 test("runTask completes immediately when fake planner returns final", async () => {
@@ -78,4 +79,58 @@ test("runTask uses fake executor step after planner requests execution", async (
   assert.equal(result.output, "completed after executor");
   assert.equal(result.executorHistory.length, 1);
   assert.equal(result.executorHistory[0]?.summary, "executor ok");
+});
+
+test("runExecutorStep enforces executor tool policy against native tool calls", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      choices: [{
+        message: {
+          content: "",
+          tool_calls: [{
+            id: "call_write",
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({ path: "runtime/blocked.txt", content: "blocked" }),
+            },
+          }],
+        },
+      }],
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  assert.notEqual(address, null);
+
+  try {
+    const config = buildMinimalConfig();
+    config.executor = {
+      ...config.executor,
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    };
+    config.executorToolPolicy = {
+      allow: ["read_file"],
+      deny: ["write_file"],
+    };
+
+    const result = await runExecutorStep(
+      config,
+      plannerNeedExecutor({
+        instruction: "Try to write a file",
+        allowed_tools: ["read_file", "write_file"],
+        expected_output: "done",
+      }),
+      1,
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error, "Tool write_file is not allowed for this step");
+    assert.deepEqual(result.artifacts, []);
+    assert.deepEqual(result.tool_calls_made.map((call) => call.tool), ["write_file"]);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  }
 });

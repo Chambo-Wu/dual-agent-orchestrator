@@ -47,6 +47,8 @@ declare module "node:http" {
     on(event: "data", listener: (chunk: string | Uint8Array) => void): this;
     on(event: "end", listener: () => void): this;
     on(event: "error", listener: (error: Error) => void): this;
+    on(event: "close", listener: () => void): this;
+    on(event: "aborted", listener: () => void): this;
   }
 
   export interface ServerResponse {
@@ -54,6 +56,7 @@ declare module "node:http" {
     setHeader(name: string, value: string): void;
     write(chunk: string): void;
     end(chunk?: string): void;
+    on(event: "close", listener: () => void): this;
   }
 
   export function createServer(

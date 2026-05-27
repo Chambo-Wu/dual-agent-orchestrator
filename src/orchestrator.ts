@@ -8,7 +8,7 @@ import type { RunLogger } from "./logger.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
-import type { ExecutionMode, ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskComplexityAssessment, TaskType } from "./types.js";
+import type { AgentToolPolicy, ExecutionMode, ExecutorOutput, OrchestratorConfig, OrchestratorStepState, PlannerExecutorRequest, PlannerOutput, RoutePolicy, RunOptions, RunTaskResult, TaskComplexityAssessment, TaskType } from "./types.js";
 import { Tracer } from "./trace.js";
 import { LoopDetector } from "./loop-detector.js";
 import { compressJsonOutput } from "./compress.js";
@@ -325,6 +325,32 @@ function normalizeRequestKey(request: PlannerExecutorRequest | undefined): strin
     allowed_tools: [...request.allowed_tools].sort(),
     expected_output: request.expected_output.replace(/\s+/g, " ").trim(),
   });
+}
+
+function applyToolPolicy(tools: string[], policy?: AgentToolPolicy): string[] {
+  let effectiveTools = [...tools];
+  if (policy?.allow && policy.allow.length > 0) {
+    const allowed = new Set(policy.allow);
+    effectiveTools = effectiveTools.filter((tool) => allowed.has(tool));
+  }
+  if (policy?.deny && policy.deny.length > 0) {
+    const denied = new Set(policy.deny);
+    effectiveTools = effectiveTools.filter((tool) => !denied.has(tool));
+  }
+  return Array.from(new Set(effectiveTools));
+}
+
+function applyExecutorToolPolicy(
+  request: PlannerExecutorRequest,
+  policy?: AgentToolPolicy,
+): PlannerExecutorRequest {
+  if (!policy) {
+    return request;
+  }
+  return {
+    ...request,
+    allowed_tools: applyToolPolicy(request.allowed_tools, policy),
+  };
 }
 
 function summarizeRecentArtifacts(executorHistory: ExecutorOutput[]): string {
@@ -1115,6 +1141,14 @@ function finalizeExecutorResult(
   const usedNativeToolCalls = conversation.executedCalls.length > 0;
   const usefulProgress = hasUsefulExecutorProgress(conversation);
   const parsed = parseExecutorOutput(rawExecutorText);
+  const parsedSummary = parsed.summary.trim();
+  const parsedRawResult = parsed.raw_result.trim();
+  const conversationSummary = conversation.lastSummary.trim();
+  const parsedAddsSynthesis = parsedSummary.length > 0
+    && parsedSummary !== conversationSummary
+    && !/^Command (succeeded|failed|exited)\b/i.test(parsedSummary)
+    && !/^Listed \d+ entries\b/i.test(parsedSummary)
+    && !/^Read file\b/i.test(parsedSummary);
   const isFormatError = parsed.summary === "AI 返回的格式异常，请重试或更换模型"
     || parsed.error?.startsWith("Unable to parse executor output as JSON");
   const modelReturnedStructuredJson = !isFormatError;
@@ -1125,6 +1159,8 @@ function finalizeExecutorResult(
 
   const summary = honorModelTerminalAssessment
     ? parsed.summary
+    : usedNativeToolCalls && parsedAddsSynthesis
+      ? parsed.summary
     : usedNativeToolCalls
       ? (conversation.lastSummary || parsed.summary)
     : !isFormatError
@@ -1132,6 +1168,8 @@ function finalizeExecutorResult(
       : (conversation.lastSummary || parsed.summary);
   const rawResult = honorModelTerminalAssessment
     ? (parsed.raw_result || conversation.lastRawResult || JSON.stringify(executorResponse.raw))
+    : usedNativeToolCalls && parsedAddsSynthesis
+      ? (parsedRawResult || conversation.lastRawResult || JSON.stringify(executorResponse.raw))
     : usedNativeToolCalls
       ? (conversation.lastRawResult || JSON.stringify(executorResponse.raw))
     : parsed.raw_result && parsed.raw_result !== (executorResponse.content || executorResponse.reasoning || "")
@@ -1848,23 +1886,29 @@ export async function runExecutorStep(
     throw new Error("Planner requested executor but did not provide executor_request");
   }
 
-  const allowedTools = TOOL_DEFINITIONS.filter((tool) => planner.executor_request?.allowed_tools.includes(tool.name));
+  const executorRequest = applyExecutorToolPolicy(planner.executor_request, config.executorToolPolicy);
+  const scopedPlanner: PlannerOutput = {
+    ...planner,
+    executor_request: executorRequest,
+  };
+  const allowedTools = TOOL_DEFINITIONS.filter((tool) => executorRequest.allowed_tools.includes(tool.name));
   logger?.log("executor.request", {
     step: stepNumber,
-    request: planner.executor_request,
+    request: executorRequest,
     allowed_tools: allowedTools.map((tool) => tool.name),
+    tool_policy_applied: !!config.executorToolPolicy,
   });
   options?.onEvent?.({
     type: "workflow.executor.start",
     step: stepNumber,
     data: {
-      instruction: planner.executor_request?.instruction,
+      instruction: executorRequest.instruction,
       allowed_tools: allowedTools.map((tool) => tool.name),
     },
   });
   const conversation = await runExecutorConversation(
     config,
-    planner.executor_request,
+    scopedPlanner.executor_request,
     allowedTools,
     stepNumber,
     logger,

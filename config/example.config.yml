@@ -20,6 +20,39 @@ executor:
   max_tokens: 8192
   temperature: 0
 
+# Optional per-agent executor registry for team mode.
+# When present, team tasks can route to different executor models by assignee.
+# default_executor_agent: "researcher"
+# agents:
+#   researcher:
+#     role: "researcher"
+#     model:
+#       base_url: "http://127.0.0.1:1234/v1"
+#       api_key: "env:EXECUTOR_API_KEY"
+#       model: "qwen/qwen3-4b-2507"
+#       timeout_ms: 60000
+#       max_tokens: 4096
+#       temperature: 0
+#     tools:
+#       allow: ["web_search", "url_fetch", "read_file"]
+#       deny: ["write_file"]
+#     limits:
+#       max_concurrency: 2
+#   writer:
+#     role: "writer"
+#     model:
+#       base_url: "http://127.0.0.1:1235/v1"
+#       api_key: "env:EXECUTOR_API_KEY"
+#       model: "deepseek-chat"
+#       timeout_ms: 60000
+#       max_tokens: 4096
+#       temperature: 0
+#     tools:
+#       allow: ["read_file", "write_file"]
+#       deny: ["shell_command"]
+#     limits:
+#       max_concurrency: 1
+
 policy:
   max_steps: 8
   max_replans: 3

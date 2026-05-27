@@ -126,19 +126,20 @@ export class TaskQueue {
     return true;
   }
 
-  getProgress(): { total: number; completed: number; failed: number; skipped: number; inProgress: number; pending: number; blocked: number } {
-    let completed = 0, failed = 0, skipped = 0, inProgress = 0, pending = 0, blocked = 0;
+  getProgress(): { total: number; completed: number; failed: number; skipped: number; inProgress: number; pending: number; blocked: number; awaitingApproval: number } {
+    let completed = 0, failed = 0, skipped = 0, inProgress = 0, pending = 0, blocked = 0, awaitingApproval = 0;
     for (const task of this.tasks.values()) {
       switch (task.status) {
         case "completed": completed++; break;
         case "failed": failed++; break;
         case "skipped": skipped++; break;
         case "in_progress": inProgress++; break;
+        case "awaiting_approval": awaitingApproval++; break;
         case "pending": pending++; break;
         case "blocked": blocked++; break;
       }
     }
-    return { total: this.tasks.size, completed, failed, skipped, inProgress, pending, blocked };
+    return { total: this.tasks.size, completed, failed, skipped, inProgress, pending, blocked, awaitingApproval };
   }
 
   on<E extends TaskQueueEvent>(event: E, handler: HandlerFor<E>): () => void {

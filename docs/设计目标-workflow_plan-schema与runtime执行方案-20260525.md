@@ -821,7 +821,9 @@ export type WorkflowRole =
 
 继续推进时，最值得优先做的是：
 
-1. 继续增强 `verify` 节点：当前已接入系统级 verifier，后续可再补 task 级 verifier 选择、结构化校验结果归档与更细粒度的 verifier 事件。
+1. 继续增强 `verify` 节点：当前已接入系统级 verifier，后续可再补 task 级 verifier 选择、结构化校验结果归档、更细粒度的 verifier 事件、模型 verifier 中间节点接入，以及 `insufficient` 语义。
 2. 把 workflow replan 从“replacement workflow + superseded history”继续补全到更完整形态：支持 patch 级 plan 更新、状态合并优化与 richer history 展示。
 3. 补集成测试：覆盖 `/v1/jobs` 创建 workflow、`/events` 历史回放、`/stream` 实时事件、`/approve` 恢复审批。
 4. 清理命名：`assessWorkflowExecutionSupport` 的提示仍写着 “Milestone C”，后续如果能力继续扩展，应同步更新用户可见文案。
+
+2026-05-27 补充：Phase 4 verification layer 主链路保持“已完成”判断，但需要进入二次收口。具体缺口已整理到 [路线图日志-Phase4验证层缺口-20260527.md](./路线图日志-Phase4验证层缺口-20260527.md)。后续实现优先级为：结构化 `VerificationResult` 持久化、task 级 verifier 选择、模型 verifier 接入 workflow 中间 `verify` 节点、`insufficient` 状态语义、check 级事件与 timeline 联动、API/stream/replay 集成测试补齐。

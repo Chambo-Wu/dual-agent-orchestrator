@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import type { Artifact, ExecutorOutput, TaskRun, VerificationCheck, VerificationResult } from "./types.js";
+import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
+import { parseModelJson } from "./json.js";
+import type { Artifact, ExecutorOutput, ModelConfig, RunOptions, TaskRun, VerificationCheck, VerificationResult } from "./types.js";
 
 export interface VerificationContext {
   jobId: string;
@@ -16,6 +18,12 @@ export interface Verifier {
   name: string;
   verify(context: VerificationContext): Promise<VerificationCheck>;
 }
+
+type ModelVerifierResponse = {
+  passed?: boolean;
+  summary?: string;
+  concerns?: string[];
+};
 
 const FileExistsVerifier: Verifier = {
   name: "file_exists",
@@ -111,13 +119,89 @@ const UrlReachableVerifier: Verifier = {
   },
 };
 
-const DEFAULT_VERIFIERS: Verifier[] = [
+export const DEFAULT_VERIFIERS: Verifier[] = [
   FileExistsVerifier,
   SchemaCheckVerifier,
   ArtifactPresenceVerifier,
   GitDiffVerifier,
   UrlReachableVerifier,
 ];
+
+function truncateForVerifier(value: string, limit = 1200): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}...`;
+}
+
+function buildModelVerifierMessages(context: VerificationContext): ChatMessage[] {
+  const taskSummary = context.taskRuns.map((taskRun) => ({
+    id: taskRun.id,
+    title: taskRun.title,
+    status: taskRun.status,
+    assignee: taskRun.assignee,
+    verified: taskRun.verified,
+    output: truncateForVerifier(taskRun.output, 800),
+    artifact_count: taskRun.artifacts.length,
+  }));
+  const artifactSummary = context.artifacts.slice(0, 12).map((artifact) => ({
+    id: artifact.id,
+    type: artifact.type,
+    path: artifact.path,
+    trustLevel: artifact.trustLevel,
+    preview: truncateForVerifier(artifact.contentPreview, 600),
+  }));
+
+  return [
+    {
+      role: "system",
+      content: "You are a strict verifier. Decide whether the task result is sufficiently supported by the provided task outputs and artifacts. Output only valid JSON.",
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        required_schema: {
+          passed: "boolean",
+          summary: "short explanation",
+          concerns: ["optional list of concerns"],
+        },
+        goal: context.goal,
+        task_runs: taskSummary,
+        artifacts: artifactSummary,
+      }, null, 2),
+    },
+  ];
+}
+
+export function createModelVerifier(
+  model: ModelConfig,
+  options?: {
+    runChat?: typeof runChatCompletionDetailed;
+    runOptions?: RunOptions;
+  },
+): Verifier {
+  return {
+    name: "model_verifier",
+    async verify(context) {
+      const runner = options?.runChat ?? runChatCompletionDetailed;
+      const response = await runner(model, buildModelVerifierMessages(context), undefined, options?.runOptions);
+      const raw = response.content || response.reasoning || "";
+      const parsed = parseModelJson<ModelVerifierResponse>(raw);
+      const passed = parsed.passed === true;
+      const summary = typeof parsed.summary === "string" && parsed.summary.trim()
+        ? parsed.summary.trim()
+        : passed
+          ? "Model verifier approved the result."
+          : "Model verifier rejected the result.";
+      const concerns = Array.isArray(parsed.concerns)
+        ? parsed.concerns.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        : [];
+      return {
+        name: "model_verifier",
+        passed,
+        detail: concerns.length > 0 ? `${summary} Concerns: ${concerns.join("; ")}` : summary,
+      };
+    },
+  };
+}
 
 export async function runVerifiers(
   context: VerificationContext,

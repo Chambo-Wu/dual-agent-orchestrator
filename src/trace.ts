@@ -3,6 +3,7 @@ import type { RunLogger } from "./logger.js";
 export type TraceEventType =
   | "task.created"
   | "task.started"
+  | "task.awaiting_approval"
   | "task.completed"
   | "task.failed"
   | "task.blocked"

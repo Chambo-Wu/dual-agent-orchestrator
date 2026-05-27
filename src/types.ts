@@ -8,6 +8,23 @@ export interface ModelConfig {
   temperature: number;
 }
 
+export interface AgentToolPolicy {
+  allow?: string[];
+  deny?: string[];
+}
+
+export interface AgentLimits {
+  max_concurrency?: number;
+}
+
+export interface RegisteredAgent {
+  id: string;
+  role: string;
+  model: ModelConfig;
+  tools?: AgentToolPolicy;
+  limits?: AgentLimits;
+}
+
 // ---------------------------------------------------------------------------
 // Search Provider
 // ---------------------------------------------------------------------------
@@ -40,6 +57,9 @@ export interface SearchRequest {
 export interface OrchestratorConfig {
   planner: ModelConfig;
   executor: ModelConfig;
+  executorToolPolicy?: AgentToolPolicy;
+  agents?: Record<string, RegisteredAgent>;
+  defaultExecutorAgent?: string;
   search?: SearchConfig;
   policy: {
     maxSteps: number;
@@ -415,7 +435,7 @@ export interface MemoryStore {
 // Task
 // ---------------------------------------------------------------------------
 
-export type TaskStatus = "pending" | "in_progress" | "completed" | "failed" | "blocked" | "skipped";
+export type TaskStatus = "pending" | "in_progress" | "awaiting_approval" | "completed" | "failed" | "blocked" | "skipped";
 
 export interface Task {
   readonly id: string;

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatSchemaIssues, isPlainObject, parseSimpleYamlDocument, SchemaValidationError, type ValidationIssue } from "./config-format.js";
-import type { ModelConfig, OrchestratorConfig, SearchConfig, SearchProviderType } from "./types.js";
+import type { AgentLimits, AgentToolPolicy, ModelConfig, OrchestratorConfig, RegisteredAgent, SearchConfig, SearchProviderType } from "./types.js";
 
 let dotenvLoaded = false;
 
@@ -113,6 +113,17 @@ function assertValidUrl(value: string, path: string, issues: ValidationIssue[]):
 }
 
 function validateModelSection(section: Record<string, unknown>, path: "planner" | "executor", issues: ValidationIssue[]): ModelConfig {
+  return validateModelLikeSection(section, path, issues, path === "planner" ? 120000 : 60000, path === "planner" ? 8192 : 2048, path === "planner" ? 0.2 : 0);
+}
+
+function validateModelLikeSection(
+  section: Record<string, unknown>,
+  path: string,
+  issues: ValidationIssue[],
+  defaultTimeoutMs: number,
+  defaultMaxTokens: number,
+  defaultTemperature: number,
+): ModelConfig {
   const baseUrl = readRequiredString(section, path, "base_url", issues);
   const apiKeyRaw = readRequiredString(section, path, "api_key", issues);
   const model = readRequiredString(section, path, "model", issues);
@@ -131,10 +142,114 @@ function validateModelSection(section: Record<string, unknown>, path: "planner" 
     baseUrl,
     apiKey,
     model,
-    timeoutMs: readOptionalNumber(section, path, "timeout_ms", path === "planner" ? 120000 : 60000, issues, { integer: true, min: 1 }),
-    maxTokens: readOptionalNumber(section, path, "max_tokens", path === "planner" ? 8192 : 2048, issues, { integer: true, min: 1 }),
-    temperature: readOptionalNumber(section, path, "temperature", path === "planner" ? 0.2 : 0, issues, { min: 0, max: 2 }),
+    timeoutMs: readOptionalNumber(section, path, "timeout_ms", defaultTimeoutMs, issues, { integer: true, min: 1 }),
+    maxTokens: readOptionalNumber(section, path, "max_tokens", defaultMaxTokens, issues, { integer: true, min: 1 }),
+    temperature: readOptionalNumber(section, path, "temperature", defaultTemperature, issues, { min: 0, max: 2 }),
   };
+}
+
+function validateAgentToolPolicy(section: Record<string, unknown>, path: string, issues: ValidationIssue[]): AgentToolPolicy | undefined {
+  const allow = section.allow;
+  const deny = section.deny;
+  const policy: AgentToolPolicy = {};
+
+  if (allow !== undefined) {
+    if (!Array.isArray(allow) || allow.some((item) => typeof item !== "string" || !item.trim())) {
+      pushIssue(issues, `${path}.allow`, "must be an array of non-empty strings");
+    } else {
+      policy.allow = allow.map((item) => item.trim());
+    }
+  }
+
+  if (deny !== undefined) {
+    if (!Array.isArray(deny) || deny.some((item) => typeof item !== "string" || !item.trim())) {
+      pushIssue(issues, `${path}.deny`, "must be an array of non-empty strings");
+    } else {
+      policy.deny = deny.map((item) => item.trim());
+    }
+  }
+
+  return Object.keys(policy).length > 0 ? policy : undefined;
+}
+
+function validateAgentLimits(section: Record<string, unknown>, path: string, issues: ValidationIssue[]): AgentLimits | undefined {
+  const limits: AgentLimits = {};
+  if (section.max_concurrency !== undefined) {
+    limits.max_concurrency = readOptionalNumber(section, path, "max_concurrency", 1, issues, { integer: true, min: 1 });
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined;
+}
+
+function validateAgentsSection(root: Record<string, unknown>, issues: ValidationIssue[]): {
+  agents?: Record<string, RegisteredAgent>;
+  defaultExecutorAgent?: string;
+} {
+  const agentsRaw = root.agents;
+  const defaultExecutorAgentRaw = root.default_executor_agent;
+  const result: {
+    agents?: Record<string, RegisteredAgent>;
+    defaultExecutorAgent?: string;
+  } = {};
+
+  if (defaultExecutorAgentRaw !== undefined) {
+    if (typeof defaultExecutorAgentRaw !== "string" || !defaultExecutorAgentRaw.trim()) {
+      pushIssue(issues, "default_executor_agent", "must be a non-empty string");
+    } else {
+      result.defaultExecutorAgent = defaultExecutorAgentRaw.trim();
+    }
+  }
+
+  if (agentsRaw === undefined) {
+    return result;
+  }
+  if (!isPlainObject(agentsRaw)) {
+    pushIssue(issues, "agents", "must be an object when provided");
+    return result;
+  }
+
+  const agents: Record<string, RegisteredAgent> = {};
+  for (const [agentId, rawValue] of Object.entries(agentsRaw)) {
+    const basePath = `agents.${agentId}`;
+    if (!isPlainObject(rawValue)) {
+      pushIssue(issues, basePath, "must be an object");
+      continue;
+    }
+    const role = readRequiredString(rawValue, basePath, "role", issues);
+    const modelSection = rawValue.model;
+    if (!isPlainObject(modelSection)) {
+      pushIssue(issues, `${basePath}.model`, "section is required and must be an object");
+      continue;
+    }
+    const model = validateModelLikeSection(modelSection, `${basePath}.model`, issues, 60000, 2048, 0);
+    const toolsSection = rawValue.tools;
+    const limitsSection = rawValue.limits;
+    const tools = isPlainObject(toolsSection)
+      ? validateAgentToolPolicy(toolsSection, `${basePath}.tools`, issues)
+      : toolsSection === undefined
+        ? undefined
+        : (pushIssue(issues, `${basePath}.tools`, "must be an object"), undefined);
+    const limits = isPlainObject(limitsSection)
+      ? validateAgentLimits(limitsSection, `${basePath}.limits`, issues)
+      : limitsSection === undefined
+        ? undefined
+        : (pushIssue(issues, `${basePath}.limits`, "must be an object"), undefined);
+
+    agents[agentId] = {
+      id: agentId,
+      role,
+      model,
+      tools,
+      limits,
+    };
+  }
+
+  if (Object.keys(agents).length > 0) {
+    result.agents = agents;
+  }
+  if (result.defaultExecutorAgent && result.agents && !result.agents[result.defaultExecutorAgent]) {
+    pushIssue(issues, "default_executor_agent", `references unknown agent "${result.defaultExecutorAgent}"`);
+  }
+  return result;
 }
 
 const VALID_PROVIDER_TYPES: SearchProviderType[] = ["bing_html", "searxng", "serpapi", "bing_api", "google_cse", "url_template", "mcp"];
@@ -218,10 +333,13 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
   }
 
   const search = validateSearchSection(root, issues);
+  const agentConfig = validateAgentsSection(root, issues);
 
   const config: OrchestratorConfig = {
     planner,
     executor,
+    agents: agentConfig.agents,
+    defaultExecutorAgent: agentConfig.defaultExecutorAgent,
     search,
     policy: {
       maxSteps: readOptionalNumber(policySection, "policy", "max_steps", 12, issues, { integer: true, min: 1 }),
@@ -243,4 +361,3 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
 
   return config;
 }
-

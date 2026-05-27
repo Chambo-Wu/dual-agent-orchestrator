@@ -4,6 +4,8 @@ import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { persistJobRecord, readJobRecord, updateStoredJobRecord } from "../../src/job-store.js";
 import { __testables } from "../../src/index.js";
+import { registerActiveJobSession, unregisterActiveJobSession, resolvePendingApproval } from "../../src/job-runtime.js";
+import { buildMinimalConfig } from "../helpers/fake-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "../../src/workflow-contract.js";
 
 class MockResponse extends EventEmitter {
@@ -29,6 +31,127 @@ class MockResponse extends EventEmitter {
     return this;
   }
 }
+
+test("team agent resolution uses config registry by default and env as override", () => {
+  const config = buildMinimalConfig();
+  config.agents = {
+    researcher: {
+      id: "researcher",
+      role: "research",
+      model: {
+        ...config.executor,
+        model: "research-model",
+      },
+    },
+    writer: {
+      id: "writer",
+      role: "write",
+      model: {
+        ...config.executor,
+        model: "writer-model",
+      },
+    },
+  };
+
+  assert.deepEqual(__testables.resolveTeamAgents(config, undefined), [
+    { name: "researcher", role: "research" },
+    { name: "writer", role: "write" },
+  ]);
+  assert.deepEqual(__testables.resolveTeamAgents(config, JSON.stringify([{ name: "env_agent", role: "override" }])), [
+    { name: "env_agent", role: "override" },
+  ]);
+});
+
+test("registered role agent resolution exposes verifier routing metadata", () => {
+  const config = buildMinimalConfig();
+  config.agents = {
+    qa_agent: {
+      id: "qa_agent",
+      role: "team verifier",
+      model: {
+        ...config.executor,
+        model: "verifier-model",
+      },
+    },
+  };
+
+  assert.deepEqual(__testables.resolveRegisteredRoleAgent(config, "verifier"), {
+    id: "qa_agent",
+    role: "team verifier",
+    model: "verifier-model",
+  });
+});
+
+test("team approval gate persists ApprovalRequest and resolves through job runtime", async () => {
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_team_gate_root",
+    title: "Team Gate Root",
+    description: "Root task",
+    status: "pending",
+    verified: false,
+    output: "",
+    attempts: 0,
+    artifacts: [],
+  });
+  const plan = createPlanRecord({
+    id: "plan_team_gate",
+    goal: "Approve team subtask",
+    mode: "team",
+    taskRunIds: [taskRun.id],
+  });
+  const job = createJobRecord({
+    id: "job_team_gate",
+    goal: "Approve team subtask",
+    mode: "team",
+    status: "running",
+    verified: false,
+    output: "Running...",
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  });
+  persistJobRecord({ job, plan, taskRuns: [taskRun], artifacts: [] });
+  const controller = new AbortController();
+  registerActiveJobSession("job_team_gate", "Approve team subtask", controller);
+
+  try {
+    const gatePromise = __testables.createTeamApprovalGate("job_team_gate")([{
+      id: "task_team_review",
+      title: "Review before execution",
+      description: "Needs approval",
+      status: "awaiting_approval",
+      assignee: "reviewer",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }]);
+
+    const pendingRecord = readJobRecord("job_team_gate");
+    assert.equal(pendingRecord?.approvalRequests?.length, 1);
+    assert.equal(pendingRecord?.approvalRequests?.[0]?.taskIds[0], "task_team_review");
+    assert.equal(pendingRecord?.control?.approvalStatus, "pending");
+
+    assert.equal(resolvePendingApproval("job_team_gate", "approved"), true);
+    assert.equal(await gatePromise, true);
+  } finally {
+    unregisterActiveJobSession("job_team_gate");
+  }
+});
+
+test("team approval mode requires async job creation", async () => {
+  const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+    goal: "Run a gated team job",
+    mode: "team",
+    policy: {
+      approval_mode: "always",
+    },
+  }), res);
+  const body = JSON.parse(res.body) as { error: { message: string; type: string } };
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(body.error.type, "invalid_request_error");
+  assert.equal(body.error.message.includes("policy.async=true"), true);
+});
 
 function buildAuthorizedRequest(url: string): IncomingMessage {
   return {
@@ -411,6 +534,289 @@ test("job create endpoint supports async start for realtime clients", async () =
   }
 });
 
+test("job create endpoint supports team mode with the same control-plane contract", async () => {
+  __testables.setTeamExecutorForTests(async (goal, model, context) => {
+    assert.equal(goal, "Coordinate a researcher and writer");
+    assert.equal(model, "dual-agent-orchestrator");
+    context?.emitEvent?.({
+      type: "workflow.step.start",
+      step: 1,
+      data: { replan_count: 0 },
+    });
+    context?.emitEvent?.({
+      type: "workflow.planner.decision",
+      step: 1,
+      data: {
+        status: "workflow",
+        reasoning_summary: "Split research and writing across the team.",
+        next_step: "Dispatch team tasks",
+        verdict: "approved",
+      },
+    });
+
+    const researchTask = createTaskRunRecord({
+      id: "taskrun_team_research",
+      title: "Research",
+      description: "Inspect source material",
+      status: "completed",
+      assignee: "researcher",
+      verified: true,
+      output: "research done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const writeTask = createTaskRunRecord({
+      id: "taskrun_team_write",
+      title: "Write",
+      description: "Produce summary",
+      status: "completed",
+      assignee: "writer",
+      dependsOn: [researchTask.id],
+      verified: true,
+      output: "write done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "team",
+      taskRunIds: [researchTask.id, writeTask.id],
+      summary: "Team plan with 2 task runs.",
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "team",
+      status: "completed",
+      verified: true,
+      output: "team job done",
+      plan,
+      taskRuns: [researchTask, writeTask],
+      artifacts: [],
+      memorySummary: "shared context",
+    });
+    persistJobRecord({
+      job,
+      plan,
+      taskRuns: [researchTask, writeTask],
+      artifacts: [],
+    });
+    return {
+      content: "team job done",
+      logPath: "runtime/logs/create-team-job.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [researchTask, writeTask],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Coordinate a researcher and writer",
+      mode: "team",
+      model_route: "dual-agent-orchestrator",
+    }), res);
+    const body = JSON.parse(res.body) as {
+      object: string;
+      job_id: string;
+      job: { id: string; mode: string; status: string };
+      plan: { mode: string };
+      step_count: number;
+    };
+
+    assert.equal(res.statusCode, 201);
+    assert.equal(body.object, "job");
+    assert.equal(body.job.id, body.job_id);
+    assert.equal(body.job.mode, "team");
+    assert.equal(body.job.status, "completed");
+    assert.equal(body.plan.mode, "team");
+    assert.equal(body.step_count, 2);
+    assert.notEqual(readJobRecord(body.job_id), null);
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${body.job_id}/events`), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as { events: Array<{ type: string; agent: string; status: string }> };
+    const verificationEvent = eventsBody.events.find((event) => event.type === "system.verification_passed");
+    assert.equal(Boolean(verificationEvent), true);
+    assert.equal(verificationEvent?.agent, "system");
+    assert.equal(verificationEvent?.status, "success");
+  } finally {
+    __testables.setTeamExecutorForTests(null);
+  }
+});
+
+test("team job create endpoint applies shared verifier result", async () => {
+  __testables.setTeamExecutorForTests(async (goal, _model, context) => {
+    const teamTask = createTaskRunRecord({
+      id: "taskrun_team_verifier_failure",
+      title: "Tool-backed team task",
+      description: goal,
+      status: "completed",
+      assignee: "researcher",
+      verified: true,
+      output: "tool completed without artifacts",
+      attempts: 1,
+      artifacts: [],
+      executorHistory: [{
+        status: "success",
+        summary: "tool ok",
+        tool_calls_made: [{ tool: "read_file", arguments: { path: "missing.txt" } }],
+        artifacts: [],
+        raw_result: "tool ok",
+      }],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "team",
+      taskRunIds: [teamTask.id],
+      summary: "Team verifier failure plan.",
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "team",
+      status: "completed",
+      verified: true,
+      output: "team verifier failure",
+      plan,
+      taskRuns: [teamTask],
+      artifacts: [],
+    });
+    return {
+      content: "team verifier failure",
+      logPath: "runtime/logs/create-team-job-verifier-failure.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [teamTask],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Run a team job with verifier failure",
+      mode: "team",
+      model_route: "dual-agent-orchestrator",
+    }), res);
+    const body = JSON.parse(res.body) as {
+      job_id: string;
+      job: { mode: string; status: string; verified: boolean };
+    };
+
+    assert.equal(res.statusCode, 201);
+    assert.equal(body.job.mode, "team");
+    assert.equal(body.job.status, "completed");
+    assert.equal(body.job.verified, false);
+
+    const record = readJobRecord(body.job_id);
+    assert.equal(record?.job.verified, false);
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${body.job_id}/events`), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as { events: Array<{ type: string; status: string }> };
+    const verificationEvent = eventsBody.events.find((event) => event.type === "system.verification_failed");
+    assert.equal(Boolean(verificationEvent), true);
+    assert.equal(verificationEvent?.status, "blocked");
+  } finally {
+    __testables.setTeamExecutorForTests(null);
+  }
+});
+
+test("job create endpoint supports async team mode", async () => {
+  __testables.setTeamExecutorForTests(async (goal, model, context) => {
+    assert.equal(goal, "Run an async team job");
+    assert.equal(model, "dual-agent-orchestrator");
+    context?.emitEvent?.({
+      type: "workflow.step.start",
+      step: 1,
+      data: { replan_count: 0 },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const teamTask = createTaskRunRecord({
+      id: "taskrun_async_team_root",
+      title: "Team Root Task",
+      description: goal,
+      status: "completed",
+      assignee: "planner",
+      verified: true,
+      output: "async team done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "team",
+      taskRunIds: [teamTask.id],
+      summary: "Async team plan.",
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "team",
+      status: "completed",
+      verified: true,
+      output: "async team done",
+      plan,
+      taskRuns: [teamTask],
+      artifacts: [],
+      memorySummary: "async team memory",
+    });
+    return {
+      content: "async team done",
+      logPath: "runtime/logs/create-team-job-async.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [teamTask],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Run an async team job",
+      mode: "team",
+      model_route: "dual-agent-orchestrator",
+      policy: {
+        async: true,
+      },
+    }), res);
+    const body = JSON.parse(res.body) as {
+      object: string;
+      job_id: string;
+      accepted: boolean;
+      job: { mode: string; status: string };
+    };
+
+    assert.equal(res.statusCode, 202);
+    assert.equal(body.object, "job");
+    assert.equal(body.accepted, true);
+    assert.equal(body.job.mode, "team");
+    assert.equal(body.job.status, "running");
+
+    let completedRecord = readJobRecord(body.job_id);
+    for (let i = 0; i < 30 && completedRecord?.job.status !== "completed"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      completedRecord = readJobRecord(body.job_id);
+    }
+
+    assert.equal(completedRecord?.job.mode, "team");
+    assert.equal(completedRecord?.job.status, "completed");
+  } finally {
+    __testables.setTeamExecutorForTests(null);
+  }
+});
+
 test("job runtime profile endpoint exposes platform and tool capabilities", async () => {
   const okRes = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/runtime-profile"), okRes);
@@ -620,6 +1026,112 @@ test("job retry endpoint creates a new stored job and links retry metadata", asy
     assert.equal(original?.control?.retriedToJobId, "job_retry_new");
   } finally {
     __testables.setTaskExecutorForTests(null);
+  }
+});
+
+test("job retry endpoint preserves team mode", async () => {
+  const teamTask = createTaskRunRecord({
+    id: "taskrun_team_retry_source",
+    title: "Team Retry Source",
+    description: "retry team desc",
+    status: "failed",
+    assignee: "planner",
+    verified: false,
+    output: "team retry source failed",
+    attempts: 1,
+    artifacts: [],
+  });
+  const teamPlan = createPlanRecord({
+    id: "plan_team_retry_source",
+    goal: "Retry this team job",
+    mode: "team",
+    taskRunIds: [teamTask.id],
+    summary: "Team retry source plan.",
+  });
+  const teamJob = createJobRecord({
+    id: "job_team_retry_source",
+    goal: "Retry this team job",
+    mode: "team",
+    status: "failed",
+    verified: false,
+    output: "team retry source failed",
+    plan: teamPlan,
+    taskRuns: [teamTask],
+    artifacts: [],
+    memorySummary: "team retry source memory",
+  });
+  persistJobRecord({
+    job: teamJob,
+    plan: teamPlan,
+    taskRuns: [teamTask],
+    artifacts: [],
+  });
+
+  __testables.setTeamExecutorForTests(async (goal, model, context) => {
+    assert.equal(goal, "Retry this team job");
+    assert.equal(model, undefined);
+    const retriedTask = createTaskRunRecord({
+      id: "taskrun_team_retry_new",
+      title: "Retried Team Task",
+      description: "retried team desc",
+      status: "completed",
+      assignee: "planner",
+      verified: true,
+      output: "team retry done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const retriedPlan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "team",
+      taskRunIds: [retriedTask.id],
+      summary: "Retried team plan.",
+    });
+    const retriedJob = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "team",
+      status: "completed",
+      verified: true,
+      output: "team retry done",
+      plan: retriedPlan,
+      taskRuns: [retriedTask],
+      artifacts: [],
+      memorySummary: "team retry memory",
+    });
+    return {
+      content: "team retry done",
+      logPath: "runtime/logs/team-retry.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job: retriedJob,
+      plan: retriedPlan,
+      taskRuns: [retriedTask],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest({
+      ...buildAuthorizedRequest("/v1/jobs/job_team_retry_source/retry"),
+      method: "POST",
+    } as IncomingMessage, res);
+    const body = JSON.parse(res.body) as {
+      ok: boolean;
+      retried_from: string;
+      job: { id: string; mode: string; status: string };
+      control: { retryOf?: string };
+    };
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.retried_from, "job_team_retry_source");
+    assert.equal(body.job.mode, "team");
+    assert.equal(body.job.status, "completed");
+    assert.equal(body.control.retryOf, "job_team_retry_source");
+  } finally {
+    __testables.setTeamExecutorForTests(null);
   }
 });
 
@@ -919,6 +1431,112 @@ test("job resume endpoint creates a resumed job and blocks awaiting approval job
     assert.equal(waitingBody.error?.failure_category, "approval_blocked");
   } finally {
     __testables.setTaskExecutorForTests(null);
+  }
+});
+
+test("job resume endpoint preserves team mode", async () => {
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_team_resume_source",
+    title: "Team Resume Source",
+    description: "Needs team resume",
+    status: "blocked",
+    assignee: "planner",
+    verified: false,
+    output: "team resume source blocked",
+    attempts: 1,
+    artifacts: [],
+  });
+  const plan = createPlanRecord({
+    id: "plan_team_resume_source",
+    goal: "Resume this team job",
+    mode: "team",
+    taskRunIds: [taskRun.id],
+    summary: "Team resume source plan.",
+  });
+  const job = createJobRecord({
+    id: "job_team_resume_source",
+    goal: "Resume this team job",
+    mode: "team",
+    status: "blocked",
+    verified: false,
+    output: "team resume source blocked",
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+    memorySummary: "team resume source memory",
+  });
+  persistJobRecord({
+    job,
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  });
+
+  __testables.setTeamExecutorForTests(async (goal, model, context) => {
+    assert.equal(goal, "Resume this team job");
+    assert.equal(model, undefined);
+    const resumedTask = createTaskRunRecord({
+      id: "taskrun_team_resume_new",
+      title: "Resumed Team Task",
+      description: "resumed team desc",
+      status: "completed",
+      assignee: "planner",
+      verified: true,
+      output: "team resumed done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const resumedPlan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "team",
+      taskRunIds: [resumedTask.id],
+      summary: "Resumed team plan.",
+    });
+    const resumedJob = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "team",
+      status: "completed",
+      verified: true,
+      output: "team resumed done",
+      plan: resumedPlan,
+      taskRuns: [resumedTask],
+      artifacts: [],
+      memorySummary: "team resumed memory",
+    });
+    return {
+      content: "team resumed done",
+      logPath: "runtime/logs/team-resume.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job: resumedJob,
+      plan: resumedPlan,
+      taskRuns: [resumedTask],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest({
+      ...buildAuthorizedRequest("/v1/jobs/job_team_resume_source/resume"),
+      method: "POST",
+    } as IncomingMessage, res);
+    const body = JSON.parse(res.body) as {
+      ok: boolean;
+      resumed_from: string;
+      job: { id: string; mode: string; status: string };
+      control: { resumeOf?: string };
+    };
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.resumed_from, "job_team_resume_source");
+    assert.equal(body.job.mode, "team");
+    assert.equal(body.job.status, "completed");
+    assert.equal(body.control.resumeOf, "job_team_resume_source");
+  } finally {
+    __testables.setTeamExecutorForTests(null);
   }
 });
 

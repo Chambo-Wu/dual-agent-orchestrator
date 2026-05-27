@@ -11,15 +11,15 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, TaskRun } from "./types.js";
+import type { ApprovalRequest, Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, Task, TaskRun } from "./types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
-import { runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
+import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 import { listStoredJobs, persistApprovalRequest, persistJobRecord, readJobRecord, resolveApprovalRequest, updateJobControlState, updateStoredJobRecord, type StoredJobRecord } from "./job-store.js";
-import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, unregisterActiveJobSession } from "./job-runtime.js";
+import { cancelActiveJobSession, getActiveJobSession, registerActiveJobSession, resolvePendingApproval, setApprovalResolver, unregisterActiveJobSession } from "./job-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
 import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type WorkflowUiEvent } from "./workflow-ui-events.js";
 import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
@@ -183,10 +183,70 @@ interface FixedTaskIds {
   taskRunId: string;
 }
 
+interface JobExecutionOptions {
+  requirePlannerCircuit?: boolean;
+  fixedIds?: FixedTaskIds;
+  approvalMode?: string;
+}
+
 let injectedTaskExecutor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null = null;
+let injectedTeamExecutor: ((userGoal: string, model: string | undefined, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null = null;
 
 function setTaskExecutorForTests(executor: ((userGoal: string, model: string | undefined, requirePlannerCircuit: boolean, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null): void {
   injectedTaskExecutor = executor;
+}
+
+function setTeamExecutorForTests(executor: ((userGoal: string, model: string | undefined, context?: TaskExecutionContext) => Promise<TaskExecutionPayload>) | null): void {
+  injectedTeamExecutor = executor;
+}
+
+function parseTeamAgentsEnv(value: string | undefined): TeamAgent[] {
+  const raw = value?.trim();
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed
+          .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && typeof item.name === "string")
+          .map((item) => ({ name: item.name as string, role: typeof item.role === "string" ? item.role : undefined }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function teamAgentsFromRegistry(config: OrchestratorConfig): TeamAgent[] {
+  return Object.values(config.agents ?? {}).map((agent) => ({
+    name: agent.id,
+    role: agent.role,
+  }));
+}
+
+function resolveRegisteredRoleAgent(config: OrchestratorConfig | undefined, roleName: string): { id: string; role: string; model: string } | undefined {
+  if (!config?.agents) {
+    return undefined;
+  }
+  const normalizedRole = roleName.toLowerCase();
+  const agent = Object.values(config.agents).find((candidate) => {
+    const id = candidate.id.toLowerCase();
+    const role = candidate.role.toLowerCase();
+    return id === normalizedRole || role === normalizedRole || role.includes(normalizedRole);
+  });
+  return agent ? { id: agent.id, role: agent.role, model: agent.model.model } : undefined;
+}
+
+function resolveTeamAgents(config: OrchestratorConfig, envValue = process.env.TEAM_AGENTS): TeamAgent[] {
+  const envAgents = parseTeamAgentsEnv(envValue);
+  if (envAgents.length > 0) {
+    return envAgents;
+  }
+  const registeredAgents = teamAgentsFromRegistry(config);
+  if (registeredAgents.length > 0) {
+    return registeredAgents;
+  }
+  return [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
 }
 
 function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): string {
@@ -196,6 +256,148 @@ function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "pla
     taskRuns: payload.taskRuns,
     artifacts: payload.artifacts,
     workflowGraph: payload.job.workflowGraph,
+  });
+}
+
+async function verifyWorkflowPayload(
+  payload: TaskExecutionPayload,
+  input: {
+    jobId: string;
+    goal: string;
+    config?: OrchestratorConfig;
+    emitLifecycle: (
+      type: string,
+      title: string,
+      summary: string,
+      status: WorkflowUiEvent["status"],
+      meta?: Record<string, unknown>,
+      phase?: WorkflowUiEvent["phase"],
+    ) => void;
+  },
+): Promise<Job> {
+  const executorHistory = payload.taskRuns.flatMap((taskRun) => taskRun.executorHistory ?? []);
+  const verificationContext: VerificationContext = {
+    jobId: input.jobId,
+    goal: input.goal,
+    executorHistory,
+    artifacts: payload.artifacts,
+    taskRuns: payload.taskRuns,
+    workspaceRoot: WORKSPACE_ROOT,
+    runtimeRoot: RUNTIME_ROOT,
+  };
+  const verifierAgent = resolveRegisteredRoleAgent(input.config, "verifier");
+  const verifierConfig = input.config?.agents?.[verifierAgent?.id ?? ""];
+  const activeVerifiers = verifierConfig
+    ? [...DEFAULT_VERIFIERS, createModelVerifier(verifierConfig.model)]
+    : undefined;
+  const verificationResult = await runVerifiers(verificationContext, activeVerifiers);
+  const allPassed = verificationResultPassed(verificationResult);
+  const verifiedJob = allPassed ? payload.job : { ...payload.job, verified: false };
+  const verifierMeta = verifierAgent
+    ? {
+        verifier_agent_id: verifierAgent.id,
+        verifier_agent_role: verifierAgent.role,
+        verifier_model: verifierAgent.model,
+      }
+    : {};
+  if (!allPassed) {
+    input.emitLifecycle("system.verification_failed", "Verification reported issues", summarizeVerification(verificationResult), "blocked", {
+      verifier_count: verificationResult.checks.length,
+      verification_status: verificationResult.status,
+      ...verifierMeta,
+    });
+  } else {
+    input.emitLifecycle("system.verification_passed", "Verification passed", summarizeVerification(verificationResult), "success", {
+      verifier_count: verificationResult.checks.length,
+      verification_status: verificationResult.status,
+      ...verifierMeta,
+    });
+  }
+  return verifiedJob;
+}
+
+function createTeamApprovalGate(jobId: string): (tasks: readonly Task[]) => Promise<boolean> {
+  return async (tasks) => {
+    const taskIds = tasks.map((task) => task.id);
+    const approvalRequest: ApprovalRequest = {
+      id: `appr_${randomUUID().slice(0, 8)}`,
+      jobId,
+      taskIds,
+      reason: `Approve team task execution for: ${tasks.map((task) => task.title).join(", ")}`,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    persistApprovalRequest(jobId, approvalRequest);
+
+    return await new Promise<boolean>((resolve) => {
+      const registered = setApprovalResolver(jobId, (decision) => {
+        resolve(decision === "approved");
+      });
+      if (!registered) {
+        resolve(false);
+      }
+    });
+  };
+}
+
+function persistTeamApprovalSnapshot(jobId: string, event: OrchestratorEvent): void {
+  if (event.type !== "workflow.task.awaiting_approval") {
+    return;
+  }
+  const taskId = typeof event.data.task_id === "string" ? event.data.task_id : "";
+  if (!taskId) {
+    return;
+  }
+  const title = typeof event.data.title === "string" && event.data.title.trim()
+    ? event.data.title.trim()
+    : "Team task awaiting approval";
+  const assignee = typeof event.data.assignee === "string"
+    ? event.data.assignee
+    : typeof event.data.role === "string"
+      ? event.data.role
+      : undefined;
+  const dependsOn = Array.isArray(event.data.depends_on)
+    ? event.data.depends_on.filter((item): item is string => typeof item === "string")
+    : [];
+
+  updateStoredJobRecord(jobId, (record) => {
+    const awaitingTask = createTaskRunRecord({
+      id: taskId,
+      title,
+      description: `Waiting for approval before running team task "${title}".`,
+      status: "awaiting_approval",
+      assignee,
+      dependsOn,
+      verified: false,
+      output: "Waiting for approval.",
+      attempts: 0,
+      artifacts: [],
+    });
+    const taskRuns = record.taskRuns.some((taskRun) => taskRun.id === taskId)
+      ? record.taskRuns.map((taskRun) => taskRun.id === taskId ? awaitingTask : taskRun)
+      : [...record.taskRuns.filter((taskRun) => taskRun.id !== record.plan.taskRunIds[0]), awaitingTask];
+    const taskRunIds = Array.from(new Set(taskRuns.map((taskRun) => taskRun.id)));
+    const plan = {
+      ...record.plan,
+      taskRunIds,
+    };
+    const job = {
+      ...record.job,
+      status: "awaiting_approval" as const,
+      verified: false,
+      output: "Waiting for approval.",
+      plan,
+      taskRuns,
+      workflowGraph: buildWorkflowGraph(plan.id, taskRuns, plan.summary),
+    };
+    return {
+      ...record,
+      savedAt: new Date().toISOString(),
+      job,
+      plan,
+      taskRuns,
+      workflowGraph: job.workflowGraph,
+    };
   });
 }
 
@@ -456,6 +658,25 @@ function getAnthropicContentText(content: string | AnthropicContentBlock[] | und
   return "";
 }
 
+function extractWorkingDirectoryHint(text: string): string {
+  if (!text) {
+    return "";
+  }
+
+  const patterns = [
+    /\bcwd\s*[:=]\s*([^\r\n]+)/i,
+    /\bworking directory\s*[:=]\s*([^\r\n]+)/i,
+    /<cwd>\s*([^<]+)\s*<\/cwd>/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+  return "";
+}
+
 function truncateToolResultContent(content: string): string {
   const normalized = content.trim();
   if (normalized.length <= MAX_TOOL_RESULT_CHARS) {
@@ -695,8 +916,18 @@ export function shouldForceTextResponseForToolMessage(message: ChatMessage | und
 
 function buildUserGoal(messages: OpenAIMessage[]): string {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
+  const systemContext = messages
+    .filter((message) => message.role === "system")
+    .map((message) => getMessageText(message))
+    .filter(Boolean)
+    .join("\n");
+  const cwdHint = extractWorkingDirectoryHint(systemContext);
+
   if (lastUserMessage) {
-    return getMessageText(lastUserMessage);
+    const goal = getMessageText(lastUserMessage);
+    return cwdHint && !goal.includes(cwdHint)
+      ? `${goal}\n\nCurrent working directory: ${cwdHint}`
+      : goal;
   }
 
   return messages
@@ -704,6 +935,81 @@ function buildUserGoal(messages: OpenAIMessage[]): string {
     .filter(Boolean)
     .join("\n")
     .trim();
+}
+
+function isClaudeControlMessage(goal: string): boolean {
+  const trimmed = goal.trim();
+  return trimmed === "/init"
+    || trimmed.startsWith("/init ")
+    || /<command-name>\s*\/init\s*<\/command-name>/i.test(trimmed)
+    || /<command-message>\s*init\s*<\/command-message>/i.test(trimmed)
+    || /^\[SUGGESTION MODE:/i.test(trimmed);
+}
+
+function hasAnthropicToolHistory(messages: AnthropicMessage[] | undefined): boolean {
+  for (const message of messages || []) {
+    const content = message.content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    if (content.some((part) => part?.type === "tool_use" || part?.type === "tool_result")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildClaudeControlResponse(goal: string): TaskExecutionPayload | null {
+  const trimmed = goal.trim();
+  if (!isClaudeControlMessage(trimmed)) {
+    return null;
+  }
+
+  const isInitCommand = trimmed === "/init"
+    || trimmed.startsWith("/init ")
+    || /<command-name>\s*\/init\s*<\/command-name>/i.test(trimmed)
+    || /<command-message>\s*init\s*<\/command-message>/i.test(trimmed);
+  const output = isInitCommand
+    ? "Dual Agent Orchestrator is ready. Existing CLAUDE.md is present, and I can inspect the repo, diagnose issues, make code changes, and run validation in this workspace."
+    : "";
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_control",
+    title: "Claude control message",
+    description: trimmed,
+    status: "completed",
+    verified: true,
+    output,
+    attempts: 0,
+    artifacts: [],
+  });
+  const plan = createPlanRecord({
+    id: "plan_control",
+    goal: trimmed,
+    mode: "task",
+    taskRunIds: [taskRun.id],
+    summary: "Short-circuited Claude control message.",
+  });
+  const job = createJobRecord({
+    id: "job_control",
+    goal: trimmed,
+    mode: "task",
+    status: "completed",
+    verified: true,
+    output,
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  });
+
+  return {
+    content: output,
+    logPath: "",
+    resolvedModel: "control",
+    job,
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  };
 }
 
 function splitContentForStreaming(content: string): string[] {
@@ -1892,6 +2198,7 @@ async function executeTaskGoal(
   requirePlannerCircuit: boolean,
   onEvent?: OrchestratorEventCallback,
   fixedIds?: FixedTaskIds,
+  onRegistered?: (jobId: string) => void,
 ): Promise<TaskExecutionPayload> {
   const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
   const planId = fixedIds?.planId ?? `plan_${randomUUID()}`;
@@ -1915,6 +2222,7 @@ async function executeTaskGoal(
     }));
   };
   const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
+    persistTeamApprovalSnapshot(jobId, event);
     emitUiEvent(normalizeWorkflowEvent(
       { type: event.type, step: event.step, data: event.data } as InternalWorkflowEvent,
       jobId,
@@ -1926,6 +2234,7 @@ async function executeTaskGoal(
   };
 
   registerActiveJobSession(jobId, userGoal, abortController);
+  onRegistered?.(jobId);
   const pendingTaskRun = createTaskRunRecord({
     id: taskRunId,
     title: "Primary Task",
@@ -1975,6 +2284,7 @@ async function executeTaskGoal(
     }
 
     let payload: TaskExecutionPayload;
+    let verificationConfig: OrchestratorConfig | undefined;
     if (injectedTaskExecutor) {
       payload = await injectedTaskExecutor(userGoal, model, requirePlannerCircuit, {
         jobId,
@@ -1986,6 +2296,7 @@ async function executeTaskGoal(
     } else {
       const baseConfig = loadConfig();
       const modelSelection = resolveRequestedModel(baseConfig, model);
+      verificationConfig = modelSelection.resolvedConfig;
       if (requirePlannerCircuit) {
         assertPlannerCircuitClosed();
       }
@@ -2023,30 +2334,12 @@ async function executeTaskGoal(
       };
     }
 
-    const executorHistory = payload.taskRuns.flatMap((taskRun) => taskRun.executorHistory ?? []);
-    const verificationContext: VerificationContext = {
+    const verifiedJob = await verifyWorkflowPayload(payload, {
       jobId,
       goal: userGoal,
-      executorHistory,
-      artifacts: payload.artifacts,
-      taskRuns: payload.taskRuns,
-      workspaceRoot: WORKSPACE_ROOT,
-      runtimeRoot: RUNTIME_ROOT,
-    };
-    const verificationResult = await runVerifiers(verificationContext);
-    const allPassed = verificationResultPassed(verificationResult);
-    const verifiedJob = allPassed ? payload.job : { ...payload.job, verified: false };
-    if (!allPassed) {
-      emitLifecycle("system.verification_failed", "Verification reported issues", summarizeVerification(verificationResult), "blocked", {
-        verifier_count: verificationResult.checks.length,
-        verification_status: verificationResult.status,
-      });
-    } else {
-      emitLifecycle("system.verification_passed", "Verification passed", summarizeVerification(verificationResult), "success", {
-        verifier_count: verificationResult.checks.length,
-        verification_status: verificationResult.status,
-      });
-    }
+      config: verificationConfig,
+      emitLifecycle,
+    });
 
     const jobRecordPath = persistWorkflowPayload({
       job: verifiedJob,
@@ -2100,6 +2393,199 @@ async function executeTaskGoal(
   }
 }
 
+async function executeTeamGoal(
+  userGoal: string,
+  model: string | undefined,
+  fixedIds?: FixedTaskIds,
+  approvalMode?: string,
+): Promise<TaskExecutionPayload> {
+  const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
+  const planId = fixedIds?.planId ?? `plan_${randomUUID()}`;
+  const taskRunId = fixedIds?.taskRunId ?? `taskrun_${randomUUID()}`;
+  const abortController = new AbortController();
+  const emitUiEvent = (event: WorkflowUiEvent) => {
+    appendEvent(event);
+  };
+  const emitLifecycle = (type: string, title: string, summary: string, status: WorkflowUiEvent["status"], meta: Record<string, unknown> = {}, phase: WorkflowUiEvent["phase"] = "result") => {
+    emitUiEvent(createLifecycleEvent({
+      jobId,
+      seq: getNextSeq(jobId),
+      time: new Date().toISOString(),
+      type,
+      title,
+      summary,
+      status,
+      phase,
+      taskRunId,
+      meta: attachFailureCategory(type, status, summary, meta),
+    }));
+  };
+  const forwardRuntimeEvent: OrchestratorEventCallback = (event) => {
+    emitUiEvent(normalizeWorkflowEvent(
+      { type: event.type, step: event.step, data: event.data } as InternalWorkflowEvent,
+      jobId,
+      getNextSeq(jobId),
+      new Date().toISOString(),
+      taskRunId,
+    ));
+  };
+
+  registerActiveJobSession(jobId, userGoal, abortController);
+  const pendingTaskRun = createTaskRunRecord({
+    id: taskRunId,
+    title: "Team Root Task",
+    description: userGoal,
+    status: "pending",
+    verified: false,
+    output: "",
+    attempts: 0,
+    artifacts: [],
+  });
+  const pendingPlan = createPlanRecord({
+    id: planId,
+    goal: userGoal,
+    mode: "team",
+    taskRunIds: [taskRunId],
+    summary: "Team orchestration run.",
+  });
+  const pendingJob = createJobRecord({
+    id: jobId,
+    goal: userGoal,
+    mode: "team",
+    status: "running",
+    verified: false,
+    output: "Running...",
+    plan: pendingPlan,
+    taskRuns: [pendingTaskRun],
+    artifacts: [],
+  });
+  persistWorkflowPayload({
+    job: pendingJob,
+    plan: pendingPlan,
+    taskRuns: [pendingTaskRun],
+    artifacts: [],
+  });
+  emitLifecycle("job.created", "Job created", "A new team job was created and queued for execution.", "running", {
+    mode: pendingJob.mode,
+    goal: pendingJob.goal,
+    plan_id: pendingPlan.id,
+  }, "start");
+  emitLifecycle("job.started", "Job started", "Execution started for the requested team goal.", "running", {
+    plan_id: pendingPlan.id,
+    task_run_id: pendingTaskRun.id,
+  }, "start");
+
+  try {
+    let payload: TaskExecutionPayload;
+    let verificationConfig: OrchestratorConfig | undefined;
+    if (injectedTeamExecutor) {
+      payload = await injectedTeamExecutor(userGoal, model, {
+        jobId,
+        planId,
+        taskRunId,
+        signal: abortController.signal,
+        emitEvent: forwardRuntimeEvent,
+      });
+    } else {
+      const config = loadConfig();
+      verificationConfig = config;
+      configureSearchTools(config.search);
+      const logger = createRunLogger(userGoal);
+      const teamAgents = resolveTeamAgents(config);
+      const tracer = new Tracer(logger);
+      const teamConfig = approvalMode === "always"
+        ? { onApproval: createTeamApprovalGate(jobId) }
+        : undefined;
+      const result = await runTeam(config, userGoal, teamAgents, logger, tracer, teamConfig, undefined, {
+        abortSignal: abortController.signal,
+        jobId,
+        planId,
+        taskRunId,
+        onEvent: forwardRuntimeEvent,
+      });
+      payload = {
+        content: result.finalAnswer,
+        logPath: logger.logPath,
+        resolvedModel: OPENAI_MODEL_ID,
+        job: {
+          ...result.job,
+          id: jobId,
+          plan: { ...result.plan, id: planId },
+        },
+        plan: { ...result.plan, id: planId },
+        taskRuns: result.taskRuns,
+        artifacts: result.artifacts,
+      };
+    }
+
+    const verifiedJob = await verifyWorkflowPayload(payload, {
+      jobId,
+      goal: userGoal,
+      config: verificationConfig,
+      emitLifecycle,
+    });
+
+    const jobRecordPath = persistWorkflowPayload({
+      job: verifiedJob,
+      plan: payload.plan,
+      taskRuns: payload.taskRuns,
+      artifacts: payload.artifacts,
+    });
+    emitLifecycle(mapJobStatusToLifecycleType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatusToUiStatus(verifiedJob.status), {
+      verified: verifiedJob.verified,
+      output_preview: verifiedJob.output.slice(0, 200),
+      log_path: payload.logPath,
+      job_record_path: jobRecordPath,
+    }, "final");
+    return {
+      ...payload,
+      job: verifiedJob,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const cancelledRecord = readJobRecord(jobId);
+    const wasCancelled = Boolean(cancelledRecord?.control?.cancelledAt);
+    updateStoredJobRecord(jobId, (record) => ({
+      ...record,
+      savedAt: new Date().toISOString(),
+      job: {
+        ...record.job,
+        status: record.control?.cancelledAt ? "cancelled" : "failed",
+        verified: false,
+        output: message,
+      },
+      taskRuns: record.taskRuns.map((taskRun) => ({
+        ...taskRun,
+        status: record.control?.cancelledAt ? "blocked" : "failed",
+        output: taskRun.output || message,
+      })),
+    }));
+    emitLifecycle(
+      wasCancelled ? "job.cancelled" : "job.failed",
+      wasCancelled ? "Job cancelled" : "Job failed",
+      truncateToolResultContent(message || (wasCancelled ? "Job cancelled." : "Job failed.")),
+      wasCancelled ? "blocked" : "failed",
+      { error: message },
+      "final",
+    );
+    throw error;
+  } finally {
+    unregisterActiveJobSession(jobId);
+  }
+}
+
+async function executeJobByMode(
+  mode: Job["mode"],
+  goal: string,
+  model: string | undefined,
+  options?: JobExecutionOptions,
+): Promise<TaskExecutionPayload> {
+  if (mode === "team") {
+    return executeTeamGoal(goal, model, options?.fixedIds, options?.approvalMode);
+  }
+  return executeTaskGoal(goal, model, options?.requirePlannerCircuit ?? true, undefined, options?.fixedIds);
+}
+
 async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExecutionPayload> {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
@@ -2109,6 +2595,11 @@ async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExec
   const userGoal = buildUserGoal(normalizedMessages);
   if (!userGoal) {
     throw new Error("Unable to derive a user goal from the provided messages.");
+  }
+
+  const controlResponse = buildClaudeControlResponse(userGoal);
+  if (controlResponse) {
+    return controlResponse;
   }
 
   return executeTaskGoal(userGoal, body.model, false);
@@ -2125,7 +2616,62 @@ async function runTaskFromMessages(messages: OpenAIMessage[], model: string | un
     throw new Error("Unable to derive a user goal from the provided messages.");
   }
 
+  const controlResponse = buildClaudeControlResponse(userGoal);
+  if (controlResponse) {
+    return controlResponse;
+  }
+
   return executeTaskGoal(userGoal, model, true, onEvent);
+}
+
+async function runTaskFromMessagesWithRegistration(
+  messages: OpenAIMessage[],
+  model: string | undefined,
+  onEvent?: OrchestratorEventCallback,
+  onRegistered?: (jobId: string) => void,
+): Promise<TaskExecutionPayload> {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error("`messages` must be a non-empty array.");
+  }
+
+  const normalizedMessages = normalizeChatMessages(messages);
+  const userGoal = buildUserGoal(normalizedMessages);
+  if (!userGoal) {
+    throw new Error("Unable to derive a user goal from the provided messages.");
+  }
+
+  const controlResponse = buildClaudeControlResponse(userGoal);
+  if (controlResponse) {
+    return controlResponse;
+  }
+
+  return executeTaskGoal(userGoal, model, true, onEvent, undefined, onRegistered);
+}
+
+function attachRequestAbortCancellation(
+  res: ServerResponse,
+  lookupJobId: () => string | null,
+): () => void {
+  let detached = false;
+  let settled = false;
+
+  const handleDisconnect = () => {
+    if (detached || settled) {
+      return;
+    }
+    const jobId = lookupJobId();
+    if (!jobId) {
+      return;
+    }
+    cancelActiveJobSession(jobId, `Client disconnected before response completed for job ${jobId}.`);
+  };
+
+  res.on("close", handleDisconnect);
+
+  return () => {
+    detached = true;
+    settled = true;
+  };
 }
 
 async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown, requestOverrides?: import("./providers/openai-compatible.js").CompletionOverrides): Promise<{
@@ -2184,10 +2730,10 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
-  if (body.mode !== undefined && body.mode !== "task") {
+  if (body.mode !== undefined && body.mode !== "task" && body.mode !== "team") {
     jsonResponse(res, 400, {
       error: {
-        message: "`POST /v1/jobs` currently supports mode \"task\". Team mode will use the same control-plane contract in a later milestone.",
+        message: "`mode` must be either \"task\" or \"team\".",
         type: "invalid_request_error",
       },
     });
@@ -2197,13 +2743,28 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
   const modelRoute = typeof body.model_route === "string" && body.model_route.trim()
     ? body.model_route.trim()
     : undefined;
+  const requestedMode = body.mode === "team" ? "team" : "task";
+  if (requestedMode === "team" && body.policy?.approval_mode === "always" && body.policy.async !== true) {
+    jsonResponse(res, 400, {
+      error: {
+        message: 'team approval_mode "always" requires policy.async=true so the job can wait for /approve.',
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
   if (body.policy?.async === true) {
     const fixedIds: FixedTaskIds = {
       jobId: `job_${randomUUID()}`,
       planId: `plan_${randomUUID()}`,
       taskRunId: `taskrun_${randomUUID()}`,
     };
-    void executeTaskGoal(goal, modelRoute, true, undefined, fixedIds).catch(() => {
+    const executionPromise = executeJobByMode(requestedMode, goal, modelRoute, {
+      requirePlannerCircuit: true,
+      fixedIds,
+      approvalMode: body.policy?.approval_mode,
+    });
+    void executionPromise.catch(() => {
       // Failure state is already persisted inside executeTaskGoal.
     });
     const record = readJobRecord(fixedIds.jobId);
@@ -2220,7 +2781,7 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
         job: {
           id: fixedIds.jobId,
           goal,
-          mode: "task",
+          mode: requestedMode,
           status: "running",
           verified: false,
           output: "Running...",
@@ -2230,7 +2791,10 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
 
-  const result = await executeTaskGoal(goal, modelRoute, true);
+  const result = await executeJobByMode(requestedMode, goal, modelRoute, {
+    requirePlannerCircuit: true,
+    approvalMode: body.policy?.approval_mode,
+  });
   const record = readJobRecord(result.job.id);
 
   jsonResponse(res, 201, {
@@ -2514,7 +3078,9 @@ async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId:
     return;
   }
 
-  const retryResult = await executeTaskGoal(record.job.goal, undefined, false);
+  const retryResult = await executeJobByMode(record.job.mode, record.job.goal, undefined, {
+    requirePlannerCircuit: false,
+  });
   updateJobControlState(jobId, {
     retriedAt: new Date().toISOString(),
     retriedToJobId: retryResult.job.id,
@@ -2671,7 +3237,9 @@ async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId
     return;
   }
 
-  const resumeResult = await executeTaskGoal(record.job.goal, undefined, false);
+  const resumeResult = await executeJobByMode(record.job.mode, record.job.goal, undefined, {
+    requirePlannerCircuit: false,
+  });
   updateJobControlState(jobId, {
     resumedAt: new Date().toISOString(),
     resumedToJobId: resumeResult.job.id,
@@ -2708,6 +3276,8 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
   const mirrorProgressToContent = body.stream && !toolMode && shouldMirrorProgressToContent(body.include_progress_updates);
+  let requestJobId: string | null = null;
+  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
 
   if (toolMode) {
     if (extractLatestOpenAIWriteToolCompletion(body.messages)) {
@@ -2874,7 +3444,12 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     };
 
     try {
-      const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model, combinedOnEvent);
+      const resultForModel = await runTaskFromMessagesWithRegistration(
+        normalizeChatMessages(body.messages || []),
+        body.model,
+        combinedOnEvent,
+        (jobId) => { requestJobId = jobId; },
+      );
       const requestedModel = resultForModel.resolvedModel;
       const workflow = buildWorkflowPayload(resultForModel);
       flushPendingToolAggregation();
@@ -2906,15 +3481,26 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
         }));
       }
       res.end("data: [DONE]\n\n");
+    } finally {
+      detachRequestAbort();
     }
     return;
   }
 
   // Non-streaming path
-  const resultForModel = await runTaskFromMessages(normalizeChatMessages(body.messages || []), body.model).catch((error) => { throw error; });
-  const requestedModel = resultForModel.resolvedModel;
-  const workflow = buildWorkflowPayload(resultForModel);
-  jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
+  try {
+    const resultForModel = await runTaskFromMessagesWithRegistration(
+      normalizeChatMessages(body.messages || []),
+      body.model,
+      undefined,
+      (jobId) => { requestJobId = jobId; },
+    ).catch((error) => { throw error; });
+    const requestedModel = resultForModel.resolvedModel;
+    const workflow = buildWorkflowPayload(resultForModel);
+    jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
+  } finally {
+    detachRequestAbort();
+  }
 }
 
 function buildResponsesOutput(content: string): unknown[] {
@@ -2952,11 +3538,19 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
   const body = await readJsonBody<ResponsesRequest>(req);
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
   const messages = normalizeResponsesInput(body.input, body.instructions);
-  const result = await runTaskFromMessages(messages, body.model);
+  let requestJobId: string | null = null;
+  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
+  const result = await runTaskFromMessagesWithRegistration(messages, body.model, undefined, (jobId) => {
+    requestJobId = jobId;
+  });
   const workflow = buildWorkflowPayload(result);
 
   if (!body.stream) {
-    jsonResponse(res, 200, buildResponsesResponse(result.resolvedModel, result.content, workflow));
+    try {
+      jsonResponse(res, 200, buildResponsesResponse(result.resolvedModel, result.content, workflow));
+    } finally {
+      detachRequestAbort();
+    }
     return;
   }
 
@@ -2978,7 +3572,11 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
       status: result.job.status,
     }));
   }
-  res.end("data: [DONE]\n\n");
+  try {
+    res.end("data: [DONE]\n\n");
+  } finally {
+    detachRequestAbort();
+  }
 }
 
 function buildAnthropicMessageResponse(model: string, content: string, workflow?: unknown): unknown {
@@ -3006,8 +3604,88 @@ function buildAnthropicMessageResponse(model: string, content: string, workflow?
 async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<AnthropicMessagesRequest>(req);
   const messages = normalizeAnthropicMessages(body.messages, body.system);
-  const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
+  const requestedToolMode = Array.isArray(body.tools) && body.tools.length > 0;
+  const hasToolHistory = hasAnthropicToolHistory(body.messages);
+  const toolMode = requestedToolMode && hasToolHistory;
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
+  let requestJobId: string | null = null;
+  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
+
+  if (requestedToolMode && !hasToolHistory) {
+    const result = await runTaskFromMessagesWithRegistration(messages, body.model, undefined, (jobId) => {
+      requestJobId = jobId;
+    });
+    const workflow = buildWorkflowPayload(result);
+
+    if (!body.stream) {
+      try {
+        jsonResponse(res, 200, buildAnthropicMessageResponse(result.resolvedModel, summarizeToolResultContent(result.content) || result.content, workflow));
+      } finally {
+        detachRequestAbort();
+      }
+      return;
+    }
+
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    const messageId = `msg_${Date.now()}`;
+    res.write(`event: message_start\n`);
+    sseWrite(res, JSON.stringify({
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model: result.resolvedModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }));
+    res.write(`event: content_block_start\n`);
+    sseWrite(res, JSON.stringify({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }));
+    for (const chunk of splitContentForStreaming(summarizeToolResultContent(result.content) || result.content)) {
+      res.write(`event: content_block_delta\n`);
+      sseWrite(res, JSON.stringify({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: chunk },
+      }));
+    }
+    res.write(`event: content_block_stop\n`);
+    sseWrite(res, JSON.stringify({ type: "content_block_stop", index: 0 }));
+    res.write(`event: message_delta\n`);
+    sseWrite(res, JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 0 },
+    }));
+    if (includeWorkflowEvents) {
+      sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
+        mode: "task",
+        model: result.resolvedModel,
+        status: result.job.status,
+      }));
+    }
+    try {
+      res.write(`event: message_stop\n`);
+      sseWrite(res, JSON.stringify({ type: "message_stop" }));
+      res.end();
+    } finally {
+      detachRequestAbort();
+    }
+    return;
+  }
+
+  detachRequestAbort();
 
   if (toolMode) {
     if (extractLatestAnthropicWriteToolCompletion(body.messages)) {
@@ -3132,7 +3810,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         index: 0,
         content_block: { type: "text", text: "" },
       }));
-      const finalText = summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
+      const finalText = summarizeToolResultContent(result.content) || result.content || summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
       for (const chunk of splitContentForStreaming(finalText)) {
         res.write(`event: content_block_delta\n`);
         sseWrite(res, JSON.stringify({
@@ -3748,25 +4426,7 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
   const tracer = new Tracer(logger);
   const startedAt = new Date().toISOString();
 
-  // Parse agents from env or use defaults
-  const agentsRaw = process.env.TEAM_AGENTS?.trim();
-  let teamAgents: TeamAgent[];
-  if (agentsRaw) {
-    try {
-      const parsed = JSON.parse(agentsRaw) as unknown;
-      if (Array.isArray(parsed)) {
-        teamAgents = parsed
-          .filter((a): a is Record<string, unknown> => !!a && typeof a === "object" && typeof (a as Record<string, unknown>).name === "string")
-          .map((a) => ({ name: a.name as string, role: typeof a.role === "string" ? a.role : undefined }));
-      } else {
-        teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
-      }
-    } catch {
-      teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
-    }
-  } else {
-    teamAgents = [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
-  }
+  const teamAgents = resolveTeamAgents(config);
 
   const result = await runTeam(config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
 
@@ -3855,7 +4515,14 @@ export const __testables = {
   buildJobResponse,
   buildStepList,
   buildJobEvents,
+  buildClaudeControlResponse,
+  isClaudeControlMessage,
   setTaskExecutorForTests,
+  setTeamExecutorForTests,
+  resolveTeamAgents,
+  resolveRegisteredRoleAgent,
+  createTeamApprovalGate,
+  persistTeamApprovalSnapshot,
   getActiveJobSession,
   recoverInterruptedJobs,
   buildDoctorReport,

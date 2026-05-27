@@ -6,6 +6,27 @@ import { normalizeWorkflowEvent } from "../../src/workflow-ui-events.js";
 import type { StoredJobRecord } from "../../src/job-store.js";
 import type { Artifact, Job, Plan, TaskRun } from "../../src/types.js";
 
+test("claude control messages are short-circuited before orchestration", () => {
+  assert.equal(__testables.isClaudeControlMessage("/init"), true);
+  assert.equal(__testables.isClaudeControlMessage("<command-message>init</command-message>\n<command-name>/init</command-name>"), true);
+  assert.equal(__testables.isClaudeControlMessage("[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"), true);
+  assert.equal(__testables.isClaudeControlMessage("介绍一下这个项目"), false);
+
+  const initResponse = __testables.buildClaudeControlResponse("/init");
+  assert.equal(initResponse?.job.status, "completed");
+  assert.equal(initResponse?.job.verified, true);
+  assert.equal(initResponse?.taskRuns.length, 1);
+  assert.equal(initResponse?.content.includes("ready"), true);
+
+  const wrappedInitResponse = __testables.buildClaudeControlResponse("<command-message>init</command-message>\n<command-name>/init</command-name>");
+  assert.equal(wrappedInitResponse?.job.status, "completed");
+  assert.equal(wrappedInitResponse?.content.includes("ready"), true);
+
+  const suggestionResponse = __testables.buildClaudeControlResponse("[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]");
+  assert.equal(suggestionResponse?.job.status, "completed");
+  assert.equal(suggestionResponse?.content, "");
+});
+
 function buildRecord(taskRuns: TaskRun[]): StoredJobRecord {
   const plan: Plan = {
     id: "plan_workflow_1",

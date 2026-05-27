@@ -1,6 +1,6 @@
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import type { RunLogger } from "./logger.js";
-import type { Artifact, Job, OrchestratorConfig, Plan, RunOptions, Task, TaskRun, TaskSpec, TeamConfig } from "./types.js";
+import type { AgentToolPolicy, Artifact, Job, OrchestratorConfig, Plan, RegisteredAgent, RunOptions, Task, TaskRun, TaskSpec, TeamConfig } from "./types.js";
 import { createTask, validateTaskDependencies } from "./task/task.js";
 import { TaskQueue } from "./task/queue.js";
 import { Scheduler, type AgentInfo } from "./orchestrator/scheduler.js";
@@ -10,6 +10,7 @@ import { loadTaskRoutingConfig } from "./task-routing.js";
 import { buildDecompositionPrompt, buildSynthesisPrompt, buildTaskPrompt } from "./orchestrator/prompts.js";
 import { Tracer } from "./trace.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workflow-contract.js";
+import { buildWorkflowGraph } from "./workflow-graph.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import { buildControlledFallbackTask, parseTeamTaskSpecs } from "./team-schema.js";
 
@@ -74,6 +75,88 @@ function buildSubtaskConfig(config: OrchestratorConfig): OrchestratorConfig {
       maxToolRetries: Math.min(config.policy.maxToolRetries, 1),
     },
   };
+}
+
+function resolveRegisteredAgent(config: OrchestratorConfig, assignee: string | undefined): RegisteredAgent | undefined {
+  if (!assignee || !config.agents) {
+    return undefined;
+  }
+  return config.agents[assignee];
+}
+
+function resolveExecutorAgent(config: OrchestratorConfig, assignee: string | undefined): RegisteredAgent | undefined {
+  const direct = resolveRegisteredAgent(config, assignee);
+  if (direct) {
+    return direct;
+  }
+  if (config.defaultExecutorAgent && config.agents?.[config.defaultExecutorAgent]) {
+    return config.agents[config.defaultExecutorAgent];
+  }
+  return undefined;
+}
+
+function resolveRoleAgent(config: OrchestratorConfig, roleName: string): RegisteredAgent | undefined {
+  const normalizedRole = roleName.toLowerCase();
+  return Object.values(config.agents ?? {}).find((agent) => {
+    const id = agent.id.toLowerCase();
+    const role = agent.role.toLowerCase();
+    return id === normalizedRole || role === normalizedRole || role.includes(normalizedRole);
+  });
+}
+
+function applyAgentToolPolicy(requestedTools: string[], policy?: AgentToolPolicy): string[] {
+  let tools = [...requestedTools];
+  if (policy?.allow && policy.allow.length > 0) {
+    const allowed = new Set(policy.allow);
+    tools = tools.filter((tool) => allowed.has(tool));
+  }
+  if (policy?.deny && policy.deny.length > 0) {
+    const denied = new Set(policy.deny);
+    tools = tools.filter((tool) => !denied.has(tool));
+  }
+  return Array.from(new Set(tools));
+}
+
+function buildAgentScopedRoutePolicy(
+  routePolicy: ReturnType<typeof getRoutePolicy>,
+  agent: RegisteredAgent | undefined,
+): ReturnType<typeof getRoutePolicy> {
+  if (!agent?.tools) {
+    return routePolicy;
+  }
+  return {
+    ...routePolicy,
+    preferredTools: applyAgentToolPolicy(routePolicy.preferredTools, agent.tools),
+  };
+}
+
+function buildAgentScopedConfig(config: OrchestratorConfig, agent: RegisteredAgent | undefined): OrchestratorConfig {
+  if (!agent) {
+    return config;
+  }
+  return {
+    ...config,
+    executor: agent.model,
+    executorToolPolicy: agent.tools,
+  };
+}
+
+function buildAgentScopedPlannerConfig(config: OrchestratorConfig, agent: RegisteredAgent | undefined): OrchestratorConfig {
+  if (!agent) {
+    return config;
+  }
+  return {
+    ...config,
+    planner: agent.model,
+  };
+}
+
+function getAgentConcurrencyLimit(agent: RegisteredAgent | undefined, fallback: number): number {
+  return agent?.limits?.max_concurrency ?? fallback;
+}
+
+function getAgentRuntimeKey(agent: RegisteredAgent | undefined, assignee: string | undefined): string {
+  return agent?.id ?? assignee ?? "unassigned";
 }
 
 async function buildDependencyContextFromMemory(
@@ -176,8 +259,9 @@ export async function runTeam(
     trace.emit("goal.achieved", { agent: best.name, reason: "simple_goal" });
     const routing = loadTaskRoutingConfig(config.taskRoutingPath);
     const taskType = detectTaskType(goal, routing);
-    const routePolicy = getRoutePolicy(taskType, routing);
-    const result = await runtimeDeps.runTask(config, goal, routePolicy, logger, runtimeDeps, options);
+    const agent = resolveExecutorAgent(config, best.name);
+    const routePolicy = buildAgentScopedRoutePolicy(getRoutePolicy(taskType, routing), agent);
+    const result = await runtimeDeps.runTask(buildAgentScopedConfig(config, agent), goal, routePolicy, logger, runtimeDeps, options);
     const taskRun = createTaskRunRecord({
       id: result.taskRuns[0]?.id,
       title: result.taskRuns[0]?.title ?? goal,
@@ -197,6 +281,7 @@ export async function runTeam(
       taskRunIds: [taskRun.id],
       summary: "Team orchestration short-circuited to a single agent.",
     });
+    const workflowGraph = buildWorkflowGraph(plan.id, [taskRun], plan.summary);
     const job = createJobRecord({
       goal,
       mode: "team",
@@ -207,6 +292,7 @@ export async function runTeam(
       taskRuns: [taskRun],
       artifacts: result.artifacts,
       memorySummary: "",
+      workflowGraph,
     });
     return {
       goal,
@@ -311,6 +397,7 @@ export async function runTeam(
         ? `Team plan only with controlled fallback: ${fallbackReason}`
         : `Team plan only with ${taskRuns.length} task runs.`,
     });
+    const workflowGraph = buildWorkflowGraph(plan.id, taskRuns, plan.summary);
     const job = createJobRecord({
       goal,
       mode: "team",
@@ -321,6 +408,7 @@ export async function runTeam(
       taskRuns,
       artifacts: [],
       memorySummary: "",
+      workflowGraph,
     });
     return {
       goal,
@@ -339,17 +427,20 @@ export async function runTeam(
   const taskResults = new Map<string, { success: boolean; output: string }>();
   const taskRunsById = new Map<string, TaskRun>();
   let activeCount = 0;
+  const activeByAgent = new Map<string, number>();
   const inFlight: Set<Promise<void>> = new Set();
   let resolveAllComplete: (() => void) | undefined;
   const allComplete = new Promise<void>((r) => { resolveAllComplete = r; });
 
   async function dispatchTask(task: Task): Promise<void> {
     assertNotCancelled(options);
+    const agentName = task.assignee ?? "unassigned";
+    const agent = resolveExecutorAgent(config, agentName);
+    const agentRuntimeKey = getAgentRuntimeKey(agent, agentName);
     activeCount++;
+    activeByAgent.set(agentRuntimeKey, (activeByAgent.get(agentRuntimeKey) ?? 0) + 1);
     queue.update(task.id, { status: "in_progress" });
     trace.emit("task.started", { taskId: task.id, title: task.title, assignee: task.assignee });
-
-    const agentName = task.assignee ?? "unassigned";
 
     const dependencyContext = await buildDependencyContextFromMemory(sharedMem, task, queue);
 
@@ -360,13 +451,21 @@ export async function runTeam(
     const taskPrompt = buildTaskPrompt(task.title, task.description, dependencyContext);
     const routing = loadTaskRoutingConfig(config.taskRoutingPath);
     const taskType = detectTaskType(taskPrompt, routing);
-    const routePolicy = getRoutePolicy(taskType, routing);
+    const routePolicy = buildAgentScopedRoutePolicy(getRoutePolicy(taskType, routing), agent);
+    const agentScopedConfig = buildAgentScopedConfig(subtaskConfig, agent);
 
     try {
-      logger?.log("team.task.start", { taskId: task.id, title: task.title, assignee: agentName });
+      logger?.log("team.task.start", {
+        taskId: task.id,
+        title: task.title,
+        assignee: agentName,
+        routed_agent: agent?.id ?? null,
+        executor_model: agent?.model.model ?? subtaskConfig.executor.model,
+        preferred_tools: routePolicy.preferredTools,
+      });
 
       const result = await executeWithRetry(task, async () => {
-        return await runtimeDeps.runTask(subtaskConfig, taskPrompt, routePolicy, logger, runtimeDeps, options);
+        return await runtimeDeps.runTask(agentScopedConfig, taskPrompt, routePolicy, logger, runtimeDeps, options);
       }, trace, logger, options);
 
       const output = result.output;
@@ -427,6 +526,7 @@ export async function runTeam(
     }
 
     activeCount--;
+    activeByAgent.set(agentRuntimeKey, Math.max(0, (activeByAgent.get(agentRuntimeKey) ?? 1) - 1));
     void tryDrain();
   }
 
@@ -441,7 +541,20 @@ export async function runTeam(
         queue.skipRemaining("Skipped: run cancelled.");
         break;
       }
-      const task = dispatchQueue.shift()!;
+      const dispatchIndex = dispatchQueue.findIndex((task) => {
+        const assignee = task.assignee ?? "unassigned";
+        const agent = resolveExecutorAgent(config, assignee);
+        const runtimeKey = getAgentRuntimeKey(agent, assignee);
+        const activeForAgent = activeByAgent.get(runtimeKey) ?? 0;
+        return activeForAgent < getAgentConcurrencyLimit(agent, maxConcurrency);
+      });
+      if (dispatchIndex < 0) {
+        break;
+      }
+      const [task] = dispatchQueue.splice(dispatchIndex, 1);
+      if (!task) {
+        break;
+      }
       const p = dispatchTask(task).catch(() => {});
       inFlight.add(p);
       p.finally(() => inFlight.delete(p));
@@ -462,9 +575,31 @@ export async function runTeam(
   if (teamConfig?.onApproval) {
     const pendingBeforeDispatch = queue.getByStatus("pending");
     if (pendingBeforeDispatch.length > 0) {
-      const approved = await teamConfig.onApproval(pendingBeforeDispatch);
+      const awaitingApproval = pendingBeforeDispatch.map((task) =>
+        queue.update(task.id, { status: "awaiting_approval", result: "Waiting for approval." })
+      );
+      for (const task of awaitingApproval) {
+        trace.emit("task.awaiting_approval", { taskId: task.id, title: task.title, assignee: task.assignee });
+        options?.onEvent?.({
+          type: "workflow.task.awaiting_approval",
+          data: {
+            task_id: task.id,
+            title: task.title,
+            kind: "approval",
+            role: task.assignee ?? "worker",
+            assignee: task.assignee ?? null,
+            depends_on: task.dependsOn ?? [],
+          },
+        });
+      }
+
+      const approved = await teamConfig.onApproval(awaitingApproval);
       if (!approved) {
         queue.skipRemaining("Skipped: approval rejected.");
+      } else {
+        for (const task of awaitingApproval) {
+          queue.update(task.id, { status: "pending", result: undefined });
+        }
       }
     }
   }
@@ -522,7 +657,13 @@ export async function runTeam(
     if (raceResult === "cancelled") {
       finalAnswer = "Run cancelled.";
     } else {
-      finalAnswer = await runtimeDeps.runTeamSynthesis(config, goal, resultsText, memorySummary, logger, runtimeDeps, options);
+      const synthesizerAgent = resolveRoleAgent(config, "synthesizer");
+      const synthesisConfig = buildAgentScopedPlannerConfig(config, synthesizerAgent);
+      logger?.log("team.synthesis.route", {
+        routed_agent: synthesizerAgent?.id ?? null,
+        planner_model: synthesisConfig.planner.model,
+      });
+      finalAnswer = await runtimeDeps.runTeamSynthesis(synthesisConfig, goal, resultsText, memorySummary, logger, runtimeDeps, options);
     }
   } catch {
     finalAnswer = completedTasks
@@ -579,6 +720,7 @@ export async function runTeam(
     taskRunIds: taskRuns.map((taskRun) => taskRun.id),
     summary: `Team plan with ${taskRuns.length} task runs.`,
   });
+  const workflowGraph = buildWorkflowGraph(plan.id, taskRuns, plan.summary);
   const job = createJobRecord({
     goal,
     mode: "team",
@@ -589,6 +731,7 @@ export async function runTeam(
     taskRuns,
     artifacts,
     memorySummary,
+    workflowGraph,
   });
 
   return { goal, finalAnswer, taskResults, memorySummary, tasks: queue.list(), job, plan, taskRuns, artifacts };
