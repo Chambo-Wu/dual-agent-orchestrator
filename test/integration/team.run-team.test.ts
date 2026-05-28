@@ -319,6 +319,59 @@ test("runTeam routes subtasks to the executor model registered for the assignee"
   assert.deepEqual(modelsUsed, ["research-model", "writer-model"]);
 });
 
+test("runTeam agent-scoped executor override wins over global executor candidate ordering", async () => {
+  const config = buildMinimalConfig();
+  config.defaultExecutorAgent = "researcher";
+  config.modelRegistry = {
+    ...config.modelRegistry,
+    executor_backup: {
+      id: "executor_backup",
+      role: "executor",
+      enabled: true,
+      model: {
+        ...config.executor,
+        model: "backup-model",
+      },
+    },
+  };
+  config.modelRouting = {
+    ...config.modelRouting,
+    executorCandidates: ["executor_backup", "executor.default"],
+  };
+  config.agents = {
+    researcher: {
+      id: "researcher",
+      role: "research",
+      model: {
+        ...config.executor,
+        model: "research-model",
+      },
+    },
+  };
+  const modelsUsed: string[] = [];
+
+  await runTeam(
+    config,
+    "Inspect the codebase",
+    [{ name: "researcher", role: "research" }],
+    undefined,
+    undefined,
+    { maxConcurrency: 1, maxRounds: 1 },
+    createFakeRuntimeDeps({
+      runTeamDecomposition: async () => JSON.stringify([
+        { title: "Inspect", description: "Inspect files", assignee: "researcher" },
+      ]),
+      runTask: async (agentScopedConfig) => {
+        modelsUsed.push(agentScopedConfig.executor.model);
+        return fakeRunTaskResult({ output: "inspection result" });
+      },
+      runTeamSynthesis: async () => "final synthesis",
+    }),
+  );
+
+  assert.deepEqual(modelsUsed, ["research-model"]);
+});
+
 test("runTeam falls back to default executor agent when assignee is not registered", async () => {
   const config = buildMinimalConfig();
   config.defaultExecutorAgent = "researcher";

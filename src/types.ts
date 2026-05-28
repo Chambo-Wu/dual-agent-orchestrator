@@ -8,6 +8,20 @@ export interface ModelConfig {
   temperature: number;
 }
 
+export type ModelRole = "planner" | "executor";
+
+export interface RegisteredModel {
+  id: string;
+  role: ModelRole;
+  enabled: boolean;
+  model: ModelConfig;
+}
+
+export interface ModelRoutingConfig {
+  plannerCandidates: string[];
+  executorCandidates: string[];
+}
+
 export interface AgentToolPolicy {
   allow?: string[];
   deny?: string[];
@@ -57,6 +71,8 @@ export interface SearchRequest {
 export interface OrchestratorConfig {
   planner: ModelConfig;
   executor: ModelConfig;
+  modelRegistry: Record<string, RegisteredModel>;
+  modelRouting: ModelRoutingConfig;
   executorToolPolicy?: AgentToolPolicy;
   agents?: Record<string, RegisteredAgent>;
   defaultExecutorAgent?: string;
@@ -419,6 +435,10 @@ export interface RunOptions {
   planId?: string;
   taskRunId?: string;
   onEvent?: OrchestratorEventCallback;
+  executorSelectionState?: {
+    selectedCandidateIds?: string[];
+    searchWarmupCompleted?: boolean;
+  };
 }
 
 // ---------------------------------------------------------------------------

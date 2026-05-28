@@ -22,6 +22,14 @@ The runtime is built around two model roles:
 - `planner`: the stronger model that understands the goal, breaks work into steps, audits progress, decides retries, and produces final answers
 - `executor`: the cheaper or more local model that performs deterministic tool work such as file I/O, shell commands, search, and URL fetching
 
+By default, those roles are configured as one `planner` and one `executor`. The runtime now also supports a compatible multi-model extension:
+
+- keep the legacy top-level `planner` and `executor` fields
+- optionally register additional models under `models`
+- optionally define candidate queues with `model_routing.planner_candidates` and `model_routing.executor_candidates`
+- automatically normalize legacy config into `planner.default` and `executor.default`
+- support both explicit probe diagnostics and runtime lazy executor admission
+
 The current implementation supports both:
 
 - direct chat-style use through `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`
@@ -45,6 +53,7 @@ This is now a working orchestration service rather than a CLI skeleton. The curr
 - Cherry Studio-friendly progress mirroring inside standard chat streams
 - protocol compatibility guards for OpenAI-style and Anthropic-style clients
 - file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
+- lazy multi-model executor warmup for retrieval-heavy steps, so the first real search/fetch request can double as candidate admission
 
 ## Terminology
 
@@ -136,6 +145,91 @@ Notes:
 - `config/example.config.yml` is a sample template and is not loaded automatically
 - `npm run config:validate` and `npm run doctor` validate `config/config.yml` unless you pass a custom path
 
+### Multi-model configuration
+
+The recommended rollout path is:
+
+1. Keep your existing `planner` and `executor` blocks unchanged.
+2. Add optional extra models under `models`.
+3. Add candidate queues under `model_routing`.
+
+Example:
+
+```yml
+planner:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "env:PLANNER_API_KEY"
+  model: "GLM-5"
+
+executor:
+  base_url: "http://127.0.0.1:1234/v1"
+  api_key: "env:EXECUTOR_API_KEY"
+  model: "qwen/qwen3-4b-2507"
+
+models:
+  planner_backup:
+    role: "planner"
+    base_url: "http://127.0.0.1:8081/v1"
+    api_key: "env:PLANNER_API_KEY"
+    model: "GLM-5-Air"
+  executor_local:
+    role: "executor"
+    base_url: "http://127.0.0.1:1235/v1"
+    api_key: "env:EXECUTOR_API_KEY"
+    model: "qwen/qwen3-8b"
+    enabled: true
+  executor_remote:
+    role: "executor"
+    base_url: "https://example-gateway.invalid/v1"
+    api_key: "env:EXECUTOR_REMOTE_API_KEY"
+    model: "deepseek-chat"
+    enabled: true
+
+model_routing:
+  planner_candidates: ["planner.default", "planner_backup"]
+  executor_candidates: ["executor.default", "executor_local", "executor_remote"]
+```
+
+Compatibility rules:
+
+- old configs with only top-level `planner` and `executor` still work
+- legacy config is normalized into `planner.default` and `executor.default`
+- runtime materialization still begins from the first routed executor candidate
+- team-mode per-agent routing still works and remains a separate layer from the global executor candidate queue
+
+### Health checks and candidate admission
+
+In multi-model mode, executor admission now depends on the surface you are using.
+
+- CLI `task` / `team` still run explicit lightweight executor probes before execution starts
+- `GET /health` also runs explicit live probes and reports those results as diagnostics
+- HTTP job execution (`POST /v1/jobs`) does not always spend a full preflight probe round anymore
+- retrieval-heavy executor steps can lazily warm all executor candidates in parallel on the first real `web_search` / `url_fetch` step and keep only the candidates that actually respond correctly
+
+Current behavior:
+
+- only `executor` candidates are health-filtered today
+- explicit probes use a minimal chat-completions request
+- lazy runtime warmup uses the first real retrieval request as the admission signal
+- healthy or successfully warmed candidates are kept in the execution queue
+- unhealthy, disabled, malformed, or non-responsive candidates are excluded
+- if every executor candidate fails under the active strategy, execution fails early
+
+Failure contract when all executor candidates are unavailable:
+
+- the run fails early with `NoHealthyExecutorError`
+- job failure events include `failure_category: "environment_failure"`
+- job failure events also include `healthy_executor_ids` and `executor_health_results`
+- synchronous `POST /v1/jobs` failures currently return HTTP `500`
+
+### What each diagnostic surface shows
+
+Use the three surfaces differently:
+
+- `npm run doctor`: config-oriented diagnostics, candidate queue visibility, writable checks, routing summary, and recommendations. It does not run live per-model probes.
+- `GET /health`: explicit live probe diagnostics. This includes `executor.configured_candidates`, `executor.active_probe.*`, and a descriptive `executor.runtime_lazy_selection` block so callers do not confuse active probes with runtime lazy admission state. It returns `503` with `status: "degraded"` when the explicit probe finds no healthy executor.
+- `GET /v1/models`: exposed API route metadata. This is the client-facing model routing view, not a live health report.
+
 ## Install And Run
 
 ```powershell
@@ -175,6 +269,7 @@ npm run doctor
 
 - config load status
 - planner/executor model readiness
+- executor candidate queue summary
 - task routing load status
 - task routing summary
 - runtime profile snapshot
@@ -226,6 +321,13 @@ Browser-friendly built-in pages:
 - `GET /jobs/:id/stream`
 - `GET /jobs/:id/timeline`
 - `POST /jobs/:id/resume`
+
+Notes for multi-model users:
+
+- `GET /health` is the primary live-health endpoint
+- `GET /v1/models` shows exposed route metadata and active planner/executor mapping
+- `POST /v1/jobs` now prefers runtime lazy executor admission for retrieval-heavy work instead of unconditional up-front probing
+- CLI `task` / `team` entrypoints still use explicit preflight probing
 
 ## Streaming Modes
 
@@ -345,6 +447,8 @@ npm run test:e2e-lite
 
 - browser dashboard data is still loaded as one list response; very large job histories will benefit from future pagination
 - some integration tests around restart recovery still need cleanup to fully match the newer auto-resume behavior
+- executor candidate health filtering is implemented, but planner candidate health filtering is not yet wired into the same admission path
+- `npm run doctor` does not perform live async per-model probing; use `/health` for real-time executor pool status
 - the planner still depends on upstream model reliability
 - web search quality depends heavily on provider quality and query quality
 - some web pages remain JS-rendered or blocked by `403/401/429`, so degraded evidence synthesis is sometimes necessary

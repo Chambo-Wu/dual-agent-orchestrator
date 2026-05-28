@@ -1,6 +1,7 @@
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import type { RunLogger } from "./logger.js";
 import type { AgentToolPolicy, Artifact, Job, OrchestratorConfig, Plan, RegisteredAgent, RunOptions, Task, TaskRun, TaskSpec, TeamConfig } from "./types.js";
+import { materializeRuntimeModelSelection } from "./config.js";
 import { createTask, validateTaskDependencies } from "./task/task.js";
 import { TaskQueue } from "./task/queue.js";
 import { Scheduler, type AgentInfo } from "./orchestrator/scheduler.js";
@@ -134,21 +135,53 @@ function buildAgentScopedConfig(config: OrchestratorConfig, agent: RegisteredAge
   if (!agent) {
     return config;
   }
-  return {
+  return materializeRuntimeModelSelection({
     ...config,
     executor: agent.model,
+    modelRegistry: {
+      ...config.modelRegistry,
+      "executor.default": {
+        ...(config.modelRegistry["executor.default"] ?? {
+          id: "executor.default",
+          role: "executor",
+          enabled: true,
+          model: agent.model,
+        }),
+        model: agent.model,
+      },
+    },
+    modelRouting: {
+      ...config.modelRouting,
+      executorCandidates: ["executor.default"],
+    },
     executorToolPolicy: agent.tools,
-  };
+  });
 }
 
 function buildAgentScopedPlannerConfig(config: OrchestratorConfig, agent: RegisteredAgent | undefined): OrchestratorConfig {
   if (!agent) {
     return config;
   }
-  return {
+  return materializeRuntimeModelSelection({
     ...config,
     planner: agent.model,
-  };
+    modelRegistry: {
+      ...config.modelRegistry,
+      "planner.default": {
+        ...(config.modelRegistry["planner.default"] ?? {
+          id: "planner.default",
+          role: "planner",
+          enabled: true,
+          model: agent.model,
+        }),
+        model: agent.model,
+      },
+    },
+    modelRouting: {
+      ...config.modelRouting,
+      plannerCandidates: ["planner.default"],
+    },
+  });
 }
 
 function getAgentConcurrencyLimit(agent: RegisteredAgent | undefined, fallback: number): number {

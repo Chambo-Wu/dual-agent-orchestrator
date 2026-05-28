@@ -20,6 +20,36 @@ executor:
   max_tokens: 8192
   temperature: 0
 
+# Optional shared model registry for multi-model routing.
+# Executor candidates can be used by:
+# - explicit probe diagnostics such as `/health` and CLI preflight
+# - runtime lazy search warmup during the first real retrieval step
+# Legacy planner/executor config stays valid and is automatically normalized into:
+# - planner.default
+# - executor.default
+# models:
+#   planner_backup:
+#     role: "planner"
+#     base_url: "http://127.0.0.1:8081/v1"
+#     api_key: "env:PLANNER_API_KEY"
+#     model: "GLM-5-Air"
+#     timeout_ms: 120000
+#     max_tokens: 8192
+#     temperature: 0.2
+#   executor_local:
+#     role: "executor"
+#     base_url: "http://127.0.0.1:1235/v1"
+#     api_key: "env:EXECUTOR_API_KEY"
+#     model: "qwen/qwen3-8b"
+#     timeout_ms: 60000
+#     max_tokens: 4096
+#     temperature: 0
+#     enabled: true
+#
+# model_routing:
+#   planner_candidates: ["planner.default", "planner_backup"]
+#   executor_candidates: ["executor.default", "executor_local"]
+
 # Optional per-agent executor registry for team mode.
 # When present, team tasks can route to different executor models by assignee.
 # default_executor_agent: "researcher"

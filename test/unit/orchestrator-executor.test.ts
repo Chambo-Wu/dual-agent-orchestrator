@@ -197,6 +197,46 @@ test("detectTaskType routes release-note fact research away from comparative res
   assert.equal(taskType, "fact_research");
 });
 
+test("detectTaskType recognizes Chinese research prompts instead of falling back to general", () => {
+  const routing = [
+    buildRoutePolicy({
+      type: "fact_research",
+      matchers: ["最新", "官方", "发布", "公告"],
+      enableRanking: false,
+      minGroundedCandidates: 0,
+      requireEvidenceBeforeFinal: true,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+    }),
+    buildRoutePolicy({
+      type: "research",
+      matchers: ["调研", "研究", "案例", "趋势", "分析", "报告"],
+      enableRanking: true,
+      minGroundedCandidates: 3,
+      requireEvidenceBeforeFinal: true,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+    }),
+    buildRoutePolicy({
+      type: "web_search",
+      matchers: ["搜索", "查询", "检索"],
+      enableRanking: true,
+      minGroundedCandidates: 2,
+      requireEvidenceBeforeFinal: true,
+      requireArtifactReadback: true,
+      requireNonEmptyArtifact: true,
+    }),
+    buildRoutePolicy(),
+  ];
+
+  const taskType = orchestratorTestables.detectTaskType(
+    "研究一下大模型协作，目前有哪些成功案例，主要使用场景是什么，并整理成报告",
+    routing,
+  );
+
+  assert.equal(taskType, "research");
+});
+
 test("runPlannerStep records and degrades workflow plans during milestone A", async () => {
   const config = buildMinimalConfig();
   const routePolicy = buildRoutePolicy();

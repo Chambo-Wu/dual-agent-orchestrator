@@ -155,6 +155,87 @@ function getReadableResearchArtifactPaths(executorHistory: ExecutorOutput[], lim
   return paths;
 }
 
+const LOW_QUALITY_RESEARCH_ARTIFACT_PATTERNS = [
+  /baike\.baidu\.com\/item\//i,
+  /zdic\.net/i,
+  /hanyuguoxue\.com/i,
+  /dictionary\.cambridge\.org/i,
+  /wiktionary/i,
+  /baidu\.com item /i,
+  /\bitem multi\b/i,
+  /\bitem 大\b/i,
+  /\bitem 多\b/i,
+];
+
+const HIGH_SIGNAL_RESEARCH_ARTIFACT_PATTERNS = [
+  /\bmulti-agent\b/i,
+  /\bmulti agent\b/i,
+  /\bautogen\b/i,
+  /\bcrewai\b/i,
+  /\blanggraph\b/i,
+  /\bagentverse\b/i,
+  /\bmetagpt\b/i,
+  /\bframework\b/i,
+  /\bagentic\b/i,
+  /多智能体/,
+  /大模型/,
+  /协作/,
+  /框架/,
+];
+
+function countRegexMatches(text: string, patterns: readonly RegExp[]): number {
+  let count = 0;
+  for (const pattern of patterns) {
+    if (pattern.test(text)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function isHighQualityResearchArtifactPath(path: string): boolean {
+  if (!isReadableFilePath(path)) {
+    return false;
+  }
+  const text = safeReadTextFile(path).slice(0, 8_000);
+  if (!text.trim()) {
+    return false;
+  }
+  const lowQualityHits = countRegexMatches(text, LOW_QUALITY_RESEARCH_ARTIFACT_PATTERNS);
+  const highSignalHits = countRegexMatches(text, HIGH_SIGNAL_RESEARCH_ARTIFACT_PATTERNS);
+  if (!path.includes("web-search") && lowQualityHits === 0) {
+    return true;
+  }
+  if (highSignalHits >= 2) {
+    return true;
+  }
+  if (lowQualityHits >= 2 && highSignalHits === 0) {
+    return false;
+  }
+  return highSignalHits >= 1 && lowQualityHits === 0;
+}
+
+function shouldAllowArtifactWriteback(
+  executorHistory: ExecutorOutput[],
+  rankingArtifactPath: string | undefined,
+  requestedOutputPath: string | undefined,
+): boolean {
+  if (!isNonEmptyString(requestedOutputPath)) {
+    return false;
+  }
+  if (hasUsableRankingArtifact(rankingArtifactPath)) {
+    return true;
+  }
+
+  const readableArtifactPaths = getReadableResearchArtifactPaths(executorHistory, 6);
+  const highQualityCount = readableArtifactPaths.filter((path) => isHighQualityResearchArtifactPath(path)).length;
+  if (readableArtifactPaths.length <= 1) {
+    return highQualityCount >= 1;
+  }
+
+  return highQualityCount >= 2 && highQualityCount * 2 >= readableArtifactPaths.length;
+}
+
 function buildExplicitArtifactReadInstruction(
   artifactPaths: readonly string[],
   purpose: string,
@@ -162,27 +243,38 @@ function buildExplicitArtifactReadInstruction(
     rankingArtifactPath?: string;
     includeRanking?: boolean;
     fallbackInstruction: string;
+    requestedOutputPath?: string;
+    forbidSearchExpansion?: boolean;
   },
 ): PlannerExecutorRequest {
   const readablePaths = artifactPaths.filter((path) => isReadableFilePath(path));
   const rankingPath = options.includeRanking && isReadableFilePath(options.rankingArtifactPath)
     ? options.rankingArtifactPath
     : undefined;
+  const shouldWriteOutput = isNonEmptyString(options.requestedOutputPath);
+  const outputPath = shouldWriteOutput ? options.requestedOutputPath : undefined;
+  const noExpansionText = options.forbidSearchExpansion
+    ? "\nDo not call web_search or url_fetch again."
+    : "";
 
   const targets = [...(rankingPath ? [rankingPath] : []), ...readablePaths].slice(0, rankingPath ? 4 : 3);
   if (targets.length === 0) {
     return {
-      instruction: options.fallbackInstruction,
-      allowed_tools: ["list_files", "read_file"],
-      expected_output: purpose,
+      instruction: outputPath
+        ? `${options.fallbackInstruction}${noExpansionText}\nAfter reading the strongest current-run evidence, write the final markdown deliverable to ${outputPath} using write_file.`
+        : `${options.fallbackInstruction}${noExpansionText}`,
+      allowed_tools: outputPath ? ["list_files", "read_file", "write_file"] : ["list_files", "read_file"],
+      expected_output: outputPath ? `A markdown file written successfully to ${outputPath}.` : purpose,
     };
   }
 
   const joined = targets.map((path, index) => `${index + 1}. ${path}`).join("\n");
   return {
-    instruction: `Read only these current-run artifact files and use them to ${purpose}:\n${joined}\nDo not inspect unrelated workspace files. Do not call read_file on any path outside this list.`,
-    allowed_tools: ["read_file"],
-    expected_output: purpose,
+    instruction: outputPath
+      ? `Read only these current-run artifact files and use them to ${purpose}, then write the final markdown deliverable to ${outputPath} using write_file:\n${joined}\nDo not inspect unrelated workspace files. Do not call read_file on any path outside this list.${noExpansionText}`
+      : `Read only these current-run artifact files and use them to ${purpose}:\n${joined}\nDo not inspect unrelated workspace files. Do not call read_file on any path outside this list.${noExpansionText}`,
+    allowed_tools: outputPath ? ["read_file", "write_file"] : ["read_file"],
+    expected_output: outputPath ? `A markdown file written successfully to ${outputPath}.` : purpose,
   };
 }
 
@@ -206,6 +298,7 @@ function maybeScopePlannerExecutorRequestToArtifacts(
   planner: PlannerOutput,
   executorHistory: ExecutorOutput[],
   rankingArtifactPath: string | undefined,
+  requestedOutputPath?: string,
 ): PlannerOutput {
   if (planner.status !== "need_executor" || !planner.executor_request) {
     return planner;
@@ -217,6 +310,9 @@ function maybeScopePlannerExecutorRequestToArtifacts(
 
   const readableArtifactPaths = getReadableResearchArtifactPaths(executorHistory);
   const usableRankingArtifactPath = hasUsableRankingArtifact(rankingArtifactPath) ? rankingArtifactPath : undefined;
+  const scopedOutputPath = shouldAllowArtifactWriteback(executorHistory, usableRankingArtifactPath, requestedOutputPath)
+    ? requestedOutputPath
+    : undefined;
   const scopedRequest = buildExplicitArtifactReadInstruction(
     readableArtifactPaths,
     planner.executor_request.expected_output,
@@ -224,6 +320,8 @@ function maybeScopePlannerExecutorRequestToArtifacts(
       rankingArtifactPath: usableRankingArtifactPath,
       includeRanking: true,
       fallbackInstruction: planner.executor_request.instruction,
+      requestedOutputPath: scopedOutputPath,
+      forbidSearchExpansion: planner.executor_request.instruction.includes("Do not call web_search or url_fetch again"),
     },
   );
 
@@ -232,8 +330,8 @@ function maybeScopePlannerExecutorRequestToArtifacts(
     audit: {
       verdict: planner.audit.verdict,
       notes: planner.audit.notes
-        ? `${planner.audit.notes} Runtime corrected the executor request to use only current-run artifact paths.`
-        : "Runtime corrected the executor request to use only current-run artifact paths.",
+        ? `${planner.audit.notes} Runtime corrected the executor request to use only current-run artifact paths.${requestedOutputPath && !scopedOutputPath ? " Runtime withheld final writeback because current artifacts are not yet strong enough for a research deliverable." : ""}`
+        : `Runtime corrected the executor request to use only current-run artifact paths.${requestedOutputPath && !scopedOutputPath ? " Runtime withheld final writeback because current artifacts are not yet strong enough for a research deliverable." : ""}`,
     },
     executor_request: scopedRequest,
   };
@@ -243,14 +341,25 @@ function applyResearchArtifactScoping(
   planner: PlannerOutput,
   executorHistory: ExecutorOutput[],
   rankingArtifactPath: string | undefined,
+  requestedOutputPath?: string,
 ): PlannerOutput {
-  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
+  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(
+    planner,
+    executorHistory,
+    rankingArtifactPath,
+    requestedOutputPath,
+  );
 
   if (scopedPlanner.status !== "final") {
     return scopedPlanner;
   }
 
-  return maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath);
+  return maybeScopePlannerExecutorRequestToArtifacts(
+    scopedPlanner,
+    executorHistory,
+    rankingArtifactPath,
+    requestedOutputPath,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -568,8 +677,65 @@ function hasUsefulExecutorProgress(conversation: {
   return false;
 }
 
+function getOrderedExecutorCandidateIds(config: OrchestratorConfig): string[] {
+  const configured = config.modelRouting.executorCandidates.length > 0
+    ? config.modelRouting.executorCandidates
+    : ["executor.default"];
+  return Array.from(new Set(configured.filter((candidateId) => {
+    const candidate = config.modelRegistry[candidateId];
+    return candidate?.role === "executor";
+  })));
+}
+
+function materializeExecutorCandidateConfig(config: OrchestratorConfig, candidateId: string): OrchestratorConfig {
+  const candidate = config.modelRegistry[candidateId];
+  if (!candidate || candidate.role !== "executor") {
+    return config;
+  }
+
+  return {
+    ...config,
+    executor: candidate.model,
+    modelRouting: {
+      ...config.modelRouting,
+      executorCandidates: [
+        candidateId,
+        ...config.modelRouting.executorCandidates.filter((item) => item !== candidateId),
+      ],
+    },
+  };
+}
+
+function shouldRotateExecutor(request: PlannerExecutorRequest, result: ExecutorOutput): boolean {
+  const requestedWrite = request.allowed_tools.includes("write_file");
+  const wroteFile = result.tool_calls_made.some((call) => call.tool === "write_file");
+  if (requestedWrite && !wroteFile) {
+    return true;
+  }
+  if (result.error === "Executor declared tool calls without actually executing any native tools.") {
+    return true;
+  }
+  if (result.error === "Executor self-declared success without native tool execution.") {
+    return true;
+  }
+  if (result.error?.startsWith("Unable to parse executor output as JSON")) {
+    return true;
+  }
+  if (result.summary === "Executor returned malformed output. Retry or switch the model.") {
+    return true;
+  }
+  return result.status === "failed" || result.status === "blocked";
+}
+
 function matchesGoal(goal: string, needle: string): boolean {
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const normalizedNeedle = needle.trim().toLowerCase();
+  if (!normalizedNeedle) {
+    return false;
+  }
+  if (/[^\x00-\x7F]/.test(normalizedNeedle)) {
+    return goal.includes(normalizedNeedle);
+  }
+  const escaped = normalizedNeedle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`\\b${escaped}\\b`, "i").test(goal);
 }
 
@@ -1691,6 +1857,7 @@ async function runPlannerStep(
 ): Promise<PlannerOutput> {
   const runtimeDeps = mergeRuntimeDeps(deps);
   assertNotCancelled(options);
+  const requestedOutputPath = extractRequestedOutputPath(userGoal);
   const rankingArtifactPath = routePolicy.enableRanking ? persistRankingArtifact(executorHistory, logger) : undefined;
   const candidateRankingText = routePolicy.enableRanking ? buildCandidateRankingText(executorHistory) : undefined;
   const plannerMessages = buildPlannerMessages(config, userGoal, executorHistory, replanCount, routePolicy, candidateRankingText);
@@ -1729,7 +1896,12 @@ async function runPlannerStep(
     };
   }
   const planner = parsePlannerOutputRecord(userGoal, parsed, executorHistory.length > 0);
-  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
+  const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(
+    planner,
+    executorHistory,
+    rankingArtifactPath,
+    requestedOutputPath,
+  );
 
   // Protocol: final with executor_request but no answer
   if (scopedPlanner.status === "final" && scopedPlanner.executor_request && !isNonEmptyString(scopedPlanner.final_answer)) {
@@ -1759,6 +1931,8 @@ async function runPlannerStep(
           rankingArtifactPath: usableRankingArtifactPath,
           includeRanking: true,
           fallbackInstruction: "List files under runtime/command-results and read only a current-run readable artifact to produce a constrained evidence summary with explicit evidence gaps.",
+          requestedOutputPath,
+          forbidSearchExpansion: true,
         },
       );
       scopedPlanner.final_answer = undefined;
@@ -1773,6 +1947,7 @@ async function runPlannerStep(
         "extract the strongest candidates into a structured summary",
         {
           fallbackInstruction: "List files under runtime/command-results and read only a current-run readable artifact file, then extract the strongest candidates into a structured summary.",
+          requestedOutputPath,
         },
       );
       scopedPlanner.final_answer = undefined;
@@ -1789,13 +1964,19 @@ async function runPlannerStep(
           rankingArtifactPath: usableRankingArtifactPath,
           includeRanking: true,
           fallbackInstruction: "List files under runtime/command-results and read only current-run readable search artifacts, then produce a grounded ranking with inclusion reasons and concerns.",
+          requestedOutputPath,
         },
       );
       scopedPlanner.final_answer = undefined;
     }
   }
 
-  const fullyScopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath);
+  const fullyScopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(
+    scopedPlanner,
+    executorHistory,
+    rankingArtifactPath,
+    requestedOutputPath,
+  );
   const normalizedPlanner = applyWorkflowMilestoneAFallback(fullyScopedPlanner, stepNumber, logger, options);
 
   logger?.log("planner.response.parsed", { step: stepNumber, parsed: normalizedPlanner });
@@ -1949,6 +2130,150 @@ function tryParseToolArguments(raw: string): Record<string, unknown> {
   }
 }
 
+function isSearchWarmupEligible(
+  request: PlannerOutput["executor_request"],
+  stepNumber: number,
+  candidateIds: readonly string[],
+  options?: RunOptions,
+): boolean {
+  if (!request) {
+    return false;
+  }
+  if (stepNumber !== 1) {
+    return false;
+  }
+  if (candidateIds.length <= 1) {
+    return false;
+  }
+  if (options?.executorSelectionState?.searchWarmupCompleted) {
+    return false;
+  }
+  const tools = new Set(request.allowed_tools);
+  if (tools.has("write_file")) {
+    return false;
+  }
+  return tools.has("web_search") || tools.has("url_fetch");
+}
+
+function isHealthyWarmupResult(
+  request: PlannerOutput["executor_request"],
+  result: ExecutorOutput,
+): boolean {
+  if (!request) {
+    return false;
+  }
+  if (result.status !== "success") {
+    return false;
+  }
+  return !shouldRotateExecutor(request, result);
+}
+
+async function runLazySearchWarmup(
+  config: OrchestratorConfig,
+  planner: PlannerOutput,
+  allowedTools: typeof TOOL_DEFINITIONS,
+  candidateIds: readonly string[],
+  stepNumber: number,
+  logger?: RunLogger,
+  options?: RunOptions,
+): Promise<{
+  selectedCandidateIds: string[];
+  primaryResult?: ExecutorOutput;
+}> {
+  const executorRequest = planner.executor_request;
+  if (!executorRequest) {
+    return { selectedCandidateIds: [] };
+  }
+
+  const attempts = await Promise.all(candidateIds.map(async (candidateId) => {
+    const candidateConfig = materializeExecutorCandidateConfig(config, candidateId);
+    logger?.log("executor.request", {
+      step: stepNumber,
+      request: executorRequest,
+      allowed_tools: allowedTools.map((tool) => tool.name),
+      tool_policy_applied: !!config.executorToolPolicy,
+      executor_candidate_id: candidateId,
+      executor_model: candidateConfig.executor.model,
+      executor_base_url: candidateConfig.executor.baseUrl,
+      executor_attempt: 1,
+      executor_candidate_count: candidateIds.length,
+      selection_strategy: "lazy_search_warmup",
+    });
+
+    const conversation = await runExecutorConversation(
+      candidateConfig,
+      executorRequest,
+      allowedTools,
+      stepNumber,
+      logger,
+      options,
+    );
+    const finalized = finalizeExecutorResult(conversation.response, conversation);
+    logger?.log("executor.response.parsed", {
+      step: stepNumber,
+      parsed: finalized,
+      used_native_tool_calls: finalized.source === "native_tool",
+      declared_tool_calls_without_execution: finalized.error === "Executor declared tool calls without actually executing any native tools.",
+      executor_candidate_id: candidateId,
+      executor_model: candidateConfig.executor.model,
+      executor_attempt: 1,
+      selection_strategy: "lazy_search_warmup",
+    });
+    return {
+      candidateId,
+      candidateConfig,
+      finalized,
+      healthy: isHealthyWarmupResult(executorRequest, finalized),
+    };
+  }));
+
+  const selectedCandidateIds = attempts.filter((attempt) => attempt.healthy).map((attempt) => attempt.candidateId);
+  logger?.log("executor.health.selection", {
+    trigger: "lazy_search_warmup",
+    healthy_executor_ids: selectedCandidateIds,
+    results: attempts.map((attempt) => ({
+      modelId: attempt.candidateId,
+      status: attempt.healthy ? "healthy" : "unhealthy",
+      summary: attempt.finalized.error || attempt.finalized.summary,
+      model: attempt.candidateConfig.executor.model,
+      baseUrl: attempt.candidateConfig.executor.baseUrl,
+    })),
+  });
+
+  if (options) {
+    options.executorSelectionState = {
+      ...(options.executorSelectionState ?? {}),
+      selectedCandidateIds: selectedCandidateIds.length > 0 ? selectedCandidateIds : options.executorSelectionState?.selectedCandidateIds,
+      searchWarmupCompleted: true,
+    };
+  }
+
+  const primaryHealthy = attempts.find((attempt) => attempt.healthy)?.finalized;
+  if (primaryHealthy) {
+    options?.onEvent?.({
+      type: "workflow.executor.result",
+      step: stepNumber,
+      data: {
+        status: primaryHealthy.status,
+        summary: primaryHealthy.summary,
+        display_summary: getExecutorDisplaySummary(primaryHealthy),
+        artifact_count: primaryHealthy.artifacts.length,
+        executor_candidate_id: attempts.find((attempt) => attempt.healthy)?.candidateId,
+        executor_model: attempts.find((attempt) => attempt.healthy)?.candidateConfig.executor.model,
+      },
+    });
+    return {
+      selectedCandidateIds,
+      primaryResult: primaryHealthy,
+    };
+  }
+
+  return {
+    selectedCandidateIds,
+    primaryResult: attempts.at(-1)?.finalized,
+  };
+}
+
 async function executeDeclaredToolCallsFallback(
   declaredCalls: Array<{ tool: string; arguments: Record<string, unknown> }>,
   request: PlannerOutput["executor_request"],
@@ -2059,47 +2384,114 @@ export async function runExecutorStep(
     executor_request: executorRequest,
   };
   const allowedTools = TOOL_DEFINITIONS.filter((tool) => executorRequest.allowed_tools.includes(tool.name));
-  logger?.log("executor.request", {
-    step: stepNumber,
-    request: executorRequest,
-    allowed_tools: allowedTools.map((tool) => tool.name),
-    tool_policy_applied: !!config.executorToolPolicy,
-  });
-  options?.onEvent?.({
-    type: "workflow.executor.start",
-    step: stepNumber,
-    data: {
-      instruction: executorRequest.instruction,
+  const cachedCandidateIds = options?.executorSelectionState?.selectedCandidateIds;
+  let candidateIds = cachedCandidateIds && cachedCandidateIds.length > 0
+    ? cachedCandidateIds
+    : getOrderedExecutorCandidateIds(config);
+  let lastResult: ExecutorOutput | undefined;
+
+  if (isSearchWarmupEligible(executorRequest, stepNumber, candidateIds, options)) {
+    const warmup = await runLazySearchWarmup(
+      config,
+      scopedPlanner,
+      allowedTools,
+      candidateIds,
+      stepNumber,
+      logger,
+      options,
+    );
+    if (warmup.selectedCandidateIds.length > 0) {
+      candidateIds = warmup.selectedCandidateIds;
+    }
+    if (warmup.primaryResult) {
+      return warmup.primaryResult;
+    }
+  }
+
+  for (let index = 0; index < candidateIds.length; index++) {
+    const candidateId = candidateIds[index]!;
+    const candidateConfig = materializeExecutorCandidateConfig(config, candidateId);
+
+    logger?.log("executor.request", {
+      step: stepNumber,
+      request: executorRequest,
       allowed_tools: allowedTools.map((tool) => tool.name),
-    },
-  });
-  const conversation = await runExecutorConversation(
-    config,
-    scopedPlanner.executor_request,
-    allowedTools,
-    stepNumber,
-    logger,
-    options,
-  );
-  const executorResponse = conversation.response;
-  const finalized = finalizeExecutorResult(executorResponse, conversation);
-  logger?.log("executor.response.parsed", {
-    step: stepNumber,
-    parsed: finalized,
-    used_native_tool_calls: finalized.source === "native_tool",
-    declared_tool_calls_without_execution: finalized.error === "Executor declared tool calls without actually executing any native tools.",
-  });
-  options?.onEvent?.({
-    type: "workflow.executor.result",
-    step: stepNumber,
-    data: {
-      status: finalized.status,
-      summary: finalized.summary,
-      display_summary: getExecutorDisplaySummary(finalized),
-      artifact_count: finalized.artifacts.length,
-    },
-  });
-  return finalized;
+      tool_policy_applied: !!config.executorToolPolicy,
+      executor_candidate_id: candidateId,
+      executor_model: candidateConfig.executor.model,
+      executor_base_url: candidateConfig.executor.baseUrl,
+      executor_attempt: index + 1,
+      executor_candidate_count: candidateIds.length,
+    });
+    options?.onEvent?.({
+      type: "workflow.executor.start",
+      step: stepNumber,
+      data: {
+        instruction: executorRequest.instruction,
+        allowed_tools: allowedTools.map((tool) => tool.name),
+        executor_candidate_id: candidateId,
+        executor_model: candidateConfig.executor.model,
+      },
+    });
+
+    const conversation = await runExecutorConversation(
+      candidateConfig,
+      executorRequest,
+      allowedTools,
+      stepNumber,
+      logger,
+      options,
+    );
+    const executorResponse = conversation.response;
+    const finalized = finalizeExecutorResult(executorResponse, conversation);
+    logger?.log("executor.response.parsed", {
+      step: stepNumber,
+      parsed: finalized,
+      used_native_tool_calls: finalized.source === "native_tool",
+      declared_tool_calls_without_execution: finalized.error === "Executor declared tool calls without actually executing any native tools.",
+      executor_candidate_id: candidateId,
+      executor_model: candidateConfig.executor.model,
+      executor_attempt: index + 1,
+    });
+
+    const shouldRotate = index < candidateIds.length - 1 && shouldRotateExecutor(executorRequest, finalized);
+    if (shouldRotate) {
+      logger?.log("executor.candidate.rotate", {
+        step: stepNumber,
+        failed_candidate_id: candidateId,
+        failed_model: candidateConfig.executor.model,
+        next_candidate_id: candidateIds[index + 1],
+        reason: finalized.error || finalized.summary,
+      });
+      lastResult = finalized;
+      continue;
+    }
+
+    options?.onEvent?.({
+      type: "workflow.executor.result",
+      step: stepNumber,
+      data: {
+        status: finalized.status,
+        summary: finalized.summary,
+        display_summary: getExecutorDisplaySummary(finalized),
+        artifact_count: finalized.artifacts.length,
+        executor_candidate_id: candidateId,
+        executor_model: candidateConfig.executor.model,
+      },
+    });
+    return finalized;
+  }
+
+  return lastResult ?? {
+    status: "failed",
+    summary: "No executor candidates were available for this step.",
+    tool_calls_made: [],
+    artifacts: [],
+    raw_result: "",
+    error: "No executor candidates were available for this step.",
+    source: "model_text",
+    display_summary: "No executor candidates were available for this step.",
+  };
 }
 
 export async function runOrchestrator(
@@ -2258,6 +2650,7 @@ export async function runOrchestrator(
         "extract the strongest candidate projects with reasons they match the user goal",
         {
           fallbackInstruction: "List files under runtime/command-results, select a readable non-directory artifact file with non-empty content, then read it and extract the strongest candidate projects with reasons they match the user goal. Never call read_file on a directory path.",
+          requestedOutputPath,
         },
       );
       planner.final_answer = undefined;
@@ -2287,14 +2680,25 @@ export async function runOrchestrator(
           rankingArtifactPath: usableRankingArtifactPath,
           includeRanking: true,
           fallbackInstruction: "List files under runtime/command-results and read the most relevant recent non-empty search result artifact, then produce a structured evidence summary for final answering.",
+          requestedOutputPath,
         },
       );
       planner.final_answer = undefined;
     }
 
-    const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(planner, executorHistory, rankingArtifactPath);
+    const scopedPlanner = maybeScopePlannerExecutorRequestToArtifacts(
+      planner,
+      executorHistory,
+      rankingArtifactPath,
+      requestedOutputPath,
+    );
     const normalizedPlanner = applyWorkflowMilestoneAFallback(
-      maybeScopePlannerExecutorRequestToArtifacts(scopedPlanner, executorHistory, rankingArtifactPath),
+      maybeScopePlannerExecutorRequestToArtifacts(
+        scopedPlanner,
+        executorHistory,
+        rankingArtifactPath,
+        requestedOutputPath,
+      ),
       step + 1,
       logger,
       options,

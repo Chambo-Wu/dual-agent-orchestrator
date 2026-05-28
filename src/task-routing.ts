@@ -6,7 +6,7 @@ import type { RoutePolicy, TaskType } from "./types.js";
 const DEFAULT_TASK_ROUTING: RoutePolicy[] = [
   {
     type: "fact_research",
-    matchers: ["latest", "official", "release", "releases", "announcement", "announcing", "highlights", "changelog", "release notes", "source", "sources", "summary"],
+    matchers: ["latest", "official", "release", "releases", "announcement", "announcing", "highlights", "changelog", "release notes", "source", "sources", "summary", "最新", "官方", "发布", "公告", "更新", "更新日志", "发布说明", "来源", "出处", "总结"],
     plannerInstruction: "Task type: fact_research. Gather official evidence, read artifacts back, and produce a concise sourced summary. Do not force candidate ranking unless the user explicitly asked for comparison.",
     enableRanking: false,
     requireEvidenceBeforeFinal: true,
@@ -25,7 +25,7 @@ const DEFAULT_TASK_ROUTING: RoutePolicy[] = [
   },
   {
     type: "research",
-    matchers: ["github", "repository", "repositories", "comparison", "compare", "ranking", "rank", "evaluate", "survey", "benchmark"],
+    matchers: ["github", "repository", "repositories", "comparison", "compare", "ranking", "rank", "evaluate", "survey", "benchmark", "调研", "研究", "案例", "成功案例", "对比", "比较", "评测", "排行", "排名", "趋势", "现状", "优劣", "优势", "劣势", "竞品", "分析", "报告"],
     plannerInstruction: "Task type: research. Gather comparison evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion.",
     enableRanking: true,
     requireEvidenceBeforeFinal: true,
@@ -44,7 +44,7 @@ const DEFAULT_TASK_ROUTING: RoutePolicy[] = [
   },
   {
     type: "web_search",
-    matchers: ["web", "website", "internet", "news", "search", "find", "lookup"],
+    matchers: ["web", "website", "internet", "news", "search", "find", "lookup", "网页", "网站", "联网", "新闻", "搜索", "查找", "查询", "检索", "查一下"],
     plannerInstruction: "Task type: web_search. Use external lookup, summarize evidence, and cite sources or artifacts when available.",
     enableRanking: true,
     requireEvidenceBeforeFinal: true,

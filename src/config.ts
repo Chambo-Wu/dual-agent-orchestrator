@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatSchemaIssues, isPlainObject, parseSimpleYamlDocument, SchemaValidationError, type ValidationIssue } from "./config-format.js";
-import type { AgentLimits, AgentToolPolicy, ModelConfig, OrchestratorConfig, RegisteredAgent, SearchConfig, SearchProviderType } from "./types.js";
+import type { AgentLimits, AgentToolPolicy, ModelConfig, ModelRole, ModelRoutingConfig, OrchestratorConfig, RegisteredAgent, RegisteredModel, SearchConfig, SearchProviderType } from "./types.js";
 
 let dotenvLoaded = false;
 
@@ -252,6 +252,141 @@ function validateAgentsSection(root: Record<string, unknown>, issues: Validation
   return result;
 }
 
+function validateModelRegistrySection(root: Record<string, unknown>, issues: ValidationIssue[]): Record<string, RegisteredModel> {
+  const modelsRaw = root.models;
+  const registry: Record<string, RegisteredModel> = {};
+  if (modelsRaw === undefined) {
+    return registry;
+  }
+  if (!isPlainObject(modelsRaw)) {
+    pushIssue(issues, "models", "must be an object when provided");
+    return registry;
+  }
+
+  for (const [modelId, rawValue] of Object.entries(modelsRaw)) {
+    const basePath = `models.${modelId}`;
+    if (!isPlainObject(rawValue)) {
+      pushIssue(issues, basePath, "must be an object");
+      continue;
+    }
+    const roleRaw = readRequiredString(rawValue, basePath, "role", issues);
+    const role = roleRaw === "planner" || roleRaw === "executor" ? roleRaw : undefined;
+    if (!role) {
+      pushIssue(issues, `${basePath}.role`, 'must be either "planner" or "executor"');
+    }
+    const enabledRaw = rawValue.enabled;
+    const enabled = enabledRaw === undefined
+      ? true
+      : typeof enabledRaw === "boolean"
+        ? enabledRaw
+        : (pushIssue(issues, `${basePath}.enabled`, "must be a boolean"), true);
+    registry[modelId] = {
+      id: modelId,
+      role: (role ?? "executor") as ModelRole,
+      enabled,
+      model: validateModelLikeSection(rawValue, basePath, issues, role === "planner" ? 120000 : 60000, role === "planner" ? 8192 : 2048, role === "planner" ? 0.2 : 0),
+    };
+  }
+
+  return registry;
+}
+
+function validateModelRoutingSection(
+  root: Record<string, unknown>,
+  registry: Record<string, RegisteredModel>,
+  issues: ValidationIssue[],
+): ModelRoutingConfig {
+  const routingRaw = root.model_routing;
+  const routing: ModelRoutingConfig = {
+    plannerCandidates: ["planner.default"],
+    executorCandidates: ["executor.default"],
+  };
+  if (routingRaw === undefined) {
+    return routing;
+  }
+  if (!isPlainObject(routingRaw)) {
+    pushIssue(issues, "model_routing", "must be an object when provided");
+    return routing;
+  }
+
+  const parseCandidateList = (key: "planner_candidates" | "executor_candidates", role: ModelRole): string[] => {
+    const value = routingRaw[key];
+    if (value === undefined) {
+      return role === "planner" ? routing.plannerCandidates : routing.executorCandidates;
+    }
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+      pushIssue(issues, `model_routing.${key}`, "must be an array of non-empty strings");
+      return role === "planner" ? routing.plannerCandidates : routing.executorCandidates;
+    }
+
+    const normalized = value.map((item) => item.trim());
+    for (const candidateId of normalized) {
+      const candidate = registry[candidateId];
+      if (!candidate) {
+        pushIssue(issues, `model_routing.${key}`, `references unknown model "${candidateId}"`);
+        continue;
+      }
+      if (candidate.role !== role) {
+        pushIssue(issues, `model_routing.${key}`, `model "${candidateId}" has role "${candidate.role}" and cannot be used as ${role}`);
+      }
+    }
+    return normalized;
+  };
+
+  routing.plannerCandidates = parseCandidateList("planner_candidates", "planner");
+  routing.executorCandidates = parseCandidateList("executor_candidates", "executor");
+  return routing;
+}
+
+function dedupeModelIds(modelIds: readonly string[]): string[] {
+  return Array.from(new Set(modelIds));
+}
+
+export function getRoutedModels(
+  config: OrchestratorConfig,
+  role: ModelRole,
+  options: {
+    includeDisabled?: boolean;
+  } = {},
+): RegisteredModel[] {
+  const includeDisabled = options.includeDisabled ?? true;
+  const candidateIds = role === "planner"
+    ? config.modelRouting.plannerCandidates
+    : config.modelRouting.executorCandidates;
+
+  return dedupeModelIds(candidateIds)
+    .map((candidateId) => config.modelRegistry[candidateId])
+    .filter((candidate): candidate is RegisteredModel => {
+      if (!candidate) {
+        return false;
+      }
+      if (candidate.role !== role) {
+        return false;
+      }
+      if (!includeDisabled && !candidate.enabled) {
+        return false;
+      }
+      return true;
+    });
+}
+
+export function materializeRuntimeModelSelection(config: OrchestratorConfig): OrchestratorConfig {
+  const plannerCandidates = getRoutedModels(config, "planner");
+  const executorCandidates = getRoutedModels(config, "executor");
+  const activePlanner = plannerCandidates[0]?.model ?? config.planner;
+  const activeExecutor = executorCandidates[0]?.model ?? config.executor;
+
+  return {
+    ...config,
+    planner: activePlanner,
+    executor: activeExecutor,
+    modelRouting: {
+      plannerCandidates: plannerCandidates.map((candidate) => candidate.id),
+      executorCandidates: executorCandidates.map((candidate) => candidate.id),
+    },
+  };
+}
+
 const VALID_PROVIDER_TYPES: SearchProviderType[] = ["bing_html", "searxng", "serpapi", "bing_api", "google_cse", "url_template", "mcp"];
 
 function readOptionalString(section: Record<string, unknown>, path: string, key: string, fallback: string, issues: ValidationIssue[]): string {
@@ -334,10 +469,29 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
 
   const search = validateSearchSection(root, issues);
   const agentConfig = validateAgentsSection(root, issues);
+  const explicitModelRegistry = validateModelRegistrySection(root, issues);
+  const modelRegistry: Record<string, RegisteredModel> = {
+    "planner.default": {
+      id: "planner.default",
+      role: "planner",
+      enabled: true,
+      model: planner,
+    },
+    "executor.default": {
+      id: "executor.default",
+      role: "executor",
+      enabled: true,
+      model: executor,
+    },
+    ...explicitModelRegistry,
+  };
+  const modelRouting = validateModelRoutingSection(root, modelRegistry, issues);
 
   const config: OrchestratorConfig = {
     planner,
     executor,
+    modelRegistry,
+    modelRouting,
     agents: agentConfig.agents,
     defaultExecutorAgent: agentConfig.defaultExecutorAgent,
     search,
@@ -360,5 +514,5 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
     );
   }
 
-  return config;
+  return materializeRuntimeModelSelection(config);
 }

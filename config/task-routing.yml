@@ -1,38 +1,38 @@
 fact_research:
-  matchers: "latest, official, release, releases, announcement, announcing, highlights, changelog, release notes, source, sources, summary"
+  matchers: "latest, official, release, releases, announcement, announcing, highlights, changelog, release notes, source, sources, summary, 最新, 官方, 发布, 公告, 更新, 更新日志, 发布说明, 来源, 出处, 总结"
   planner_instruction: "Task type: fact_research. Gather official evidence, read artifacts back, and produce a concise sourced summary. Do not force candidate ranking unless the user explicitly asked for comparison."
   enable_ranking: false
   require_evidence_before_final: true
   min_grounded_candidates: 0
   require_artifact_readback: true
   require_non_empty_artifact: true
-  preferred_tools: "shell_command, list_files, read_file"
+  preferred_tools: "web_search, url_fetch, read_file"
   artifact_priority: "search result artifact, captured page content, structured JSON output"
   completion_checklist: "collect official or primary-source evidence, read back at least one non-empty artifact, identify the strongest source for the answer, final answer cites the strongest artifacts and states any evidence gap"
   fallback_rule: "If official evidence is weak or ambiguous, return a constrained answer that states the evidence gap instead of inventing comparisons."
 
 research:
-  matchers: "github, repository, repositories, comparison, compare, ranking, rank, evaluate, survey, benchmark"
+  matchers: "github, repository, repositories, comparison, compare, ranking, rank, evaluate, survey, benchmark, 调研, 研究, 案例, 成功案例, 对比, 比较, 评测, 排行, 排名, 趋势, 现状, 优劣, 优势, 劣势, 竞品, 分析, 报告"
   planner_instruction: "Task type: research. Gather comparison evidence, rank candidates, read artifacts before finalizing, and explain inclusion or exclusion."
   enable_ranking: true
   require_evidence_before_final: true
   min_grounded_candidates: 3
   require_artifact_readback: true
   require_non_empty_artifact: true
-  preferred_tools: "shell_command, list_files, read_file"
+  preferred_tools: "web_search, url_fetch, read_file"
   artifact_priority: "ranking artifact, search result artifact, structured JSON output"
   completion_checklist: "collect external evidence, read back at least one artifact, compare candidates with reasons and concerns, final answer cites the strongest artifacts"
   fallback_rule: "If evidence is missing, do not guess. Read artifacts or return a constrained answer that states the evidence gap."
 
 web_search:
-  matchers: "web, website, internet, news, search, find, lookup"
+  matchers: "web, website, internet, news, search, find, lookup, 网页, 网站, 联网, 新闻, 搜索, 查找, 查询, 检索, 查一下"
   planner_instruction: "Task type: web_search. Use external lookup, summarize evidence, and cite sources or artifacts when available."
   enable_ranking: true
   require_evidence_before_final: true
   min_grounded_candidates: 2
   require_artifact_readback: true
   require_non_empty_artifact: true
-  preferred_tools: "shell_command, list_files, read_file"
+  preferred_tools: "web_search, url_fetch, read_file"
   artifact_priority: "search result artifact, ranking artifact, captured page content"
   completion_checklist: "perform external lookup, preserve non-empty artifacts, read back the strongest artifact before finalizing, state conclusions with evidence"
   fallback_rule: "If lookup fails, avoid fabricated conclusions and explicitly report the missing external evidence."

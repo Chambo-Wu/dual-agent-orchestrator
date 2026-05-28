@@ -4,9 +4,10 @@ import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, materializeRuntimeModelSelection } from "./config.js";
 import { compressJsonOutput, compressToolOutput } from "./compress.js";
 import { createRunLogger } from "./logger.js";
+import { buildHealthyExecutorRuntimeConfig, NoHealthyExecutorError, type ModelHealthResult } from "./model-health.js";
 import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getRoutePolicy } from "./orchestrator.js";
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
@@ -159,6 +160,37 @@ interface ExposedModel {
   executor_base_url?: string;
   executor_api_key?: string;
   description?: string;
+}
+
+type HealthResponse = {
+  status: string;
+  planner: Record<string, unknown>;
+  executor: Record<string, unknown>;
+  runtime: Record<string, unknown>;
+  models: string[];
+};
+
+function assertHealthyExecutorSelection(
+  healthSelection: Awaited<ReturnType<typeof buildHealthyExecutorRuntimeConfig>>,
+): void {
+  if (healthSelection.healthyExecutorIds.length > 0) {
+    return;
+  }
+  throw new NoHealthyExecutorError(healthSelection.results);
+}
+
+function summarizeExecutorHealth(results: readonly ModelHealthResult[]): {
+  total: number;
+  healthy: number;
+  unhealthy: number;
+  disabled: number;
+} {
+  return {
+    total: results.length,
+    healthy: results.filter((result) => result.status === "healthy").length,
+    unhealthy: results.filter((result) => result.status === "unhealthy").length,
+    disabled: results.filter((result) => result.status === "disabled").length,
+  };
 }
 
 interface TaskExecutionPayload {
@@ -573,24 +605,52 @@ function getExposedModels(config: OrchestratorConfig): ExposedModel[] {
 function resolveRequestedModel(config: OrchestratorConfig, requestedModel: string | undefined): { exposed: ExposedModel; resolvedConfig: OrchestratorConfig } {
   const exposedModels = getExposedModels(config);
   const exposed = exposedModels.find((item) => item.id === requestedModel) || exposedModels[0];
+  const resolvedPlanner = {
+    ...config.planner,
+    model: exposed.planner_model || config.planner.model,
+    baseUrl: exposed.planner_base_url || config.planner.baseUrl,
+    apiKey: exposed.planner_api_key || config.planner.apiKey,
+  };
+  const resolvedExecutor = {
+    ...config.executor,
+    model: exposed.executor_model || config.executor.model,
+    baseUrl: exposed.executor_base_url || config.executor.baseUrl,
+    apiKey: exposed.executor_api_key || config.executor.apiKey,
+  };
 
   return {
     exposed,
-    resolvedConfig: {
+    resolvedConfig: materializeRuntimeModelSelection({
+      ...config,
       planner: {
-        ...config.planner,
-        model: exposed.planner_model || config.planner.model,
-        baseUrl: exposed.planner_base_url || config.planner.baseUrl,
-        apiKey: exposed.planner_api_key || config.planner.apiKey,
+        ...resolvedPlanner,
       },
       executor: {
-        ...config.executor,
-        model: exposed.executor_model || config.executor.model,
-        baseUrl: exposed.executor_base_url || config.executor.baseUrl,
-        apiKey: exposed.executor_api_key || config.executor.apiKey,
+        ...resolvedExecutor,
+      },
+      modelRegistry: {
+        ...config.modelRegistry,
+        "planner.default": {
+          ...(config.modelRegistry["planner.default"] ?? {
+            id: "planner.default",
+            role: "planner",
+            enabled: true,
+            model: resolvedPlanner,
+          }),
+          model: resolvedPlanner,
+        },
+        "executor.default": {
+          ...(config.modelRegistry["executor.default"] ?? {
+            id: "executor.default",
+            role: "executor",
+            enabled: true,
+            model: resolvedExecutor,
+          }),
+          model: resolvedExecutor,
+        },
       },
       policy: { ...config.policy },
-    },
+    }),
   };
 }
 
@@ -1185,14 +1245,22 @@ function buildModelsResponse(config = loadConfig()): unknown {
       metadata: {
         planner_model: model.planner_model || config.planner.model,
         executor_model: model.executor_model || config.executor.model,
+        executor_candidates: config.modelRouting.executorCandidates,
         description: model.description || "",
       },
     })),
   };
 }
 
-function buildHealthResponse(config = loadConfig()): { status: string; planner: Record<string, unknown>; executor: Record<string, unknown>; runtime: Record<string, unknown>; models: string[] } {
+function buildHealthResponse(
+  config = loadConfig(),
+  executorHealthResults?: ModelHealthResult[],
+): HealthResponse {
   const circuitOpen = isPlannerCircuitOpen();
+  const executorHealthSummary = summarizeExecutorHealth(executorHealthResults ?? []);
+  const probedHealthyCandidates = executorHealthResults
+    ?.filter((result) => result.status === "healthy")
+    .map((result) => result.modelId) ?? [];
   return {
     status: circuitOpen ? "degraded" : "ok",
     planner: {
@@ -1207,6 +1275,24 @@ function buildHealthResponse(config = loadConfig()): { status: string; planner: 
     executor: {
       model: config.executor.model,
       base_url: config.executor.baseUrl,
+      configured_candidates: config.modelRouting.executorCandidates,
+      active_probe: {
+        mode: "explicit_probe",
+        description: "Active probe health for /health and doctor-style diagnostics. This is not the runtime lazy selection cache used during real task execution.",
+        healthy_candidates: probedHealthyCandidates,
+        health_summary: executorHealthSummary,
+        health_checks: executorHealthResults?.map((result) => ({
+          model_id: result.modelId,
+          status: result.status,
+          summary: result.summary,
+        })) ?? [],
+      },
+      runtime_lazy_selection: {
+        mode: "lazy_search_warmup",
+        description: "Runtime lazy selection is established during the first real search/fetch executor step and is not persisted in /health responses.",
+        available: false,
+        selected_candidates: [],
+      },
     },
     runtime: {
       auto_resume_concurrency: config.policy.autoResumeConcurrency,
@@ -2860,6 +2946,13 @@ async function executeTaskGoal(
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const healthMeta = error instanceof NoHealthyExecutorError
+      ? {
+          failure_category: "environment_failure",
+          healthy_executor_ids: [],
+          executor_health_results: error.results,
+        }
+      : {};
     const cancelledRecord = readJobRecord(jobId);
     const wasCancelled = Boolean(cancelledRecord?.control?.cancelledAt);
     updateStoredJobRecord(jobId, (record) => ({
@@ -2882,7 +2975,7 @@ async function executeTaskGoal(
       wasCancelled ? "Job cancelled" : "Job failed",
       truncateToolResultContent(message || (wasCancelled ? "Job cancelled." : "Job failed.")),
       wasCancelled ? "blocked" : "failed",
-      { error: message },
+      { error: message, ...healthMeta },
       "final",
     );
     throw error;
@@ -3055,6 +3148,13 @@ async function executeTeamGoal(
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const healthMeta = error instanceof NoHealthyExecutorError
+      ? {
+          failure_category: "environment_failure",
+          healthy_executor_ids: [],
+          executor_health_results: error.results,
+        }
+      : {};
     const cancelledRecord = readJobRecord(jobId);
     const wasCancelled = Boolean(cancelledRecord?.control?.cancelledAt);
     updateStoredJobRecord(jobId, (record) => ({
@@ -3077,7 +3177,7 @@ async function executeTeamGoal(
       wasCancelled ? "Job cancelled" : "Job failed",
       truncateToolResultContent(message || (wasCancelled ? "Job cancelled." : "Job failed.")),
       wasCancelled ? "blocked" : "failed",
-      { error: message },
+      { error: message, ...healthMeta },
       "final",
     );
     throw error;
@@ -3218,7 +3318,12 @@ async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise
 }
 
 async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const payload = buildHealthResponse();
+  const config = loadConfig();
+  const healthSelection = await buildHealthyExecutorRuntimeConfig(config);
+  const payload = buildHealthResponse(healthSelection.config, healthSelection.results);
+  if (healthSelection.healthyExecutorIds.length === 0) {
+    payload.status = "degraded";
+  }
   jsonResponse(res, payload.status === "ok" ? 200 : 503, payload);
 }
 
@@ -3230,7 +3335,7 @@ async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promi
 }
 
 async function handleJobsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const html = renderJobsDashboardHtml([] as Array<{
+  const html = renderJobsDashboardHtml(buildListedJobsResponse("/jobs") as Array<{
     id: string;
     goal: string;
     mode?: string;
@@ -4704,6 +4809,7 @@ function runConfigValidation(configPath?: string): void {
     config_path: resolvedPath,
     planner_model: config.planner.model,
     executor_model: config.executor.model,
+    executor_candidates: config.modelRouting.executorCandidates,
     task_routing_path: config.taskRoutingPath,
     auto_resume_concurrency: config.policy.autoResumeConcurrency,
     route_types: routing.map((route) => route.type),
@@ -4948,6 +5054,17 @@ function buildDoctorReport(configPath?: string): Record<string, unknown> {
       });
     checks.push(buildModelConfigCheck("planner_model_config", "planner", config.planner));
     checks.push(buildModelConfigCheck("executor_model_config", "executor", config.executor));
+    checks.push({
+      name: "executor_candidate_queue",
+      ok: config.modelRouting.executorCandidates.length > 0,
+      summary: config.modelRouting.executorCandidates.length > 0
+        ? `Executor candidate queue contains ${config.modelRouting.executorCandidates.length} model(s).`
+        : "Executor candidate queue is empty.",
+      detail: {
+        executor_candidates: config.modelRouting.executorCandidates,
+        candidate_count: config.modelRouting.executorCandidates.length,
+      },
+    });
 
     const routing = loadTaskRoutingConfig(config.taskRoutingPath);
     checks.push({
@@ -5033,11 +5150,13 @@ function runDoctor(configPath?: string): void {
 async function runCliTask(task: string): Promise<void> {
   const logger = createRunLogger(task);
   const baseConfig = loadConfig();
-  configureSearchTools(baseConfig.search);
-  const routing = loadTaskRoutingConfig(baseConfig.taskRoutingPath);
+  const healthSelection = await buildHealthyExecutorRuntimeConfig(baseConfig);
+  assertHealthyExecutorSelection(healthSelection);
+  configureSearchTools(healthSelection.config.search);
+  const routing = loadTaskRoutingConfig(healthSelection.config.taskRoutingPath);
   const taskType = detectTaskType(task, routing);
   const routePolicy = getRoutePolicy(taskType, routing);
-  const result = await runTask(baseConfig, task, routePolicy, logger);
+  const result = await runTask(healthSelection.config, task, routePolicy, logger);
   console.error(`Run log: ${logger.logPath}`);
   console.log(JSON.stringify({
     status: result.status,
@@ -5048,19 +5167,22 @@ async function runCliTask(task: string): Promise<void> {
     plan: result.plan,
     taskRuns: result.taskRuns,
     artifacts: result.artifacts,
+    model_health: healthSelection.results,
   }, null, 2));
 }
 
 async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): Promise<void> {
   const config = loadConfig();
-  configureSearchTools(config.search);
+  const healthSelection = await buildHealthyExecutorRuntimeConfig(config);
+  assertHealthyExecutorSelection(healthSelection);
+  configureSearchTools(healthSelection.config.search);
   const logger = createRunLogger(goal);
   const tracer = new Tracer(logger);
   const startedAt = new Date().toISOString();
 
-  const teamAgents = resolveTeamAgents(config);
+  const teamAgents = resolveTeamAgents(healthSelection.config);
 
-  const result = await runTeam(config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
+  const result = await runTeam(healthSelection.config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
 
   // Export dashboard
   const dashData = buildDashboardData(logger.runId, goal, result.tasks, tracer.getEvents(), startedAt);
@@ -5079,6 +5201,7 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
     plan: result.plan,
     taskRuns: result.taskRuns,
     artifacts: result.artifacts,
+    model_health: healthSelection.results,
     traceSummary: tracer.getSummary(),
   }, null, 2));
 }

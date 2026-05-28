@@ -116,6 +116,40 @@ export function buildMinimalConfig(): OrchestratorConfig {
       maxTokens: 512,
       temperature: 0,
     },
+    modelRegistry: {
+      "planner.default": {
+        id: "planner.default",
+        role: "planner",
+        enabled: true,
+        model: {
+          provider: "openai_compatible",
+          baseUrl: "http://planner.test/v1",
+          apiKey: "planner-key",
+          model: "planner-model",
+          timeoutMs: 1000,
+          maxTokens: 512,
+          temperature: 0,
+        },
+      },
+      "executor.default": {
+        id: "executor.default",
+        role: "executor",
+        enabled: true,
+        model: {
+          provider: "openai_compatible",
+          baseUrl: "http://executor.test/v1",
+          apiKey: "executor-key",
+          model: "executor-model",
+          timeoutMs: 1000,
+          maxTokens: 512,
+          temperature: 0,
+        },
+      },
+    },
+    modelRouting: {
+      plannerCandidates: ["planner.default"],
+      executorCandidates: ["executor.default"],
+    },
     policy: {
       maxSteps: 4,
       maxReplans: 2,

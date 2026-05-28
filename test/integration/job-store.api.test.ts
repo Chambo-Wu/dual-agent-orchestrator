@@ -2,9 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { persistJobRecord, readJobRecord, updateJobControlState, updateStoredJobRecord } from "../../src/job-store.js";
+import { listStoredJobs, persistJobRecord, readJobRecord, updateJobControlState, updateStoredJobRecord } from "../../src/job-store.js";
 import { __testables } from "../../src/index.js";
 import { registerActiveJobSession, unregisterActiveJobSession, resolvePendingApproval } from "../../src/job-runtime.js";
+import { NoHealthyExecutorError } from "../../src/model-health.js";
 import { buildMinimalConfig } from "../helpers/fake-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "../../src/workflow-contract.js";
 
@@ -2237,6 +2238,9 @@ test("doctor report exposes runtime diagnostics and writable checks", () => {
   assert.equal(report.checks.some((check) => check.name === "executor_model_config" && check.ok), true);
   assert.equal(report.checks.some((check) => check.name === "runtime_profile" && check.ok), true);
   assert.equal(report.checks.some((check) => check.name === "task_routing_summary" && check.ok), true);
+  const executorCandidateQueue = report.checks.find((check) => check.name === "executor_candidate_queue");
+  assert.notEqual(executorCandidateQueue, undefined);
+  assert.equal(typeof executorCandidateQueue?.detail?.candidate_count, "number");
   assert.equal(report.checks.some((check) => check.name === "workspace_writable"), true);
   assert.equal(report.checks.some((check) => check.name === "runtime_writable"), true);
   assert.equal(report.checks.some((check) => check.name === "proxy_health"), true);
@@ -2244,4 +2248,116 @@ test("doctor report exposes runtime diagnostics and writable checks", () => {
   assert.equal(report.summary.total, report.checks.length);
   assert.equal(report.recommendations.length > 0, true);
   assert.equal(typeof report.recommendations[0]?.suggested_action, "string");
+});
+
+test("job create failure events expose executor health metadata for task mode", async () => {
+  const healthResults = [
+    {
+      modelId: "executor.default",
+      role: "executor" as const,
+      status: "unhealthy" as const,
+      summary: "Probe failed with upstream status 503.",
+      baseUrl: "https://example.invalid/v1",
+      model: "executor-model",
+      error: "503 Service Unavailable",
+    },
+  ];
+
+  __testables.setTaskExecutorForTests(async () => {
+    throw new NoHealthyExecutorError(healthResults);
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Fail task job when no executor is healthy",
+      mode: "task",
+      model_route: "dual-agent-orchestrator",
+    }), res);
+    const body = JSON.parse(res.body) as {
+      error: { type: string; message: string };
+    };
+
+    assert.equal(res.statusCode, 500);
+    assert.equal(body.error.type, "server_error");
+
+    const failedRecord = listStoredJobs()
+      .filter((record) => record.goal === "Fail task job when no executor is healthy" && record.status === "failed")
+      .sort((left, right) => right.savedAt.localeCompare(left.savedAt))[0];
+    assert.notEqual(failedRecord, undefined);
+    assert.equal(failedRecord?.status, "failed");
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${failedRecord?.id}/events`), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as {
+      events: Array<{ type: string; meta?: Record<string, unknown> }>;
+    };
+    const failedEvent = [...eventsBody.events].reverse().find((event) => event.type === "job.failed");
+    assert.notEqual(failedEvent, undefined);
+    assert.equal(failedEvent?.meta?.failure_category, "environment_failure");
+    assert.deepEqual(failedEvent?.meta?.healthy_executor_ids, []);
+    assert.deepEqual(failedEvent?.meta?.executor_health_results, healthResults);
+  } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
+
+test("job create failure events expose executor health metadata for team mode", async () => {
+  const healthResults = [
+    {
+      modelId: "executor.alpha",
+      role: "executor" as const,
+      status: "healthy" as const,
+      summary: "Probe succeeded.",
+      baseUrl: "https://example.invalid/v1",
+      model: "executor-alpha",
+    },
+    {
+      modelId: "executor.beta",
+      role: "executor" as const,
+      status: "unhealthy" as const,
+      summary: "Probe timed out.",
+      baseUrl: "https://example.invalid/v1",
+      model: "executor-beta",
+      error: "timeout",
+    },
+  ];
+
+  __testables.setTeamExecutorForTests(async () => {
+    throw new NoHealthyExecutorError(healthResults);
+  });
+
+  try {
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Fail team job when no executor is healthy",
+      mode: "team",
+      model_route: "dual-agent-orchestrator",
+    }), res);
+    const body = JSON.parse(res.body) as {
+      error: { type: string; message: string };
+    };
+
+    assert.equal(res.statusCode, 500);
+    assert.equal(body.error.type, "server_error");
+
+    const failedRecord = listStoredJobs()
+      .filter((record) => record.goal === "Fail team job when no executor is healthy" && record.status === "failed")
+      .sort((left, right) => right.savedAt.localeCompare(left.savedAt))[0];
+    assert.notEqual(failedRecord, undefined);
+    assert.equal(failedRecord?.status, "failed");
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${failedRecord?.id}/events`), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as {
+      events: Array<{ type: string; meta?: Record<string, unknown> }>;
+    };
+    const failedEvent = [...eventsBody.events].reverse().find((event) => event.type === "job.failed");
+    assert.notEqual(failedEvent, undefined);
+    assert.equal(failedEvent?.meta?.failure_category, "environment_failure");
+    assert.deepEqual(failedEvent?.meta?.healthy_executor_ids, []);
+    assert.deepEqual(failedEvent?.meta?.executor_health_results, healthResults);
+  } finally {
+    __testables.setTeamExecutorForTests(null);
+  }
 });
