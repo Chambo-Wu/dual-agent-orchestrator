@@ -6,7 +6,7 @@ Dual Agent Orchestrator is a local-first `planner + executor` runtime for multi-
 - Anthropic-style `messages` APIs
 - a job-oriented control plane for long-running work
 - realtime workflow streams for frontend clients
-- built-in browser pages for job dashboards and timelines
+- built-in browser pages for job and goal dashboards and timelines
 
 Chinese documentation: [Readme-CN.md](./Readme-CN.md)
 
@@ -49,7 +49,7 @@ This is now a working orchestration service rather than a CLI skeleton. The curr
 - workflow replan history preserved in job responses
 - structured verification checks carried through job responses, events, and the timeline UI
 - restart recovery with auto-resume, queue metadata, redirect/follow semantics, and CTA actions
-- built-in browser dashboard and timeline pages
+- built-in browser dashboard and timeline pages for jobs and goals
 - Cherry Studio-friendly progress mirroring inside standard chat streams
 - protocol compatibility guards for OpenAI-style and Anthropic-style clients
 - file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
@@ -80,6 +80,8 @@ Use these terms consistently across the runtime, API, UI, and planning docs:
 - `src/job-event-bus.ts`: persisted event bus for job streams
 - `src/timeline.ts`: HTML timeline rendering
 - `src/jobs-dashboard.ts`: browser dashboard rendering
+- `src/goal-timeline.ts`: goal timeline rendering
+- `src/goals-dashboard.ts`: goal dashboard rendering
 - `src/workflow-plan.ts`: workflow plan schema parsing and validation
 - `src/workflow-runtime.ts`: workflow runtime execution and replan flow
 - `src/workflow-graph.ts`: DAG and replan-history view-model generation
@@ -256,7 +258,8 @@ Default service URL:
 
 Recommended first browser checks:
 
-- dashboard: `http://127.0.0.1:9898/jobs/dashboard`
+- jobs dashboard: `http://127.0.0.1:9898/jobs/dashboard`
+- goals dashboard: `http://127.0.0.1:9898/goals/dashboard`
 - health: `http://127.0.0.1:9898/health`
 
 Quick health/config self-check:
@@ -312,6 +315,20 @@ Job control plane:
 - `POST /v1/jobs/:id/approve`
 - `POST /v1/jobs/:id/resume`
 
+Goal control plane:
+
+- `GET /v1/goals`
+- `GET /v1/goals/data`
+- `GET /v1/goals/dashboard`
+- `POST /v1/goals`
+- `GET /v1/goals/:id`
+- `GET /v1/goals/:id/events`
+- `GET /v1/goals/:id/timeline`
+- `POST /v1/goals/:id/run-next`
+- `POST /v1/goals/:id/retry`
+- `POST /v1/goals/:id/resume`
+- `POST /v1/goals/:id/review`
+
 Browser-friendly built-in pages:
 
 - `GET /jobs/dashboard`
@@ -321,6 +338,11 @@ Browser-friendly built-in pages:
 - `GET /jobs/:id/stream`
 - `GET /jobs/:id/timeline`
 - `POST /jobs/:id/resume`
+- `GET /goals/dashboard`
+- `GET /goals/data`
+- `GET /goals/:id`
+- `GET /goals/:id/events`
+- `GET /goals/:id/timeline`
 
 Notes for multi-model users:
 
@@ -388,6 +410,7 @@ The current progress system is designed for both custom frontends and generic cl
 - shareable timeline URLs that preserve `workflowFocus`, `analysisFilter`, and `analysisValue`
 - recovery-aware frontend signals such as `job.redirect`, `snapshot.follow`, `snapshot.actions`, and `snapshot.recovery`
 - a browser-friendly `/jobs/dashboard` that summarizes persisted jobs without requiring manual auth headers
+- a browser-friendly `/goals/dashboard` that summarizes persisted goals and exposes goal-mode continuation controls
 
 Example mirrored progress in chat streams:
 
@@ -446,7 +469,6 @@ npm run test:e2e-lite
 ## Current Limitations
 
 - browser dashboard data is still loaded as one list response; very large job histories will benefit from future pagination
-- some integration tests around restart recovery still need cleanup to fully match the newer auto-resume behavior
 - executor candidate health filtering is implemented, but planner candidate health filtering is not yet wired into the same admission path
 - `npm run doctor` does not perform live async per-model probing; use `/health` for real-time executor pool status
 - the planner still depends on upstream model reliability
@@ -470,6 +492,8 @@ For custom apps:
 - store the last seen SSE `id` and reconnect with `Last-Event-ID`
 - open `/v1/jobs/:id/timeline` for a built-in visualization
 - use `/jobs/dashboard` when you want a zero-setup browser view of persisted jobs
+- use `/goals/dashboard` when you want a zero-setup browser view of persisted goals
+- open `/v1/goals/:id/timeline` when you want a built-in visualization for goal-mode execution
 
 ## Acknowledgments
 
