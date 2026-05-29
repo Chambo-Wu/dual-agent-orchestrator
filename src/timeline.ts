@@ -4,7 +4,8 @@ import type { WorkflowUiEvent } from "./workflow-ui-events.js";
 export type TimelineSelectionState =
   | { kind: "task"; taskId: string }
   | { kind: "artifact"; artifactId: string }
-  | { kind: "verification_check"; checkKey: string; taskId?: string };
+  | { kind: "verification_check"; checkKey: string; taskId?: string }
+  | { kind: "skill_install"; eventId: string };
 
 export interface TimelineUiState {
   workflowFocus: string | null;
@@ -16,6 +17,7 @@ export type TimelineUiAction =
   | { type: "select_task"; taskId: string }
   | { type: "select_artifact"; artifactId: string }
   | { type: "select_verification_check"; checkKey: string; taskId?: string }
+  | { type: "select_skill_install"; eventId: string }
   | { type: "apply_analysis_filter"; kind: string; value: string }
   | { type: "clear_analysis_filter" }
   | { type: "apply_workflow_focus"; workflowId: string }
@@ -40,6 +42,11 @@ export function reduceTimelineUiState(state: TimelineUiState, action: TimelineUi
         analysisFilter: { kind: "verification_check", value: action.checkKey },
         selection: { kind: "verification_check", checkKey: action.checkKey, taskId: action.taskId },
       };
+    case "select_skill_install":
+      return {
+        ...state,
+        selection: { kind: "skill_install", eventId: action.eventId },
+      };
     case "apply_analysis_filter":
       return {
         ...state,
@@ -48,6 +55,8 @@ export function reduceTimelineUiState(state: TimelineUiState, action: TimelineUi
           ? { kind: "artifact", artifactId: action.value }
           : action.kind === "verification_check"
             ? { kind: "verification_check", checkKey: action.value }
+            : action.kind === "skill_install"
+              ? { kind: "skill_install", eventId: action.value }
             : state.selection,
       };
     case "clear_analysis_filter":
@@ -85,6 +94,8 @@ export function readTimelineUiStateFromUrl(urlText: string): TimelineUiState {
     selection = { kind: "artifact", artifactId: selectionValue };
   } else if (selectionKind === "verification_check" && selectionValue) {
     selection = { kind: "verification_check", checkKey: selectionValue };
+  } else if (selectionKind === "skill_install" && selectionValue) {
+    selection = { kind: "skill_install", eventId: selectionValue };
   }
 
   return {
@@ -117,6 +128,9 @@ export function writeTimelineUiStateToUrl(urlText: string, state: TimelineUiStat
   } else if (state.selection?.kind === "verification_check") {
     url.searchParams.set("selectionKind", "verification_check");
     url.searchParams.set("selectionValue", state.selection.checkKey);
+  } else if (state.selection?.kind === "skill_install") {
+    url.searchParams.set("selectionKind", "skill_install");
+    url.searchParams.set("selectionValue", state.selection.eventId);
   } else {
     url.searchParams.delete("selectionKind");
     url.searchParams.delete("selectionValue");
@@ -134,6 +148,62 @@ export function renderTimelineHtml(
   goal?: string,
   status?: string,
   workflowSummary?: {
+    intent_route?: {
+      kind?: string;
+      reason?: string;
+      source?: string;
+    } | null;
+    candidate_skills?: Array<{
+      skillId?: string;
+      score?: number;
+      reasons?: string[];
+      source?: string;
+    }>;
+    selected_skill?: {
+      skill_id?: string;
+      skill_action?: string;
+      skill_install_status?: string;
+      skill_reason?: string;
+    } | null;
+    skill_verification?: {
+      task_id?: string;
+      title?: string;
+      task_status?: string;
+      verified?: boolean;
+      verification_status?: string;
+      verification_label?: string;
+      action_required?: boolean;
+      summary?: string | null;
+      outcome_summary?: string | null;
+      next_action?: string | null;
+      check_count?: number;
+      failed_check_names?: string[];
+      missing_requirements?: string[];
+    } | null;
+    skill_reflection?: {
+      id?: string;
+      skillId?: string;
+      reflectionKind?: string;
+      reason?: string;
+      recommendedAction?: string;
+      evidence?: {
+        verificationStatus?: string | null;
+        failedCheckNames?: string[];
+        missingRequirements?: string[];
+        eventIds?: string[];
+        artifactIds?: string[];
+        silentBypassSignal?: boolean;
+      } | null;
+    } | null;
+    skill_evolution?: {
+      proposal_count?: number;
+      latest_proposal_id?: string;
+      latest_status?: string;
+      latest_patch_summary?: string;
+      latest_created_at?: string;
+      latest_decided_at?: string | null;
+      statuses?: Record<string, number>;
+    } | null;
     current_task?: { id?: string; title?: string; status?: string } | null;
     awaiting_approval_task?: { title?: string; status?: string } | null;
     task_counts?: Record<string, number>;
@@ -202,6 +272,13 @@ export function renderTimelineHtml(
   const latestStep = events.reduce((max, e) => Math.max(max, e.step ?? 0), 0);
   const failureSummary = summarizeFailures(events);
   const runtimeAnalysis = summarizeRuntimeAnalysis(events);
+  const skillInstallSummary = summarizeSkillInstallActivity(events);
+  const intentRoute = workflowSummary?.intent_route;
+  const candidateSkills = Array.isArray(workflowSummary?.candidate_skills) ? workflowSummary.candidate_skills : [];
+  const selectedSkill = workflowSummary?.selected_skill;
+  const skillVerification = workflowSummary?.skill_verification;
+  const skillReflection = workflowSummary?.skill_reflection;
+  const skillEvolution = workflowSummary?.skill_evolution;
   const currentTaskId = workflowSummary?.current_task?.id;
   const currentTaskTitle = workflowSummary?.current_task?.title;
   const currentTaskStatus = workflowSummary?.current_task?.status;
@@ -242,7 +319,35 @@ export function renderTimelineHtml(
   const taskCountSummary = taskCounts
     ? `Tasks: ${taskCounts.completed ?? 0} completed, ${taskCounts.awaiting_approval ?? 0} awaiting approval, ${taskCounts.in_progress ?? 0} in progress, ${taskCounts.pending ?? 0} pending`
     : "";
+  const candidateSkillSummary = candidateSkills.length > 0
+    ? `Skill candidates: ${candidateSkills.slice(0, 3).map((candidate) => {
+        const skillId = typeof candidate?.skillId === "string" ? candidate.skillId : "unknown";
+        const score = typeof candidate?.score === "number" ? candidate.score : undefined;
+        return score !== undefined ? `${skillId} (${score})` : skillId;
+      }).join(", ")}`
+    : "";
+  const skillVerificationSummary = skillVerification?.verification_status
+    ? `Skill verification: ${skillVerification.title ?? "Skill verification"} (${skillVerification.verification_label ?? skillVerification.verification_status})${skillVerification.outcome_summary ? ` - ${skillVerification.outcome_summary}` : ""}`
+    : "";
+  const skillVerificationRequirements = Array.isArray(skillVerification?.missing_requirements) && skillVerification.missing_requirements.length > 0
+    ? `Missing requirements: ${skillVerification.missing_requirements.join(" | ")}`
+    : "";
+  const skillVerificationNextAction = skillVerification?.action_required && skillVerification?.next_action
+    ? `Next action: ${skillVerification.next_action}`
+    : "";
+  const skillReflectionSummary = skillReflection?.reflectionKind
+    ? `Skill reflection: ${skillReflection.reflectionKind}${skillReflection.recommendedAction ? ` -> ${skillReflection.recommendedAction}` : ""}${skillReflection.reason ? ` - ${skillReflection.reason}` : ""}`
+    : "";
+  const skillReflectionSignals = skillReflection?.evidence?.silentBypassSignal
+    ? "Reflection signal: silent skill bypass detected."
+    : Array.isArray(skillReflection?.evidence?.missingRequirements) && skillReflection.evidence.missingRequirements.length > 0
+      ? `Reflection evidence: ${skillReflection.evidence.missingRequirements.join(" | ")}`
+      : "";
+  const skillEvolutionSummary = skillEvolution?.latest_status
+    ? `Skill evolution: ${skillEvolution.latest_status}${skillEvolution.latest_patch_summary ? ` - ${skillEvolution.latest_patch_summary}` : ""}`
+    : "";
   const failureSummaryText = formatFailureSummaryDisplay(failureSummary);
+  const skillInstallSummaryText = formatSkillInstallSummaryText(skillInstallSummary);
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -285,6 +390,23 @@ export function renderTimelineHtml(
       display: flex;
       align-items: center;
       gap: 4px;
+    }
+    .route-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(88,166,255,0.35);
+      background: rgba(88,166,255,0.12);
+      color: #8cc7ff;
+      font-size: 12px;
+    }
+    .route-badge .route-source {
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 10px;
     }
     .cta-banner {
       margin-top: 12px;
@@ -633,6 +755,34 @@ export function renderTimelineHtml(
 
     .event-card.status-failed { border-left-color: #f85149; }
     .event-card.status-failed::before { background: #f85149; }
+    .event-card.event-skill-install {
+      background:
+        linear-gradient(135deg, rgba(210,153,34,0.12), rgba(22,27,34,0.96) 48%),
+        #161b22;
+      border-color: rgba(210,153,34,0.45);
+      box-shadow: inset 0 0 0 1px rgba(210,153,34,0.08);
+    }
+    .event-card.event-skill-install .event-title {
+      color: #ffd37a;
+    }
+    .event-card.event-skill-install.status-success {
+      background:
+        linear-gradient(135deg, rgba(63,185,80,0.16), rgba(22,27,34,0.96) 48%),
+        #161b22;
+      border-color: rgba(63,185,80,0.5);
+    }
+    .event-card.event-skill-install.status-blocked {
+      background:
+        linear-gradient(135deg, rgba(210,153,34,0.18), rgba(22,27,34,0.96) 48%),
+        #161b22;
+      border-color: rgba(210,153,34,0.55);
+    }
+    .event-card.event-skill-install.status-failed {
+      background:
+        linear-gradient(135deg, rgba(248,81,73,0.18), rgba(22,27,34,0.96) 48%),
+        #161b22;
+      border-color: rgba(248,81,73,0.55);
+    }
 
     .event-header {
       display: flex;
@@ -679,6 +829,73 @@ export function renderTimelineHtml(
       font-size: 11px;
       background: #30363d;
       color: #8b949e;
+    }
+    .tag.tag-install {
+      background: rgba(210,153,34,0.18);
+      color: #ffd37a;
+      border: 1px solid rgba(210,153,34,0.35);
+    }
+    .tag.tag-install.status-success {
+      background: rgba(63,185,80,0.18);
+      color: #7ee787;
+      border-color: rgba(63,185,80,0.35);
+    }
+    .tag.tag-install.status-blocked {
+      background: rgba(210,153,34,0.2);
+      color: #ffd37a;
+    }
+    .tag.tag-install.status-failed {
+      background: rgba(248,81,73,0.18);
+      color: #ff938a;
+      border-color: rgba(248,81,73,0.35);
+    }
+    .skill-install-banner {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(210,153,34,0.32);
+      background:
+        linear-gradient(135deg, rgba(210,153,34,0.12), rgba(13,17,23,0.94) 58%),
+        #111723;
+      color: #f0f6fc;
+    }
+    .skill-install-banner strong {
+      color: #ffd37a;
+    }
+    .skill-install-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .skill-install-stat {
+      border: 1px solid rgba(210,153,34,0.2);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: rgba(13,17,23,0.45);
+    }
+    .skill-install-stat .label {
+      display: block;
+      font-size: 11px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .skill-install-stat .value {
+      display: block;
+      font-size: 15px;
+      font-weight: 700;
+      color: #f0f6fc;
+      margin-top: 3px;
+    }
+    .analysis-chip.skill-install-chip {
+      border-color: rgba(210,153,34,0.35);
+      background: rgba(210,153,34,0.08);
+    }
+    .analysis-chip.skill-install-chip:hover,
+    .analysis-chip.skill-install-chip.is-active {
+      border-color: rgba(210,153,34,0.65);
+      background: rgba(210,153,34,0.16);
     }
     .analysis-chip {
       border: 1px solid #30363d;
@@ -809,9 +1026,21 @@ export function renderTimelineHtml(
         ${goal ? `<span>Goal: ${escapeHtml(truncate(goal, 80))}</span>` : ""}
         <span>Step: ${latestStep}</span>
         ${status ? `<span class="status-badge status-${status}">${status}</span>` : ""}
+        ${intentRoute?.kind ? `<span class="route-badge">Route: ${escapeHtml(formatIntentRouteLabel(intentRoute.kind))}${intentRoute.source ? `<span class="route-source">${escapeHtml(intentRoute.source)}</span>` : ""}</span>` : ""}
+        ${selectedSkill?.skill_id ? `<span class="route-badge">Skill: ${escapeHtml(selectedSkill.skill_id)}${selectedSkill.skill_install_status ? `<span class="route-source">${escapeHtml(selectedSkill.skill_install_status)}</span>` : ""}</span>` : ""}
         ${currentTaskTitle ? `<span>Current: ${escapeHtml(currentTaskTitle)}${currentTaskStatus ? ` (${escapeHtml(currentTaskStatus)})` : ""}</span>` : ""}
         ${approvalTaskTitle ? `<span>Approval: ${escapeHtml(approvalTaskTitle)}</span>` : ""}
       </div>
+      ${intentRoute?.reason ? `<div class="meta" style="margin-top:8px"><span>Route reason: ${escapeHtml(intentRoute.reason)}</span></div>` : ""}
+      ${selectedSkill?.skill_reason ? `<div class="meta" style="margin-top:8px"><span>Skill reason: ${escapeHtml(selectedSkill.skill_reason)}</span></div>` : ""}
+      ${candidateSkillSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(candidateSkillSummary)}</span></div>` : ""}
+      ${skillInstallSummaryText ? `<div class="skill-install-banner"><strong>Skill install activity</strong><div style="margin-top:6px">${escapeHtml(skillInstallSummaryText)}</div><div class="skill-install-grid"><div class="skill-install-stat"><span class="label">Attempts</span><span class="value">${skillInstallSummary.attempted}</span></div><div class="skill-install-stat"><span class="label">Completed</span><span class="value">${skillInstallSummary.completed}</span></div><div class="skill-install-stat"><span class="label">Blocked</span><span class="value">${skillInstallSummary.blocked}</span></div><div class="skill-install-stat"><span class="label">Failed</span><span class="value">${skillInstallSummary.failed}</span></div></div></div>` : ""}
+      ${skillVerificationSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillVerificationSummary)}</span></div>` : ""}
+      ${skillVerificationRequirements ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillVerificationRequirements)}</span></div>` : ""}
+      ${skillVerificationNextAction ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillVerificationNextAction)}</span></div>` : ""}
+      ${skillReflectionSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillReflectionSummary)}</span></div>` : ""}
+      ${skillReflectionSignals ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillReflectionSignals)}</span></div>` : ""}
+      ${skillEvolutionSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(skillEvolutionSummary)}</span></div>` : ""}
       ${taskCountSummary ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(taskCountSummary)}</span></div>` : ""}
       ${failureSummaryText ? `<div class="meta" style="margin-top:8px"><span>${escapeHtml(failureSummaryText)}</span></div>` : ""}
       ${(actions.length > 0 || autoResumeStatus === "queued" || autoResumeStatus === "running") ? `<div id="cta-banner" class="cta-banner">
@@ -852,7 +1081,7 @@ export function renderTimelineHtml(
       </div>
       <aside class="panel detail-pane" id="detail-pane">
         <h2>Details</h2>
-        <div id="detail-content" class="detail-empty">Select a task, artifact, or verification check to inspect its details.</div>
+        <div id="detail-content" class="detail-empty">Select a task, artifact, verification check, or skill install event to inspect its details.</div>
       </aside>
     </div>
   </div>
@@ -1044,8 +1273,12 @@ export function renderTimelineHtml(
       const artifactPath = typeof event.meta?.path === 'string' ? event.meta.path : '';
       const artifactType = typeof event.meta?.artifact_type === 'string' ? event.meta.artifact_type : '';
       const relatedTaskRunId = typeof event.meta?.related_task_run_id === 'string' ? event.meta.related_task_run_id : '';
+      const isSkillInstallEvent = typeof event.type === 'string' && event.type.startsWith('system.skill_install_');
+      const skillInstallStatus = typeof event.meta?.skill_install_status === 'string' ? event.meta.skill_install_status : '';
+      const installReason = typeof event.meta?.install_reason === 'string' ? event.meta.install_reason : '';
       const card = document.createElement('div');
-      card.className = 'event-card agent-' + event.agent + ' status-' + event.status;
+      card.className = 'event-card agent-' + event.agent + ' status-' + event.status + (isSkillInstallEvent ? ' event-skill-install' : '');
+      if (event.id) card.setAttribute('data-event-id', event.id);
       card.setAttribute('data-event-type', event.type || '');
       if (event.taskRunId) card.setAttribute('data-task-run-id', event.taskRunId);
       if (artifactId) card.setAttribute('data-artifact-id', artifactId);
@@ -1054,6 +1287,8 @@ export function renderTimelineHtml(
       if (relatedTaskRunId) card.setAttribute('data-related-task-run-id', relatedTaskRunId);
       if (event.meta?.tool) card.setAttribute('data-event-tool', event.meta.tool);
       if (failureCategory) card.setAttribute('data-failure-category', failureCategory);
+      if (skillInstallStatus) card.setAttribute('data-skill-install-status', skillInstallStatus);
+      if (isSkillInstallEvent) card.setAttribute('data-skill-install-group', 'skill_install');
       if (event.meta?.verification_check_name) card.setAttribute('data-verification-check-name', event.meta.verification_check_name);
       if (event.meta?.verification_check_status) card.setAttribute('data-verification-check-status', event.meta.verification_check_status);
       if (Array.isArray(event.meta?.related_artifact_ids)) card.setAttribute('data-related-artifact-ids', event.meta.related_artifact_ids.join(','));
@@ -1065,8 +1300,11 @@ export function renderTimelineHtml(
         <div class="event-summary">\${escapeHtml(event.summary)}</div>
         <div class="event-tags">
           <span class="tag">\${event.agent}</span>
+          \${isSkillInstallEvent ? '<span class="tag tag-install status-' + escapeHtml(event.status || 'running') + '">skill install</span>' : ''}
           <span class="tag">\${event.type}</span>
           \${event.step ? '<span class="tag">step ' + event.step + '</span>' : ''}
+          \${skillInstallStatus ? '<span class="tag">' + escapeHtml(skillInstallStatus) + '</span>' : ''}
+          \${installReason ? '<span class="tag">' + escapeHtml(truncate(installReason, 44)) + '</span>' : ''}
           \${failureCategoryLabel ? '<span class="tag" title="' + escapeHtml(failureCategory) + '">' + failureCategoryLabel + '</span>' : ''}
         </div>
         <pre class="event-meta">\${escapeHtml(JSON.stringify(event.meta, null, 2))}</pre>
@@ -1183,6 +1421,7 @@ export function renderTimelineHtml(
             if (selection.kind === 'task') value = selection.taskId || null;
             if (selection.kind === 'artifact') value = selection.artifactId || null;
             if (selection.kind === 'verification_check') value = selection.checkKey || null;
+            if (selection.kind === 'skill_install') value = selection.eventId || null;
             if (value) {
               url.searchParams.set(selectionKindParamName, selection.kind);
               url.searchParams.set(selectionValueParamName, value);
@@ -1288,6 +1527,7 @@ export function renderTimelineHtml(
       const escapeDetail = (value) => escapeHtml(String(value || ''));
       const findTaskCard = (taskId) => analysisTaskCards.find((card) => card.getAttribute('data-task-id') === taskId) || null;
       const findArtifactCard = (artifactId) => eventCards.find((card) => card.getAttribute('data-artifact-id') === artifactId) || null;
+      const findSkillInstallCard = (eventId) => eventCards.find((card) => card.getAttribute('data-event-id') === eventId && card.getAttribute('data-skill-install-group') === 'skill_install') || null;
       const findCheckCard = (checkKey) => eventCards.find((card) => {
         const checkName = card.getAttribute('data-verification-check-name');
         const checkStatus = card.getAttribute('data-verification-check-status');
@@ -1314,6 +1554,11 @@ export function renderTimelineHtml(
             taskId: selection.taskId || checkCard.getAttribute('data-task-run-id') || undefined,
           };
         }
+        if (selection.kind === 'skill_install') {
+          return selection.eventId && findSkillInstallCard(selection.eventId)
+            ? { kind: 'skill_install', eventId: selection.eventId }
+            : null;
+        }
         return null;
       };
       const selectionFromUrlState = (urlSelection) => {
@@ -1321,6 +1566,7 @@ export function renderTimelineHtml(
         if (urlSelection.kind === 'task') return normalizeSelection({ kind: 'task', taskId: urlSelection.value });
         if (urlSelection.kind === 'artifact') return normalizeSelection({ kind: 'artifact', artifactId: urlSelection.value });
         if (urlSelection.kind === 'verification_check') return normalizeSelection({ kind: 'verification_check', checkKey: urlSelection.value });
+        if (urlSelection.kind === 'skill_install') return normalizeSelection({ kind: 'skill_install', eventId: urlSelection.value });
         return null;
       };
       const getArtifactCardsForTask = (taskId) => {
@@ -1492,6 +1738,42 @@ export function renderTimelineHtml(
           + '</div>';
       };
 
+      const renderSkillInstallDetail = (eventId) => {
+        if (!detailContent) return;
+        const eventCard = findSkillInstallCard(eventId);
+        if (!eventCard) {
+          renderEmptyDetail();
+          return;
+        }
+        const meta = parseCardMeta(eventCard);
+        const skillId = meta.skill_id || '';
+        const relatedInstallEvents = eventCards.filter((card) => {
+          if (card.getAttribute('data-skill-install-group') !== 'skill_install') return false;
+          const cardMeta = parseCardMeta(card);
+          return !skillId || cardMeta.skill_id === skillId;
+        });
+        detailContent.innerHTML =
+          '<div class="detail-kv">'
+            + '<div><span>Skill</span>' + (escapeDetail(skillId) || 'n/a') + '</div>'
+            + '<div><span>Status</span>' + (escapeDetail(meta.skill_install_status || '') || 'n/a') + '</div>'
+            + '<div><span>Source</span>' + (escapeDetail(meta.install_source || '') || 'n/a') + '</div>'
+            + '<div><span>Location</span>' + (escapeDetail(meta.install_location || '') || 'n/a') + '</div>'
+            + '<div><span>Event</span>' + (escapeDetail(eventCard.getAttribute('data-event-type') || '') || 'n/a') + '</div>'
+          + '</div>'
+          + '<div class="detail-section">'
+            + '<h3>Install Reason</h3>'
+            + '<div class="detail-preview">' + escapeDetail(meta.install_reason || eventCard.querySelector('.event-summary')?.textContent || 'No install reason recorded.') + '</div>'
+          + '</div>'
+          + '<div class="detail-section">'
+            + '<h3>Install Timeline</h3>'
+            + '<div class="detail-list">' + (relatedEventMarkup(relatedInstallEvents) || '<div class="detail-item">No related install events.</div>') + '</div>'
+          + '</div>'
+          + '<div class="detail-section">'
+            + '<h3>Raw Metadata</h3>'
+            + '<div class="detail-preview">' + escapeDetail(JSON.stringify(meta, null, 2)) + '</div>'
+          + '</div>';
+      };
+
       const applySelectionStyling = () => {
         eventCards.forEach((card) => card.classList.remove('is-selected'));
         analysisTaskCards.forEach((card) => card.classList.remove('is-selected'));
@@ -1526,6 +1808,10 @@ export function renderTimelineHtml(
             if (taskCard) taskCard.classList.add('is-selected');
           }
         }
+        if (activeSelection.kind === 'skill_install') {
+          const skillInstallCard = findSkillInstallCard(activeSelection.eventId);
+          if (skillInstallCard) skillInstallCard.classList.add('is-selected');
+        }
       };
 
       const renderSelectionDetail = () => {
@@ -1543,6 +1829,10 @@ export function renderTimelineHtml(
         }
         if (activeSelection.kind === 'verification_check') {
           renderVerificationCheckDetail(activeSelection.checkKey, activeSelection.taskId);
+          return;
+        }
+        if (activeSelection.kind === 'skill_install') {
+          renderSkillInstallDetail(activeSelection.eventId);
           return;
         }
         renderEmptyDetail();
@@ -1571,6 +1861,9 @@ export function renderTimelineHtml(
         }
         if (selection.kind === 'verification_check' && selection.checkKey) {
           return { kind: 'verification_check', value: selection.checkKey };
+        }
+        if (selection.kind === 'skill_install' && selection.eventId) {
+          return { kind: 'skill_install_group', value: 'skill_install' };
         }
         return null;
       };
@@ -1616,6 +1909,8 @@ export function renderTimelineHtml(
           const eventTool = card.getAttribute('data-event-tool');
           const failureCategory = card.getAttribute('data-failure-category');
           const eventType = card.getAttribute('data-event-type');
+          const skillInstallStatus = card.getAttribute('data-skill-install-status');
+          const skillInstallGroup = card.getAttribute('data-skill-install-group');
           const verificationCheckName = card.getAttribute('data-verification-check-name');
           const verificationCheckStatus = card.getAttribute('data-verification-check-status');
           const relatedArtifactIds = (card.getAttribute('data-related-artifact-ids') || '').split(',').filter(Boolean);
@@ -1628,9 +1923,13 @@ export function renderTimelineHtml(
               ? failureCategory === value
               : kind === 'verifier'
                 ? eventType === value
-                : kind === 'verification_check'
-                  ? (verificationCheckName + ':' + verificationCheckStatus) === value
-                  : kind === 'artifact'
+                : kind === 'skill_install_group'
+                  ? skillInstallGroup === value
+                  : kind === 'skill_install'
+                    ? skillInstallStatus === value
+                  : kind === 'verification_check'
+                    ? (verificationCheckName + ':' + verificationCheckStatus) === value
+                    : kind === 'artifact'
                     ? artifactId === value || relatedArtifactIds.includes(value)
                     : false;
           card.classList.toggle('is-analysis-match', matches);
@@ -1765,14 +2064,19 @@ export function renderTimelineHtml(
           const value = chip.getAttribute('data-analysis-value');
           const result = applyAnalysisFilter(kind, value, chip, { historyMode: 'push' });
           if (kind === 'artifact' && value) {
-            setSelection({ kind: 'artifact', artifactId: value });
+            setSelection({ kind: 'artifact', artifactId: value }, { historyMode: 'push' });
           } else if (kind === 'verification_check' && value) {
             const match = eventCards.find((card) => {
               const checkName = card.getAttribute('data-verification-check-name');
               const checkStatus = card.getAttribute('data-verification-check-status');
               return !!checkName && (checkName + ':' + (checkStatus || '')) === value;
             }) || null;
-            setSelection({ kind: 'verification_check', checkKey: value, taskId: match?.getAttribute('data-task-run-id') || undefined });
+            setSelection({ kind: 'verification_check', checkKey: value, taskId: match?.getAttribute('data-task-run-id') || undefined }, { historyMode: 'push' });
+          } else if ((kind === 'skill_install' || kind === 'skill_install_group') && result?.firstMatch) {
+            const eventId = result.firstMatch.getAttribute('data-event-id');
+            if (eventId) {
+              setSelection({ kind: 'skill_install', eventId }, { historyMode: 'push' });
+            }
           }
           const match = result?.firstMatch || eventCards.find((card) => card.classList.contains('is-analysis-match'));
           const preferredWorkflowId = result?.matchedWorkflowIds?.values()?.next()?.value;
@@ -1825,6 +2129,7 @@ export function renderTimelineHtml(
           const artifactId = card.getAttribute('data-artifact-id');
           const checkName = card.getAttribute('data-verification-check-name');
           const checkStatus = card.getAttribute('data-verification-check-status');
+          const skillInstallGroup = card.getAttribute('data-skill-install-group');
           const taskId = card.getAttribute('data-task-run-id') || card.getAttribute('data-related-task-run-id');
           if (artifactId) {
             selectEntity({ kind: 'artifact', artifactId }, { syncFilter: true, historyMode: 'push' });
@@ -1833,6 +2138,13 @@ export function renderTimelineHtml(
           if (checkName) {
             selectEntity({ kind: 'verification_check', checkKey: checkName + ':' + (checkStatus || ''), taskId: taskId || undefined }, { syncFilter: true, historyMode: 'push' });
             return;
+          }
+          if (skillInstallGroup === 'skill_install') {
+            const eventId = card.getAttribute('data-event-id');
+            if (eventId) {
+              selectEntity({ kind: 'skill_install', eventId }, { syncFilter: true, historyMode: 'push' });
+              return;
+            }
           }
           if (taskId) {
             selectEntity({ kind: 'task', taskId }, { historyMode: 'push' });
@@ -1952,7 +2264,14 @@ function renderEventCard(event: WorkflowUiEvent): string {
   const relatedTaskRunId = typeof event.meta.related_task_run_id === "string" ? event.meta.related_task_run_id : "";
   const artifactPath = typeof event.meta.path === "string" ? event.meta.path : "";
   const artifactType = typeof event.meta.artifact_type === "string" ? event.meta.artifact_type : "";
-  return `<div class="event-card agent-${event.agent} status-${event.status}" data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${artifactId ? ` data-artifact-id="${escapeHtmlAttribute(artifactId)}"` : ""}${artifactPath ? ` data-artifact-path="${escapeHtmlAttribute(artifactPath)}"` : ""}${artifactType ? ` data-artifact-type="${escapeHtmlAttribute(artifactType)}"` : ""}${relatedTaskRunId ? ` data-related-task-run-id="${escapeHtmlAttribute(relatedTaskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""}${relatedArtifactIds.length > 0 ? ` data-related-artifact-ids="${escapeHtmlAttribute(relatedArtifactIds.join(","))}"` : ""} onclick="this.classList.toggle('expanded')">
+  const isSkillInstallEvent = event.type.startsWith("system.skill_install_");
+  const isSkillReflectionEvent = event.type === "system.skill_reflection_recorded";
+  const skillInstallStatus = typeof event.meta.skill_install_status === "string" ? event.meta.skill_install_status : "";
+  const installReason = typeof event.meta.install_reason === "string" ? event.meta.install_reason : "";
+  const reflectionKind = typeof event.meta.reflection_kind === "string" ? event.meta.reflection_kind : "";
+  const recommendedAction = typeof event.meta.recommended_action === "string" ? event.meta.recommended_action : "";
+  const silentBypassSignal = event.meta.silent_bypass_signal === true;
+  return `<div class="event-card agent-${event.agent} status-${event.status}${isSkillInstallEvent ? " event-skill-install" : ""}${isSkillReflectionEvent ? " event-skill-reflection" : ""}"${event.id ? ` data-event-id="${escapeHtmlAttribute(event.id)}"` : ""} data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${artifactId ? ` data-artifact-id="${escapeHtmlAttribute(artifactId)}"` : ""}${artifactPath ? ` data-artifact-path="${escapeHtmlAttribute(artifactPath)}"` : ""}${artifactType ? ` data-artifact-type="${escapeHtmlAttribute(artifactType)}"` : ""}${relatedTaskRunId ? ` data-related-task-run-id="${escapeHtmlAttribute(relatedTaskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""}${skillInstallStatus ? ` data-skill-install-status="${escapeHtmlAttribute(skillInstallStatus)}"` : ""}${reflectionKind ? ` data-reflection-kind="${escapeHtmlAttribute(reflectionKind)}"` : ""}${recommendedAction ? ` data-recommended-action="${escapeHtmlAttribute(recommendedAction)}"` : ""}${silentBypassSignal ? ` data-silent-bypass-signal="true"` : ""}${isSkillInstallEvent ? ` data-skill-install-group="skill_install"` : ""}${relatedArtifactIds.length > 0 ? ` data-related-artifact-ids="${escapeHtmlAttribute(relatedArtifactIds.join(","))}"` : ""} onclick="this.classList.toggle('expanded')">
   <div class="event-header">
     <span class="event-title">${escapeHtml(event.title)}</span>
     <span class="event-time">${formatTime(event.time)}</span>
@@ -1960,8 +2279,15 @@ function renderEventCard(event: WorkflowUiEvent): string {
   <div class="event-summary">${escapeHtml(event.summary)}</div>
   <div class="event-tags">
     <span class="tag">${event.agent}</span>
+    ${isSkillInstallEvent ? `<span class="tag tag-install status-${escapeHtmlAttribute(event.status)}">skill install</span>` : ""}
+    ${isSkillReflectionEvent ? `<span class="tag tag-install status-${escapeHtmlAttribute(event.status)}">skill reflection</span>` : ""}
     <span class="tag">${event.type}</span>
     ${event.step ? `<span class="tag">step ${event.step}</span>` : ""}
+    ${skillInstallStatus ? `<span class="tag">${escapeHtml(skillInstallStatus)}</span>` : ""}
+    ${installReason ? `<span class="tag">${escapeHtml(truncate(installReason, 44))}</span>` : ""}
+    ${reflectionKind ? `<span class="tag">${escapeHtml(reflectionKind)}</span>` : ""}
+    ${recommendedAction ? `<span class="tag">${escapeHtml(recommendedAction)}</span>` : ""}
+    ${silentBypassSignal ? `<span class="tag">silent bypass</span>` : ""}
     ${failureCategoryLabel ? `<span class="tag" title="${escapeHtmlAttribute(failureCategory)}">${escapeHtml(failureCategoryLabel)}</span>` : ""}
   </div>
   <pre class="event-meta">${escapeHtml(JSON.stringify(event.meta, null, 2))}</pre>
@@ -2025,6 +2351,13 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
   blockerPoints: Array<{ label: string; count: number }>;
   verificationSignals: { passed: number; failed: number };
   verificationChecks: Array<{ name: string; status: string; count: number }>;
+  skillInstallSignals: {
+    attempted: number;
+    completed: number;
+    blocked: number;
+    failed: number;
+    byStatus: Array<{ status: string; count: number }>;
+  };
   artifactSignals: {
     created: number;
     items: Array<{ id: string; label: string; count: number }>;
@@ -2033,10 +2366,15 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
   const toolCounts = new Map<string, number>();
   const blockerCounts = new Map<string, number>();
   const verificationCheckCounts = new Map<string, { name: string; status: string; count: number }>();
+  const skillInstallCounts = new Map<string, number>();
   const artifactCounts = new Map<string, { id: string; label: string; count: number }>();
   let verificationPassed = 0;
   let verificationFailed = 0;
   let artifactCreated = 0;
+  let skillInstallAttempted = 0;
+  let skillInstallCompleted = 0;
+  let skillInstallBlocked = 0;
+  let skillInstallFailed = 0;
 
   for (const event of events) {
     const tool = typeof event.meta.tool === "string" ? event.meta.tool.trim() : "";
@@ -2078,6 +2416,22 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
       }
     }
 
+    if (event.type.startsWith("system.skill_install_")) {
+      const installStatus = typeof event.meta.skill_install_status === "string" && event.meta.skill_install_status.trim().length > 0
+        ? event.meta.skill_install_status.trim()
+        : event.type.replace("system.skill_install_", "");
+      skillInstallCounts.set(installStatus, (skillInstallCounts.get(installStatus) ?? 0) + 1);
+      if (event.type === "system.skill_install_attempted") {
+        skillInstallAttempted += 1;
+      } else if (event.type === "system.skill_install_completed") {
+        skillInstallCompleted += 1;
+      } else if (event.type === "system.skill_install_blocked") {
+        skillInstallBlocked += 1;
+      } else if (event.type === "system.skill_install_failed") {
+        skillInstallFailed += 1;
+      }
+    }
+
     if (event.status === "blocked" || event.status === "awaiting_approval" || event.type.endsWith(".failed")) {
       const failureCategory = typeof event.meta.failure_category === "string" && event.meta.failure_category.trim().length > 0
         ? event.meta.failure_category.trim()
@@ -2095,11 +2449,14 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
   const verificationChecks = [...verificationCheckCounts.values()]
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name) || a.status.localeCompare(b.status));
+  const skillInstallStatuses = [...skillInstallCounts.entries()]
+    .map(([status, count]) => ({ status, count }))
+    .sort((a, b) => b.count - a.count || a.status.localeCompare(b.status));
   const artifactItems = [...artifactCounts.values()]
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   return {
-    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0 || verificationChecks.length > 0 || artifactCreated > 0,
+    hasData: toolUsage.length > 0 || blockerPoints.length > 0 || verificationPassed > 0 || verificationFailed > 0 || verificationChecks.length > 0 || skillInstallStatuses.length > 0 || artifactCreated > 0,
     toolUsage,
     blockerPoints,
     verificationSignals: {
@@ -2107,11 +2464,64 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
       failed: verificationFailed,
     },
     verificationChecks,
+    skillInstallSignals: {
+      attempted: skillInstallAttempted,
+      completed: skillInstallCompleted,
+      blocked: skillInstallBlocked,
+      failed: skillInstallFailed,
+      byStatus: skillInstallStatuses,
+    },
     artifactSignals: {
       created: artifactCreated,
       items: artifactItems,
     },
   };
+}
+
+function summarizeSkillInstallActivity(events: WorkflowUiEvent[]): {
+  attempted: number;
+  completed: number;
+  blocked: number;
+  failed: number;
+  latestSummary: string | null;
+} {
+  let attempted = 0;
+  let completed = 0;
+  let blocked = 0;
+  let failed = 0;
+  let latestSummary: string | null = null;
+  for (const event of events) {
+    if (!event.type.startsWith("system.skill_install_")) {
+      continue;
+    }
+    latestSummary = event.summary;
+    if (event.type === "system.skill_install_attempted") {
+      attempted += 1;
+    } else if (event.type === "system.skill_install_completed") {
+      completed += 1;
+    } else if (event.type === "system.skill_install_blocked") {
+      blocked += 1;
+    } else if (event.type === "system.skill_install_failed") {
+      failed += 1;
+    }
+  }
+  return { attempted, completed, blocked, failed, latestSummary };
+}
+
+function formatSkillInstallSummaryText(summary: ReturnType<typeof summarizeSkillInstallActivity>): string {
+  const total = summary.attempted + summary.completed + summary.blocked + summary.failed;
+  if (total === 0) {
+    return "";
+  }
+  const parts = [
+    `attempted ${summary.attempted}`,
+    `completed ${summary.completed}`,
+    `blocked ${summary.blocked}`,
+    `failed ${summary.failed}`,
+  ];
+  return summary.latestSummary
+    ? `${parts.join(" · ")}. Latest: ${truncate(summary.latestSummary, 120)}`
+    : parts.join(" · ");
 }
 
 function escapeHtml(text: string): string {
@@ -2140,6 +2550,21 @@ function formatTime(time: string): string {
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - 3) + "...";
+}
+
+function formatIntentRouteLabel(kind: string): string {
+  switch (kind) {
+    case "direct_answer":
+      return "Direct Answer";
+    case "research":
+      return "Research";
+    case "goal":
+      return "Goal";
+    case "coding":
+      return "Coding";
+    default:
+      return kind;
+  }
 }
 
 function renderDagPanel(
@@ -2277,6 +2702,14 @@ function renderWorkflowAnalysisPanel(
         <button type="button" class="analysis-chip" data-analysis-filter="verification_check" data-analysis-value="${escapeHtmlAttribute(`${entry.name}:${entry.status}`)}"><strong>${escapeHtml(entry.name)}</strong> · ${escapeHtml(entry.status)} · ${entry.count}</button>
       `).join("")}</div>`
     : "";
+  const skillInstallSection = runtimeAnalysis.skillInstallSignals.byStatus.length > 0
+    ? `<div class="subtle">Skill install lifecycle</div><div class="history-list" style="margin-bottom:12px">
+        <button type="button" class="analysis-chip skill-install-chip" data-analysis-filter="skill_install_group" data-analysis-value="skill_install"><strong>Install events</strong> · ${runtimeAnalysis.skillInstallSignals.attempted + runtimeAnalysis.skillInstallSignals.completed + runtimeAnalysis.skillInstallSignals.blocked + runtimeAnalysis.skillInstallSignals.failed}</button>
+        ${runtimeAnalysis.skillInstallSignals.byStatus.map((entry) => `
+          <button type="button" class="analysis-chip skill-install-chip" data-analysis-filter="skill_install" data-analysis-value="${escapeHtmlAttribute(entry.status)}"><strong>${escapeHtml(entry.status)}</strong> · ${entry.count}</button>
+        `).join("")}
+      </div>`
+    : "";
   const artifactSection = runtimeAnalysis.artifactSignals.created > 0
     ? `<div class="subtle">Artifact output</div><div class="history-list" style="margin-bottom:12px">
         <button type="button" class="analysis-chip" data-analysis-filter="artifact_group" data-analysis-value="artifact.created"><strong>Artifacts created</strong> · ${runtimeAnalysis.artifactSignals.created}</button>
@@ -2295,7 +2728,7 @@ function renderWorkflowAnalysisPanel(
         <button type="button" class="analysis-chip" data-analysis-filter="failure_category" data-analysis-value="${escapeHtmlAttribute(entry.label)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
       `).join("")}</div>`
     : `<div class="subtle" style="margin-top:12px">No issue signals recorded.</div>`;
-  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${verificationCheckSection}${artifactSection}${toolSection}${blockerSection}</div>`;
+  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${verificationCheckSection}${skillInstallSection}${artifactSection}${toolSection}${blockerSection}</div>`;
 }
 
 function assignTaskLevels(
