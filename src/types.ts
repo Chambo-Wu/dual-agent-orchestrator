@@ -53,6 +53,34 @@ export interface SearchConfig {
   providers: Record<string, Record<string, unknown>>;
 }
 
+export interface SkillsConfig {
+  enabled: boolean;
+  autoInstall: boolean;
+  builtinDir: string;
+  installDir: string;
+  allowSources: Array<"builtin" | "local_dir" | "git" | "package">;
+}
+
+export interface SkillEvolutionConfig {
+  enabled: boolean;
+  autoReflect: boolean;
+  autoPropose: boolean;
+  autoAudit: boolean;
+  autoValidate: boolean;
+  autoAccept: boolean;
+  runtimeReplayInAutoPipeline: boolean;
+  candidateDir: string;
+  riskTiering: {
+    enabled: boolean;
+    defaultTier: "low" | "medium" | "high";
+    automationCeilings: {
+      low: "auto_accept" | "auto_validate" | "auto_audit" | "auto_propose" | "auto_reflect";
+      medium: "auto_accept" | "auto_validate" | "auto_audit" | "auto_propose" | "auto_reflect";
+      high: "auto_accept" | "auto_validate" | "auto_audit" | "auto_propose" | "auto_reflect";
+    };
+  };
+}
+
 export interface SearchResult {
   title: string;
   url: string;
@@ -77,6 +105,8 @@ export interface OrchestratorConfig {
   agents?: Record<string, RegisteredAgent>;
   defaultExecutorAgent?: string;
   search?: SearchConfig;
+  skills: SkillsConfig;
+  skillEvolution: SkillEvolutionConfig;
   policy: {
     maxSteps: number;
     maxReplans: number;
@@ -134,6 +164,13 @@ export interface RuntimeProfile {
 
 export type TaskType = "fact_research" | "research" | "web_search" | "code" | "data_analysis" | "file_ops" | "shell_ops" | "general";
 export type ExecutionMode = "direct" | "orchestrated";
+export type IntentRouteKind = "direct_answer" | "research" | "goal" | "coding";
+
+export interface IntentRouteMetadata {
+  kind: IntentRouteKind;
+  reason: string;
+  source: "heuristic" | "planner";
+}
 
 export interface TaskComplexityAssessment {
   mode: ExecutionMode;
@@ -160,6 +197,32 @@ export interface PlannerExecutorRequest {
   instruction: string;
   allowed_tools: string[];
   expected_output: string;
+}
+
+export interface PlannerSkillDecision {
+  skill_id?: string;
+  skill_action?: "use_installed" | "install_then_use" | "skip_skill";
+  skill_reason?: string;
+}
+
+export interface SelectedSkillSummary {
+  skill_id?: string;
+  skill_action?: "use_installed" | "install_then_use" | "skip_skill";
+  skill_reason?: string;
+  skill_install_status?: "installed" | "install_required" | "skipped" | "unavailable";
+}
+
+export interface CandidateSkillSummary {
+  skillId: string;
+  score: number;
+  reasons: string[];
+  source: "rule" | "planner";
+}
+
+export interface IntentExecutionPlan {
+  intent: IntentRouteMetadata;
+  candidateSkills: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }
 
 export type WorkflowTaskKind =
@@ -246,6 +309,7 @@ export interface PlannerOutput {
     verdict: "not_applicable" | "approved" | "retry" | "blocked";
     notes: string;
   };
+  skill?: PlannerSkillDecision;
   workflow_plan?: WorkflowPlan;
   executor_request?: PlannerExecutorRequest;
   final_answer?: string;
@@ -325,6 +389,9 @@ export interface Plan {
   mode: JobMode;
   taskRunIds: readonly string[];
   summary?: string;
+  intentRoute?: IntentRouteMetadata;
+  candidateSkills?: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }
 
 export interface WorkflowGraphTaskNode {
@@ -378,6 +445,9 @@ export interface Job {
   memorySummary?: string;
   workflowGraph?: WorkflowGraph;
   verificationResult?: VerificationResult;
+  intentRoute?: IntentRouteMetadata;
+  candidateSkills?: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }
 
 export interface ToolDefinition {
@@ -435,6 +505,7 @@ export interface RunOptions {
   planId?: string;
   taskRunId?: string;
   onEvent?: OrchestratorEventCallback;
+  intentExecutionPlan?: IntentExecutionPlan;
   executorSelectionState?: {
     selectedCandidateIds?: string[];
     searchWarmupCompleted?: boolean;

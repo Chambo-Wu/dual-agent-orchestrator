@@ -229,9 +229,36 @@ function normalizePotentiallyInteractiveWebCmd(command: string): string {
 }
 
 function prefersPowerShell(command: string): boolean {
-  return /\b(ConvertFrom-Json|ConvertTo-Json|Invoke-WebRequest|Invoke-RestMethod|Select-Object|Out-File|Get-ChildItem|ForEach-Object)\b/i.test(command)
+  return /\b(Add-Content|ConvertFrom-Json|ConvertTo-Json|Copy-Item|Get-ChildItem|Get-Content|Invoke-RestMethod|Invoke-WebRequest|Join-Path|Measure-Object|Move-Item|New-Item|Out-File|Out-Null|Remove-Item|Select-Object|Select-String|Set-Content|Sort-Object|Start-Process|Test-Path|Where-Object|Write-Output)\b/i.test(command)
+    || /\[[\w.]+\]::/.test(command)
     || /\$\w+/.test(command)
     || /@\{/.test(command);
+}
+
+function commandFailed(result: ReturnType<typeof spawnSync>): boolean {
+  return Boolean(result.error) || result.status !== 0;
+}
+
+function runShellCommandWithFallback(command: string, cwd: string, timeoutMs: number) {
+  if (prefersPowerShell(command)) {
+    const powerShellResult = runPowerShellCommand(command, cwd, timeoutMs);
+    if (powerShellResult) {
+      return powerShellResult;
+    }
+    return runCmdCommand(command, cwd, timeoutMs);
+  }
+
+  const cmdResult = runCmdCommand(command, cwd, timeoutMs);
+  if (cmdResult && !commandFailed(cmdResult)) {
+    return cmdResult;
+  }
+
+  const powerShellResult = runPowerShellCommand(command, cwd, timeoutMs);
+  if (powerShellResult && !commandFailed(powerShellResult)) {
+    return powerShellResult;
+  }
+
+  return cmdResult ?? powerShellResult;
 }
 
 let artifactCounter = 0;
@@ -336,10 +363,15 @@ export function resetSearchCache(): void {
   searchCache.clear();
 }
 
-async function fetchUrlText(url: string, timeoutMs: number): Promise<{ ok: boolean; body: string; error?: string }> {
+async function fetchUrlText(url: string, timeoutMs: number, headers: Record<string, string> = {}): Promise<{ ok: boolean; body: string; error?: string }> {
   try {
     const resp = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        ...headers,
+      },
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "follow",
     });
@@ -481,17 +513,32 @@ function parseSearchResults(body: string, count: number): Array<{ title: string;
       const data = JSON.parse(trimmed);
       if (data.web?.results) {
         return (data.web.results || []).slice(0, count).map((r: any) => ({
-          title: r.title || "", url: r.url || "", snippet: r.description || "",
+          title: r.title || r.name || "", url: r.url || r.link || "", snippet: r.description || r.snippet || "",
+        }));
+      }
+      if (data.webPages?.value) {
+        return (data.webPages.value || []).slice(0, count).map((r: any) => ({
+          title: r.name || r.title || "", url: r.url || r.link || "", snippet: r.snippet || r.description || "",
+        }));
+      }
+      if (data.organic_results) {
+        return (data.organic_results || []).slice(0, count).map((r: any) => ({
+          title: r.title || r.name || "", url: r.link || r.url || "", snippet: r.snippet || r.description || "",
+        }));
+      }
+      if (data.items) {
+        return (data.items || []).slice(0, count).map((r: any) => ({
+          title: r.title || r.name || "", url: r.link || r.url || "", snippet: r.snippet || r.description || "",
         }));
       }
       if (Array.isArray(data)) {
         return data.slice(0, count).map((r: any) => ({
-          title: r.title || "", url: r.url || "", snippet: r.snippet || r.description || "",
+          title: r.title || r.name || "", url: r.url || r.link || "", snippet: r.snippet || r.description || "",
         }));
       }
       if (Array.isArray(data.results)) {
         return data.results.slice(0, count).map((r: any) => ({
-          title: r.title || "", url: r.url || "", snippet: r.snippet || r.description || "",
+          title: r.title || r.name || "", url: r.url || r.link || "", snippet: r.snippet || r.description || "",
         }));
       }
     } catch { /* fall through */ }
@@ -611,13 +658,27 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
 
   if (name === "list_files") {
     const path = safePath(args.path);
-    const entries = readdirSync(path, { withFileTypes: true }).map((entry) => entry.name);
-    return {
-      ok: true,
-      summary: `Listed ${entries.length} entries in ${path}`,
-      artifact: { type: "json", path, content_preview: JSON.stringify(entries).slice(0, 200) },
-      rawResult: JSON.stringify(entries, null, 2),
-    };
+    try {
+      const stat = statSync(path);
+      if (!stat.isDirectory()) {
+        return {
+          ok: false,
+          summary: `Failed to list: ${path}`,
+          rawResult: "",
+          error: `Path is not a readable directory: ${path}`,
+        };
+      }
+      const entries = readdirSync(path, { withFileTypes: true }).map((entry) => entry.name);
+      return {
+        ok: true,
+        summary: `Listed ${entries.length} entries in ${path}`,
+        artifact: { type: "json", path, content_preview: JSON.stringify(entries).slice(0, 200) },
+        rawResult: JSON.stringify(entries, null, 2),
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, summary: `Failed to list: ${path}`, rawResult: "", error: msg };
+    }
   }
 
   if (name === "shell_command") {
@@ -637,9 +698,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
       : DEFAULT_COMMAND_TIMEOUT_MS;
 
     const normalizedCommand = normalizePotentiallyInteractiveWebCmd(command);
-    const result = prefersPowerShell(normalizedCommand)
-      ? (runPowerShellCommand(normalizedCommand, cwd, timeoutMs) ?? runCmdCommand(normalizedCommand, cwd, timeoutMs))
-      : (runCmdCommand(normalizedCommand, cwd, timeoutMs) ?? runPowerShellCommand(normalizedCommand, cwd, timeoutMs));
+    const result = runShellCommandWithFallback(normalizedCommand, cwd, timeoutMs);
     if (!result) {
       return {
         ok: false,
@@ -720,7 +779,7 @@ export async function executeTool(name: string, args: Record<string, unknown>): 
         const provider = createSearchProvider(activeSearchConfig);
         const request = provider.buildRequest(query, count);
         const timeoutMs = activeSearchConfig.timeoutMs || DEFAULT_COMMAND_TIMEOUT_MS;
-        const fetchResult = await fetchUrlText(request.url, timeoutMs);
+        const fetchResult = await fetchUrlText(request.url, timeoutMs, request.headers);
         if (fetchResult.ok) {
           results = provider.parseResults(fetchResult.body, count);
           providerUsed = activeSearchConfig.provider;

@@ -1,0 +1,34 @@
+{
+  "id": "find.official_sources",
+  "version": "0.1.0",
+  "title": "Official Source Discovery",
+  "description": "Find official docs, repositories, release notes, and primary sources.",
+  "intents": ["research"],
+  "keywords": ["official", "latest", "release", "source", "documentation", "repo", "github", "announcement"],
+  "requiredTools": ["web_search", "url_fetch", "read_file"],
+  "install": {
+    "source": "builtin",
+    "location": "skills/find.official_sources"
+  },
+  "activation": {
+    "mode": "intent_match",
+    "priority": 100
+  },
+  "execution": {
+    "strategy": "workflow_template",
+    "templateId": "find_official_sources_v1"
+  },
+  "verification": {
+    "requiredArtifacts": ["search_results", "primary_source_summary"],
+    "successSignal": "at_least_two_non_empty_primary_sources",
+    "artifactLabels": {
+      "search_results": "search result evidence",
+      "primary_source_summary": "primary-source summaries"
+    },
+    "successSignalLabel": "capture at least two non-empty primary sources",
+    "remediation": {
+      "insufficient": "Fetch at least two primary sources and summarize why they are official, then rerun skill verification.",
+      "failed": "Review the fetched sources, replace weak or invalid evidence, and confirm the official-source summary before continuing."
+    }
+  }
+}

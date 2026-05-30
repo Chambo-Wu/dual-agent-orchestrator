@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { RUNTIME_ROOT } from "./paths.js";
 import type { TraceEvent, TraceEventType } from "./trace.js";
-import type { Task } from "./types.js";
+import type { IntentRouteMetadata, Task } from "./types.js";
 
 export interface DashboardData {
   runId: string;
@@ -12,6 +12,7 @@ export interface DashboardData {
   tasks: TaskSummary[];
   trace: readonly TraceEvent[];
   summary: { totalTasks: number; completed: number; failed: number; blocked: number; tools: number; loops: number; artifacts: number };
+  intentRoute?: IntentRouteMetadata;
 }
 
 export interface TaskSummary {
@@ -30,6 +31,7 @@ export function buildDashboardData(
   tasks: readonly Task[],
   traceEvents: readonly TraceEvent[],
   startedAt: string,
+  intentRoute?: IntentRouteMetadata,
 ): DashboardData {
   const now = new Date().toISOString();
   const taskSummaries: TaskSummary[] = tasks.map((t) => ({
@@ -53,6 +55,7 @@ export function buildDashboardData(
     completedAt: now,
     tasks: taskSummaries,
     trace: traceEvents,
+    intentRoute,
     summary: {
       totalTasks: tasks.length,
       completed: tasks.filter((t) => t.status === "completed").length,
@@ -103,6 +106,9 @@ export function renderDashboardHtml(data: DashboardData): string {
       <td>${e.tool ?? "-"}</td>
       <td>${e.duration ?? "-"}</td>
     </tr>`).join("\n");
+  const intentRouteHtml = data.intentRoute
+    ? `<div class="route-callout"><strong>Intent Route:</strong> ${escapeHtml(formatIntentRouteLabel(data.intentRoute.kind))} (${escapeHtml(data.intentRoute.source)})<br><strong>Route Reason:</strong> ${escapeHtml(data.intentRoute.reason)}</div>`
+    : "";
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Run Dashboard - ${data.runId}</title>
@@ -116,11 +122,13 @@ export function renderDashboardHtml(data: DashboardData): string {
   .summary-card { background: white; border-radius: 8px; padding: 15px 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
   .summary-card .label { font-size: 12px; color: #888; }
   .summary-card .value { font-size: 28px; font-weight: bold; }
+  .route-callout { background: white; border-left: 4px solid #2196f3; border-radius: 8px; padding: 12px 16px; margin: 14px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
 </style></head><body>
 <h1>Run Dashboard</h1>
 <p><strong>Goal:</strong> ${data.goal}</p>
 <p><strong>Run ID:</strong> ${data.runId}</p>
 <p><strong>Started:</strong> ${data.startedAt} &nbsp; <strong>Completed:</strong> ${data.completedAt}</p>
+${intentRouteHtml}
 
 <div class="summary">
   <div class="summary-card"><div class="label">Total Tasks</div><div class="value">${data.summary.totalTasks}</div></div>
@@ -141,6 +149,30 @@ ${tasksHtml}
 ${traceHtml}
 </table>
 </body></html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatIntentRouteLabel(kind: string): string {
+  switch (kind) {
+    case "direct_answer":
+      return "Direct Answer";
+    case "research":
+      return "Research";
+    case "goal":
+      return "Goal";
+    case "coding":
+      return "Coding";
+    default:
+      return kind;
+  }
 }
 
 export function exportDashboardHtml(data: DashboardData): string {

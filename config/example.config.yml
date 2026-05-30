@@ -117,3 +117,12 @@ policy:
 #     server_url: "http://127.0.0.1:3000"
 #     tool_name: "web_search"
 #     timeout_ms: 30000
+
+# Skill layer configuration (optional)
+# Builtin skills are available by default; local_dir enables loading custom manifests from install_dir.
+# skills:
+#   enabled: true
+#   auto_install: false
+#   builtin_dir: "skills"
+#   install_dir: "runtime/skills"
+#   allow_sources: ["builtin", "local_dir"]

@@ -1,0 +1,34 @@
+{
+  "id": "find.integration_points",
+  "version": "0.1.0",
+  "title": "Integration Point Discovery",
+  "description": "Identify integration boundaries such as routes, handlers, events, persistence layers, and UI consumption points.",
+  "intents": ["coding"],
+  "keywords": ["integration", "entrypoint", "entry point", "hook", "handler", "event", "api", "endpoint", "consumer", "producer", "wiring"],
+  "requiredTools": ["list_files", "read_file", "shell_command"],
+  "install": {
+    "source": "builtin",
+    "location": "skills/find.integration_points"
+  },
+  "activation": {
+    "mode": "intent_match",
+    "priority": 98
+  },
+  "execution": {
+    "strategy": "workflow_template",
+    "templateId": "find_integration_points_v1"
+  },
+  "verification": {
+    "requiredArtifacts": ["integration_hits", "call_path_excerpt"],
+    "successSignal": "at_least_one_relevant_integration_boundary",
+    "artifactLabels": {
+      "integration_hits": "integration boundary hits",
+      "call_path_excerpt": "call path excerpts"
+    },
+    "successSignalLabel": "trace at least one relevant integration boundary",
+    "remediation": {
+      "insufficient": "Trace integration hits and call path excerpts across the boundary, then rerun skill verification.",
+      "failed": "Review the traced integration paths and repair the missing or invalid boundary evidence before continuing."
+    }
+  }
+}

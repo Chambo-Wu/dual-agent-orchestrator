@@ -1,0 +1,34 @@
+{
+  "id": "find.workspace_files",
+  "version": "0.1.0",
+  "title": "Workspace File Discovery",
+  "description": "Locate relevant workspace files, schemas, configs, and neighboring assets before deeper analysis or edits.",
+  "intents": ["coding"],
+  "keywords": ["file", "files", "workspace", "schema", "config", "directory", "folder", ".json", ".yml", ".yaml", ".env"],
+  "requiredTools": ["list_files", "read_file", "shell_command"],
+  "install": {
+    "source": "builtin",
+    "location": "skills/find.workspace_files"
+  },
+  "activation": {
+    "mode": "intent_match",
+    "priority": 95
+  },
+  "execution": {
+    "strategy": "workflow_template",
+    "templateId": "find_workspace_files_v1"
+  },
+  "verification": {
+    "requiredArtifacts": ["file_hits", "config_excerpt"],
+    "successSignal": "at_least_one_relevant_workspace_target",
+    "artifactLabels": {
+      "file_hits": "relevant workspace file hits",
+      "config_excerpt": "config or schema excerpts"
+    },
+    "successSignalLabel": "locate at least one relevant workspace target",
+    "remediation": {
+      "insufficient": "Collect the relevant workspace file hits and config excerpts, then rerun skill verification.",
+      "failed": "Recheck the selected workspace files and confirm the config/schema evidence before continuing."
+    }
+  }
+}

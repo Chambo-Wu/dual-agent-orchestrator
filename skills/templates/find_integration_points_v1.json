@@ -1,0 +1,34 @@
+{
+  "id": "find_integration_points_v1",
+  "strategy": "integration_point_discovery",
+  "summary": "Identify the most relevant integration points, boundaries, and consumers for the user goal.",
+  "tasks": [
+    {
+      "id": "discover_boundaries",
+      "title": "Discover integration boundaries",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "List the most likely routes, handlers, modules, and boundary files related to the user goal.",
+      "allowed_tools": ["list_files", "shell_command"],
+      "depends_on": [],
+      "required": true
+    },
+    {
+      "id": "trace_connections",
+      "title": "Trace consuming and producing paths",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "Read the most relevant files and trace how data, events, or calls move across the integration boundary.",
+      "allowed_tools": ["read_file", "shell_command"],
+      "depends_on": ["discover_boundaries"],
+      "required": true
+    }
+  ],
+  "finish_when": {
+    "mode": "all_required_tasks_completed"
+  },
+  "replan_policy": {
+    "allow_runtime_replan": true,
+    "max_replans": 1
+  }
+}

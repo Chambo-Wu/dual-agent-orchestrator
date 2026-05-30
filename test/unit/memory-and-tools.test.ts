@@ -71,6 +71,37 @@ test("read_file rejects directory paths instead of reading them like files", asy
   rmSync(fixtureDir, { recursive: true, force: true });
 });
 
+test("list_files returns structured failure for missing or non-directory paths", async () => {
+  const missingResult = await executeTool("list_files", { path: "tmp-tool-missing-dir-test" });
+  assert.equal(missingResult.ok, false);
+  assert.equal(missingResult.summary.includes("Failed to list"), true);
+
+  const filePath = resolve(WORKSPACE_ROOT, "tmp-tool-list-file-test.txt");
+  rmSync(filePath, { force: true });
+  writeFileSync(filePath, "not a directory", "utf8");
+  try {
+    const fileResult = await executeTool("list_files", { path: "tmp-tool-list-file-test.txt" });
+    assert.equal(fileResult.ok, false);
+    assert.equal(fileResult.error?.includes("not a readable directory"), true);
+  } finally {
+    rmSync(filePath, { force: true });
+  }
+});
+
+test("shell_command routes common PowerShell cmdlets to PowerShell on Windows", { skip: process.platform !== "win32" }, async () => {
+  const fixtureDir = resolve(WORKSPACE_ROOT, "tmp-tool-powershell-shell-test");
+  rmSync(fixtureDir, { recursive: true, force: true });
+  try {
+    const result = await executeTool("shell_command", {
+      command: "New-Item -ItemType Directory -Force -Path tmp-tool-powershell-shell-test | Out-Null; Set-Content -Path tmp-tool-powershell-shell-test/out.txt -Value ok",
+    });
+    assert.equal(result.ok, true);
+    assert.equal(readFileSync(resolve(fixtureDir, "out.txt"), "utf8").trim(), "ok");
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
 test("extended tools reject invalid arguments predictably", async () => {
   resetSearchCache();
   const missingQuery = await executeTool("web_search", {});
@@ -96,6 +127,33 @@ test("web_search writes a real artifact path when results are returned", async (
     assert.equal(result.ok, true);
     assert.equal(Boolean(result.artifact?.path), true);
     assert.equal(result.artifact?.path?.includes("runtime"), true);
+  } finally {
+    if (originalTemplate === undefined) {
+      delete process.env.SEARCH_URL_TEMPLATE;
+    } else {
+      process.env.SEARCH_URL_TEMPLATE = originalTemplate;
+    }
+  }
+});
+
+test("web_search parses current Bing-style result blocks with useful snippets", async () => {
+  resetSearchCache();
+  const originalTemplate = process.env.SEARCH_URL_TEMPLATE;
+  const html = [
+    '<html><body><ol id="b_results">',
+    '<li class="b_algo"><h2><a target="_blank" href="https://example.com/report">Example Report</a></h2>',
+    '<div class="b_caption"><p>Independent benchmark evidence with enough context for a grounded answer.</p></div></li>',
+    '</ol></body></html>',
+  ].join("");
+  process.env.SEARCH_URL_TEMPLATE = `data:text/html,${encodeURIComponent(html)}`;
+
+  try {
+    const result = await executeTool("web_search", { query: "example benchmark", count: 1 });
+    assert.equal(result.ok, true);
+    const parsed = JSON.parse(result.rawResult) as Array<{ title: string; url: string; snippet: string }>;
+    assert.equal(parsed[0]?.title, "Example Report");
+    assert.equal(parsed[0]?.url, "https://example.com/report");
+    assert.equal(parsed[0]?.snippet.includes("benchmark evidence"), true);
   } finally {
     if (originalTemplate === undefined) {
       delete process.env.SEARCH_URL_TEMPLATE;

@@ -1,0 +1,34 @@
+{
+  "id": "find_code_symbol_v1",
+  "strategy": "code_symbol_discovery",
+  "summary": "Locate the most relevant repository symbols and entrypoints before editing.",
+  "tasks": [
+    {
+      "id": "discover_files",
+      "title": "List repository files",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "List relevant files and narrow down likely code entrypoints.",
+      "allowed_tools": ["list_files", "shell_command"],
+      "depends_on": [],
+      "required": true
+    },
+    {
+      "id": "inspect_symbols",
+      "title": "Inspect symbol hits",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "Search for the most relevant symbols, routes, functions, or classes and read the matching files.",
+      "allowed_tools": ["read_file", "shell_command"],
+      "depends_on": ["discover_files"],
+      "required": true
+    }
+  ],
+  "finish_when": {
+    "mode": "all_required_tasks_completed"
+  },
+  "replan_policy": {
+    "allow_runtime_replan": true,
+    "max_replans": 1
+  }
+}

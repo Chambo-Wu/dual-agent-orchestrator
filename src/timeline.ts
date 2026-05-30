@@ -200,6 +200,9 @@ export function renderTimelineHtml(
       latest_proposal_id?: string;
       latest_status?: string;
       latest_patch_summary?: string;
+      latest_change_summary?: string;
+      latest_rationale_summary?: string;
+      latest_changed_files?: string[];
       latest_created_at?: string;
       latest_decided_at?: string | null;
       statuses?: Record<string, number>;
@@ -344,7 +347,7 @@ export function renderTimelineHtml(
       ? `Reflection evidence: ${skillReflection.evidence.missingRequirements.join(" | ")}`
       : "";
   const skillEvolutionSummary = skillEvolution?.latest_status
-    ? `Skill evolution: ${skillEvolution.latest_status}${skillEvolution.latest_patch_summary ? ` - ${skillEvolution.latest_patch_summary}` : ""}`
+    ? `Skill evolution: ${skillEvolution.latest_status}${skillEvolution.latest_change_summary ? ` - ${skillEvolution.latest_change_summary}` : skillEvolution.latest_patch_summary ? ` - ${skillEvolution.latest_patch_summary}` : ""}${skillEvolution.latest_rationale_summary ? ` Why: ${skillEvolution.latest_rationale_summary}` : ""}`
     : "";
   const failureSummaryText = formatFailureSummaryDisplay(failureSummary);
   const skillInstallSummaryText = formatSkillInstallSummaryText(skillInstallSummary);
@@ -2271,6 +2274,9 @@ function renderEventCard(event: WorkflowUiEvent): string {
   const reflectionKind = typeof event.meta.reflection_kind === "string" ? event.meta.reflection_kind : "";
   const recommendedAction = typeof event.meta.recommended_action === "string" ? event.meta.recommended_action : "";
   const silentBypassSignal = event.meta.silent_bypass_signal === true;
+  const automationRiskTier = typeof event.meta.risk_tier === "string" ? event.meta.risk_tier : "";
+  const automationBlockedStage = typeof event.meta.blocked_stage === "string" ? event.meta.blocked_stage : "";
+  const automationCeiling = typeof event.meta.automation_ceiling === "string" ? event.meta.automation_ceiling : "";
   return `<div class="event-card agent-${event.agent} status-${event.status}${isSkillInstallEvent ? " event-skill-install" : ""}${isSkillReflectionEvent ? " event-skill-reflection" : ""}"${event.id ? ` data-event-id="${escapeHtmlAttribute(event.id)}"` : ""} data-event-type="${escapeHtmlAttribute(event.type)}"${event.taskRunId ? ` data-task-run-id="${escapeHtmlAttribute(event.taskRunId)}"` : ""}${artifactId ? ` data-artifact-id="${escapeHtmlAttribute(artifactId)}"` : ""}${artifactPath ? ` data-artifact-path="${escapeHtmlAttribute(artifactPath)}"` : ""}${artifactType ? ` data-artifact-type="${escapeHtmlAttribute(artifactType)}"` : ""}${relatedTaskRunId ? ` data-related-task-run-id="${escapeHtmlAttribute(relatedTaskRunId)}"` : ""}${eventTool ? ` data-event-tool="${escapeHtmlAttribute(eventTool)}"` : ""}${failureCategory ? ` data-failure-category="${escapeHtmlAttribute(failureCategory)}"` : ""}${verificationCheckName ? ` data-verification-check-name="${escapeHtmlAttribute(verificationCheckName)}"` : ""}${verificationCheckStatus ? ` data-verification-check-status="${escapeHtmlAttribute(verificationCheckStatus)}"` : ""}${skillInstallStatus ? ` data-skill-install-status="${escapeHtmlAttribute(skillInstallStatus)}"` : ""}${reflectionKind ? ` data-reflection-kind="${escapeHtmlAttribute(reflectionKind)}"` : ""}${recommendedAction ? ` data-recommended-action="${escapeHtmlAttribute(recommendedAction)}"` : ""}${silentBypassSignal ? ` data-silent-bypass-signal="true"` : ""}${isSkillInstallEvent ? ` data-skill-install-group="skill_install"` : ""}${relatedArtifactIds.length > 0 ? ` data-related-artifact-ids="${escapeHtmlAttribute(relatedArtifactIds.join(","))}"` : ""} onclick="this.classList.toggle('expanded')">
   <div class="event-header">
     <span class="event-title">${escapeHtml(event.title)}</span>
@@ -2288,6 +2294,9 @@ function renderEventCard(event: WorkflowUiEvent): string {
     ${reflectionKind ? `<span class="tag">${escapeHtml(reflectionKind)}</span>` : ""}
     ${recommendedAction ? `<span class="tag">${escapeHtml(recommendedAction)}</span>` : ""}
     ${silentBypassSignal ? `<span class="tag">silent bypass</span>` : ""}
+    ${automationRiskTier ? `<span class="tag">${escapeHtml(automationRiskTier)} risk</span>` : ""}
+    ${automationBlockedStage ? `<span class="tag">${escapeHtml(automationBlockedStage)}</span>` : ""}
+    ${automationCeiling ? `<span class="tag">ceiling ${escapeHtml(automationCeiling)}</span>` : ""}
     ${failureCategoryLabel ? `<span class="tag" title="${escapeHtmlAttribute(failureCategory)}">${escapeHtml(failureCategoryLabel)}</span>` : ""}
   </div>
   <pre class="event-meta">${escapeHtml(JSON.stringify(event.meta, null, 2))}</pre>

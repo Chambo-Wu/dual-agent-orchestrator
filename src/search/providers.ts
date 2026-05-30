@@ -13,6 +13,21 @@ function stripHtmlTags(html: string): string {
     .replace(/\s+/g, " ").trim();
 }
 
+function readMetaAttribute(tag: string, name: string): string {
+  const doubleQuoted = tag.match(new RegExp(`${name}="([^"]*)"`, "i"));
+  if (doubleQuoted?.[1]) return doubleQuoted[1];
+  const singleQuoted = tag.match(new RegExp(`${name}='([^']*)'`, "i"));
+  return singleQuoted?.[1] ?? "";
+}
+
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
 // Bing HTML Provider
 // ---------------------------------------------------------------------------
@@ -52,6 +67,7 @@ function cleanBingTitle(title: string, url: string): string {
 
 function parseBingHtml(html: string, count: number): SearchResult[] {
   const results: SearchResult[] = [];
+  const seen = new Set<string>();
   const bingPatterns = [
     new RegExp('<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?(?:<p[^>]*>([\\s\\S]*?)</p>|<span[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\\s\\S]*?)</span>)', "gi"),
     new RegExp('<li[^>]+class="b_algo"[^>]*>[\\s\\S]*?<a[^>]+href="(https?://[^"]+)"[^>]*>([\\s\\S]*?)</a>[\\s\\S]*?<div[^>]*class="[^"]*b_caption[^"]*"[^>]*>[\\s\\S]*?(?:<p[^>]*>([\\s\\S]*?)</p>|<span[^>]*>([\\s\\S]*?)</span>)', "gi"),
@@ -60,13 +76,49 @@ function parseBingHtml(html: string, count: number): SearchResult[] {
   for (const re of bingPatterns) {
     for (const m of html.matchAll(re)) {
       if (results.length >= count) break;
-      const url = m[1] || "";
+      const url = decodeHtmlAttribute(m[1] || "");
       const rawTitle = stripHtmlTags(m[2] || "");
       const snippet = stripHtmlTags(m[3] || m[4] || "");
       const title = cleanBingTitle(rawTitle, url);
-      if (url && title && url.startsWith("http")) results.push({ title, url, snippet });
+      if (url && title && url.startsWith("http") && !seen.has(url)) {
+        seen.add(url);
+        results.push({ title, url, snippet });
+      }
     }
     if (results.length > 0) return results;
+  }
+  const genericBlockRe = /<li[^>]+class=["'][^"']*b_algo[^"']*["'][^>]*>([\s\S]*?)<\/li>/gi;
+  for (const blockMatch of html.matchAll(genericBlockRe)) {
+    if (results.length >= count) break;
+    const block = blockMatch[1] ?? "";
+    const anchorMatch = block.match(/<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
+    if (!anchorMatch) continue;
+    const url = anchorMatch[1] ?? "";
+    if (!url || seen.has(url)) continue;
+    const rawTitle = stripHtmlTags(anchorMatch[2] ?? "");
+    const metaSnippet = [...block.matchAll(/<[^>]+class=["'][^"']*(?:b_caption|b_snippet|b_lineclamp)[^"']*["'][^>]*>([\s\S]*?)<\/[^>]+>/gi)]
+      .map((match) => stripHtmlTags(match[1] ?? ""))
+      .find((value) => value.length > 0) ?? "";
+    const paragraphSnippet = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1] ?? "";
+    const snippet = metaSnippet || stripHtmlTags(paragraphSnippet);
+    const title = cleanBingTitle(rawTitle, url);
+    if (title) {
+      seen.add(url);
+      results.push({ title, url, snippet });
+    }
+  }
+  if (results.length > 0) return results;
+
+  const genericAnchorRe = /<a\b([^>]*\bhref=["']https?:\/\/[^"']+["'][^>]*)>([\s\S]*?)<\/a>/gi;
+  for (const match of html.matchAll(genericAnchorRe)) {
+    if (results.length >= count) break;
+    const tag = match[1] ?? "";
+    const url = readMetaAttribute(tag, "href");
+    if (!url || seen.has(url)) continue;
+    const title = stripHtmlTags(match[2] ?? "");
+    if (title.length < 5) continue;
+    seen.add(url);
+    results.push({ title, url, snippet: "" });
   }
   return results;
 }

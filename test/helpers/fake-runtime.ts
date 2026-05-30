@@ -1,6 +1,9 @@
 import type { ChatMessage } from "../../src/providers/openai-compatible.js";
 import type { ModelConfig, ModelResponse, PlannerOutput, RoutePolicy, RunTaskResult, ExecutorOutput, OrchestratorConfig } from "../../src/types.js";
 import type { RuntimeDeps } from "../../src/runtime/deps.js";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 type ChatCall = {
   config: ModelConfig;
@@ -97,6 +100,7 @@ export function fakeRunTaskResult(overrides?: Partial<RunTaskResult>): RunTaskRe
 }
 
 export function buildMinimalConfig(): OrchestratorConfig {
+  const installDir = mkdtempSync(join(tmpdir(), "dao-skill-runtime-"));
   return {
     planner: {
       provider: "openai_compatible",
@@ -149,6 +153,31 @@ export function buildMinimalConfig(): OrchestratorConfig {
     modelRouting: {
       plannerCandidates: ["planner.default"],
       executorCandidates: ["executor.default"],
+    },
+    skills: {
+      enabled: true,
+      autoInstall: false,
+      builtinDir: "skills",
+      installDir,
+      allowSources: ["builtin", "local_dir"],
+    },
+    skillEvolution: {
+      enabled: false,
+      autoReflect: true,
+      autoPropose: false,
+      autoAudit: true,
+      autoValidate: false,
+      autoAccept: false,
+      candidateDir: "runtime/skill-evolution",
+      riskTiering: {
+        enabled: false,
+        defaultTier: "medium",
+        automationCeilings: {
+          low: "auto_accept",
+          medium: "auto_validate",
+          high: "auto_propose",
+        },
+      },
     },
     policy: {
       maxSteps: 4,

@@ -1,0 +1,34 @@
+{
+  "id": "find_workspace_files_v1",
+  "strategy": "workspace_file_discovery",
+  "summary": "Locate the most relevant workspace files, schemas, and adjacent configs before execution.",
+  "tasks": [
+    {
+      "id": "scan_workspace",
+      "title": "Scan workspace structure",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "List files and folders, then narrow down the most relevant workspace areas for the user goal.",
+      "allowed_tools": ["list_files", "shell_command"],
+      "depends_on": [],
+      "required": true
+    },
+    {
+      "id": "inspect_target_files",
+      "title": "Inspect candidate files",
+      "kind": "read",
+      "role": "worker",
+      "instruction": "Read the strongest candidate files, configs, schemas, or manifests and summarize why they matter.",
+      "allowed_tools": ["read_file", "shell_command"],
+      "depends_on": ["scan_workspace"],
+      "required": true
+    }
+  ],
+  "finish_when": {
+    "mode": "all_required_tasks_completed"
+  },
+  "replan_policy": {
+    "allow_runtime_replan": true,
+    "max_replans": 1
+  }
+}

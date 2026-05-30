@@ -42,6 +42,13 @@ export function createUiEvent(input: {
   taskRunId?: string;
   meta?: Record<string, unknown>;
 }): WorkflowUiEvent {
+  const meta = { ...(input.meta ?? {}) };
+  if (input.type === "planner.decision") {
+    const candidateSkills = Array.isArray(meta.candidate_skills) ? meta.candidate_skills : [];
+    if (!Array.isArray(meta.skill_match_candidates) && candidateSkills.length > 0) {
+      meta.skill_match_candidates = candidateSkills;
+    }
+  }
   return {
     id: `evt_${randomUUID().slice(0, 8)}`,
     jobId: input.jobId,
@@ -55,7 +62,7 @@ export function createUiEvent(input: {
     status: input.status,
     step: input.step,
     taskRunId: input.taskRunId,
-    meta: input.meta ?? {},
+    meta,
   };
 }
 
@@ -101,6 +108,13 @@ export function normalizeWorkflowEvent(
           reasoning_summary: internal.data.reasoning_summary ?? "",
           next_step: internal.data.next_step ?? "",
           verdict: internal.data.verdict ?? null,
+          candidate_skills: Array.isArray(internal.data.candidate_skills) ? internal.data.candidate_skills : [],
+          skill_match_candidates: Array.isArray(internal.data.candidate_skills) ? internal.data.candidate_skills : [],
+          selected_skill: asString(internal.data.skill_id),
+          skill_id: asString(internal.data.skill_id),
+          skill_action: asString(internal.data.skill_action),
+          skill_install_status: asString(internal.data.skill_install_status),
+          skill_reason: asString(internal.data.skill_reason),
           failure_category: classifyFailure({
             type: "planner.decision",
             status: asString(internal.data.status),
@@ -426,6 +440,100 @@ export function normalizeWorkflowEvent(
       });
     }
 
+    case "system.skill_install_attempted":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "decision",
+        type: "system.skill_install_attempted",
+        title: "Skill install attempted",
+        summary: formatSkillInstallSummary(internal.data, "attempted"),
+        status: "running",
+        step: internal.step,
+        meta: buildSkillInstallMeta(internal.data, null),
+      });
+
+    case "system.skill_install_completed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "result",
+        type: "system.skill_install_completed",
+        title: "Skill install completed",
+        summary: formatSkillInstallSummary(internal.data, "completed"),
+        status: "success",
+        step: internal.step,
+        meta: buildSkillInstallMeta(internal.data, null),
+      });
+
+    case "system.skill_install_blocked":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "retry",
+        type: "system.skill_install_blocked",
+        title: "Skill install blocked",
+        summary: formatSkillInstallSummary(internal.data, "blocked"),
+        status: "blocked",
+        step: internal.step,
+        meta: buildSkillInstallMeta(internal.data, classifyFailure({
+          type: "system.skill_install_blocked",
+          status: "blocked",
+          summary: formatSkillInstallSummary(internal.data, "blocked"),
+        })),
+      });
+
+    case "system.skill_install_failed":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "result",
+        type: "system.skill_install_failed",
+        title: "Skill install failed",
+        summary: formatSkillInstallSummary(internal.data, "failed"),
+        status: "failed",
+        step: internal.step,
+        meta: buildSkillInstallMeta(internal.data, classifyFailure({
+          type: "system.skill_install_failed",
+          status: "failed",
+          summary: formatSkillInstallSummary(internal.data, "failed"),
+        })),
+      });
+
+    case "system.skill_evolution_proposed":
+    case "system.skill_evolution_audit_passed":
+    case "system.skill_evolution_audit_failed":
+    case "system.skill_evolution_validation_passed":
+    case "system.skill_evolution_validation_failed":
+    case "system.skill_evolution_accepted":
+    case "system.skill_evolution_rejected":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: mapSkillEvolutionPhase(internal.type),
+        type: internal.type,
+        title: formatSkillEvolutionTitle(internal.type),
+        summary: formatSkillEvolutionSummary(internal.type, internal.data),
+        status: mapSkillEvolutionStatus(internal.type),
+        step: internal.step,
+        meta: buildSkillEvolutionMeta(internal.type, internal.data),
+      });
+
     case "system.verification_failed":
       return createUiEvent({
         jobId,
@@ -669,6 +777,121 @@ function formatToolStartSummary(data: Record<string, unknown>): string {
   }
   const argSummary = summarizeArguments(data.arguments);
   return argSummary ? `${tool}(${argSummary})` : tool;
+}
+
+function formatSkillInstallSummary(
+  data: Record<string, unknown>,
+  state: "attempted" | "completed" | "blocked" | "failed",
+): string {
+  const skillId = asString(data.skill_id) || "skill";
+  const reason = asString(data.install_reason);
+  if (state === "attempted") {
+    return `Attempting to install ${skillId}.`;
+  }
+  if (state === "completed") {
+    return reason ? `Installed ${skillId}. ${reason}` : `Installed ${skillId}.`;
+  }
+  if (state === "blocked") {
+    return reason ? `Install blocked for ${skillId}. ${reason}` : `Install blocked for ${skillId}.`;
+  }
+  return reason ? `Install failed for ${skillId}. ${reason}` : `Install failed for ${skillId}.`;
+}
+
+function buildSkillInstallMeta(data: Record<string, unknown>, failureCategory: string | null): Record<string, unknown> {
+  return {
+    skill_id: asString(data.skill_id),
+    skill_install_status: asString(data.install_status),
+    install_reason: asString(data.install_reason),
+    install_source: asString(data.install_source),
+    install_location: asString(data.install_location),
+    failure_category: failureCategory,
+  };
+}
+
+function formatSkillEvolutionTitle(type: string): string {
+  switch (type) {
+    case "system.skill_evolution_proposed":
+      return "Skill evolution proposed";
+    case "system.skill_evolution_audit_passed":
+      return "Skill evolution audit passed";
+    case "system.skill_evolution_audit_failed":
+      return "Skill evolution audit failed";
+    case "system.skill_evolution_validation_passed":
+      return "Skill evolution validation passed";
+    case "system.skill_evolution_validation_failed":
+      return "Skill evolution validation failed";
+    case "system.skill_evolution_accepted":
+      return "Skill evolution accepted";
+    case "system.skill_evolution_rejected":
+      return "Skill evolution rejected";
+    default:
+      return "Skill evolution updated";
+  }
+}
+
+function formatSkillEvolutionSummary(type: string, data: Record<string, unknown>): string {
+  const changeSummary = asString(data.change_summary);
+  const patchSummary = asString(data.patch_summary);
+  const rationaleSummary = asString(data.rationale_summary);
+  const proposalId = asString(data.proposal_id);
+  const summary = changeSummary || patchSummary || (proposalId ? `Proposal ${proposalId}` : "Skill evolution updated.");
+  const reason = asString(data.decision_reason);
+  const rationale = rationaleSummary || reason;
+  if ((type === "system.skill_evolution_accepted" || type === "system.skill_evolution_rejected") && rationale) {
+    return `${summary}. ${rationale}`;
+  }
+  return rationale && rationale !== summary ? `${summary}. ${rationale}` : summary;
+}
+
+function mapSkillEvolutionStatus(type: string): UiEventStatus {
+  switch (type) {
+    case "system.skill_evolution_audit_failed":
+    case "system.skill_evolution_validation_failed":
+    case "system.skill_evolution_rejected":
+      return "blocked";
+    case "system.skill_evolution_audit_passed":
+    case "system.skill_evolution_validation_passed":
+    case "system.skill_evolution_accepted":
+      return "success";
+    default:
+      return "running";
+  }
+}
+
+function mapSkillEvolutionPhase(type: string): UiEventPhase {
+  switch (type) {
+    case "system.skill_evolution_proposed":
+      return "decision";
+    case "system.skill_evolution_accepted":
+    case "system.skill_evolution_rejected":
+      return "final";
+    default:
+      return "result";
+  }
+}
+
+function buildSkillEvolutionMeta(type: string, data: Record<string, unknown>): Record<string, unknown> {
+  const summary = formatSkillEvolutionSummary(type, data);
+  const failed = type === "system.skill_evolution_audit_failed"
+    || type === "system.skill_evolution_validation_failed"
+    || type === "system.skill_evolution_rejected";
+  return {
+    skill_id: asString(data.skill_id),
+    reflection_id: asString(data.reflection_id),
+    proposal_id: asString(data.proposal_id),
+    proposal_status: asString(data.proposal_status),
+    patch_summary: asString(data.patch_summary),
+    audit_report_path: asString(data.audit_report_path),
+    validation_report_path: asString(data.validation_report_path),
+    decision_reason: asString(data.decision_reason),
+    failure_category: failed
+      ? classifyFailure({
+          type,
+          status: "blocked",
+          summary,
+        })
+      : null,
+  };
 }
 
 function formatWorkflowTaskSummary(data: Record<string, unknown>, state: "ready" | "assigned" | "awaiting_approval" | "completed" | "failed" | "skipped"): string {

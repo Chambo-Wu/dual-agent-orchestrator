@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatSchemaIssues, isPlainObject, parseSimpleYamlDocument, SchemaValidationError, type ValidationIssue } from "./config-format.js";
-import type { AgentLimits, AgentToolPolicy, ModelConfig, ModelRole, ModelRoutingConfig, OrchestratorConfig, RegisteredAgent, RegisteredModel, SearchConfig, SearchProviderType } from "./types.js";
+import type { AgentLimits, AgentToolPolicy, ModelConfig, ModelRole, ModelRoutingConfig, OrchestratorConfig, RegisteredAgent, RegisteredModel, SearchConfig, SearchProviderType, SkillEvolutionConfig, SkillsConfig } from "./types.js";
 
 let dotenvLoaded = false;
 
@@ -388,6 +388,9 @@ export function materializeRuntimeModelSelection(config: OrchestratorConfig): Or
 }
 
 const VALID_PROVIDER_TYPES: SearchProviderType[] = ["bing_html", "searxng", "serpapi", "bing_api", "google_cse", "url_template", "mcp"];
+const VALID_SKILL_SOURCES = ["builtin", "local_dir", "git", "package"] as const;
+const VALID_RISK_TIERS = ["low", "medium", "high"] as const;
+const VALID_AUTOMATION_CEILINGS = ["auto_reflect", "auto_propose", "auto_audit", "auto_validate", "auto_accept"] as const;
 
 function readOptionalString(section: Record<string, unknown>, path: string, key: string, fallback: string, issues: ValidationIssue[]): string {
   const value = section[key];
@@ -407,6 +410,25 @@ function readOptionalBoolean(section: Record<string, unknown>, path: string, key
     return fallback;
   }
   return value;
+}
+
+function readOptionalEnum<T extends string>(
+  section: Record<string, unknown>,
+  path: string,
+  key: string,
+  fallback: T,
+  allowed: readonly T[],
+  issues: ValidationIssue[],
+): T {
+  const value = section[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    pushIssue(issues, `${path}.${key}`, `must be one of: ${allowed.join(", ")}`);
+    return fallback;
+  }
+  return value as T;
 }
 
 function validateSearchSection(root: Record<string, unknown>, issues: ValidationIssue[]): SearchConfig | undefined {
@@ -438,12 +460,181 @@ function validateSearchSection(root: Record<string, unknown>, issues: Validation
     }
   }
 
+  const legacyProviderSection = section[provider];
+  if (isPlainObject(legacyProviderSection) && !providers[provider]) {
+    providers[provider] = legacyProviderSection as Record<string, unknown>;
+  }
+
+  if (provider === "bing_html" && !providers.bing_html) {
+    providers.bing_html = {};
+  }
+
   // Validate the active provider's sub-object exists
   if (provider !== "url_template" && !providers[provider]) {
     pushIssue(issues, `search.${provider}`, `provider is set to "${provider}" but the corresponding section is missing`);
   }
 
   return { provider, fallbackEnabled, apiKey, timeoutMs, providers };
+}
+
+function validateSkillsSection(root: Record<string, unknown>, issues: ValidationIssue[]): SkillsConfig {
+  const skillsRaw = root.skills;
+  if (skillsRaw === undefined) {
+    return {
+      enabled: true,
+      autoInstall: false,
+      builtinDir: "skills",
+      installDir: "runtime/skills",
+      allowSources: ["builtin", "local_dir"],
+    };
+  }
+  if (!isPlainObject(skillsRaw)) {
+    pushIssue(issues, "skills", "must be an object when provided");
+    return {
+      enabled: true,
+      autoInstall: false,
+      builtinDir: "skills",
+      installDir: "runtime/skills",
+      allowSources: ["builtin", "local_dir"],
+    };
+  }
+
+  const section = skillsRaw as Record<string, unknown>;
+  const enabled = readOptionalBoolean(section, "skills", "enabled", true, issues);
+  const autoInstall = readOptionalBoolean(section, "skills", "auto_install", false, issues);
+  const builtinDir = readOptionalString(section, "skills", "builtin_dir", "skills", issues);
+  const installDir = readOptionalString(section, "skills", "install_dir", "runtime/skills", issues);
+  const allowSourcesRaw = section.allow_sources;
+  let allowSources: SkillsConfig["allowSources"] = ["builtin", "local_dir"];
+  if (allowSourcesRaw !== undefined) {
+    if (!Array.isArray(allowSourcesRaw) || allowSourcesRaw.some((item) => typeof item !== "string" || !item.trim())) {
+      pushIssue(issues, "skills.allow_sources", "must be an array of non-empty strings");
+    } else {
+      const normalized = allowSourcesRaw.map((item) => item.trim()) as string[];
+      for (const source of normalized) {
+        if (!VALID_SKILL_SOURCES.includes(source as typeof VALID_SKILL_SOURCES[number])) {
+          pushIssue(issues, "skills.allow_sources", `unsupported skill source "${source}"`);
+        }
+      }
+      allowSources = normalized.filter((source): source is SkillsConfig["allowSources"][number] =>
+        VALID_SKILL_SOURCES.includes(source as typeof VALID_SKILL_SOURCES[number]));
+    }
+  }
+
+  if (autoInstall && !allowSources.includes("builtin") && !allowSources.includes("local_dir")) {
+    pushIssue(issues, "skills.auto_install", "requires at least one installable source in skills.allow_sources");
+  }
+
+  return {
+    enabled,
+    autoInstall,
+    builtinDir,
+    installDir,
+    allowSources,
+  };
+}
+
+function validateSkillEvolutionSection(root: Record<string, unknown>, issues: ValidationIssue[]): SkillEvolutionConfig {
+  const raw = root.skill_evolution;
+  if (raw === undefined) {
+    return {
+      enabled: false,
+      autoReflect: true,
+      autoPropose: false,
+      autoAudit: true,
+      autoValidate: false,
+      autoAccept: false,
+      runtimeReplayInAutoPipeline: false,
+      candidateDir: "runtime/skill-evolution",
+      riskTiering: {
+        enabled: false,
+        defaultTier: "medium",
+        automationCeilings: {
+          low: "auto_accept",
+          medium: "auto_validate",
+          high: "auto_propose",
+        },
+      },
+    };
+  }
+  if (!isPlainObject(raw)) {
+    pushIssue(issues, "skill_evolution", "must be an object when provided");
+    return {
+      enabled: false,
+      autoReflect: true,
+      autoPropose: false,
+      autoAudit: true,
+      autoValidate: false,
+      autoAccept: false,
+      runtimeReplayInAutoPipeline: false,
+      candidateDir: "runtime/skill-evolution",
+      riskTiering: {
+        enabled: false,
+        defaultTier: "medium",
+        automationCeilings: {
+          low: "auto_accept",
+          medium: "auto_validate",
+          high: "auto_propose",
+        },
+      },
+    };
+  }
+
+  const section = raw as Record<string, unknown>;
+  const riskTieringRaw = section.risk_tiering;
+  const riskTieringSection = isPlainObject(riskTieringRaw)
+    ? riskTieringRaw as Record<string, unknown>
+    : riskTieringRaw === undefined
+      ? {}
+      : (pushIssue(issues, "skill_evolution.risk_tiering", "must be an object when provided"), {});
+
+  return {
+    enabled: readOptionalBoolean(section, "skill_evolution", "enabled", false, issues),
+    autoReflect: readOptionalBoolean(section, "skill_evolution", "auto_reflect", true, issues),
+    autoPropose: readOptionalBoolean(section, "skill_evolution", "auto_propose", false, issues),
+    autoAudit: readOptionalBoolean(section, "skill_evolution", "auto_audit", true, issues),
+    autoValidate: readOptionalBoolean(section, "skill_evolution", "auto_validate", false, issues),
+    autoAccept: readOptionalBoolean(section, "skill_evolution", "auto_accept", false, issues),
+    runtimeReplayInAutoPipeline: readOptionalBoolean(section, "skill_evolution", "runtime_replay_in_auto_pipeline", false, issues),
+    candidateDir: readOptionalString(section, "skill_evolution", "candidate_dir", "runtime/skill-evolution", issues),
+    riskTiering: {
+      enabled: readOptionalBoolean(riskTieringSection, "skill_evolution.risk_tiering", "enabled", false, issues),
+      defaultTier: readOptionalEnum(
+        riskTieringSection,
+        "skill_evolution.risk_tiering",
+        "default_tier",
+        "medium",
+        VALID_RISK_TIERS,
+        issues,
+      ),
+      automationCeilings: {
+        low: readOptionalEnum(
+          riskTieringSection,
+          "skill_evolution.risk_tiering",
+          "low_ceiling",
+          "auto_accept",
+          VALID_AUTOMATION_CEILINGS,
+          issues,
+        ),
+        medium: readOptionalEnum(
+          riskTieringSection,
+          "skill_evolution.risk_tiering",
+          "medium_ceiling",
+          "auto_validate",
+          VALID_AUTOMATION_CEILINGS,
+          issues,
+        ),
+        high: readOptionalEnum(
+          riskTieringSection,
+          "skill_evolution.risk_tiering",
+          "high_ceiling",
+          "auto_propose",
+          VALID_AUTOMATION_CEILINGS,
+          issues,
+        ),
+      },
+    },
+  };
 }
 
 export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig {
@@ -468,6 +659,8 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
   }
 
   const search = validateSearchSection(root, issues);
+  const skills = validateSkillsSection(root, issues);
+  const skillEvolution = validateSkillEvolutionSection(root, issues);
   const agentConfig = validateAgentsSection(root, issues);
   const explicitModelRegistry = validateModelRegistrySection(root, issues);
   const modelRegistry: Record<string, RegisteredModel> = {
@@ -495,6 +688,8 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
     agents: agentConfig.agents,
     defaultExecutorAgent: agentConfig.defaultExecutorAgent,
     search,
+    skills,
+    skillEvolution,
     policy: {
       maxSteps: readOptionalNumber(policySection, "policy", "max_steps", 12, issues, { integer: true, min: 1 }),
       maxReplans: readOptionalNumber(policySection, "policy", "max_replans", 3, issues, { integer: true, min: 0 }),

@@ -6,6 +6,8 @@ import { __testables as orchestratorTestables } from "../../src/orchestrator.js"
 import { WORKSPACE_ROOT } from "../../src/paths.js";
 import type { ModelResponse } from "../../src/types.js";
 import { buildMinimalConfig, buildRoutePolicy, createFakeChatRunner, createFakeRuntimeDeps, modelResponseFromJson } from "../helpers/fake-runtime.js";
+import { getInstalledSkill } from "../../src/skill-registry.js";
+import { getInstalledSkillRecord, installSkillRecord } from "../../src/skill-installer.js";
 
 test("finalizeExecutorResult treats successful native tool calls as success even when assistant text is empty", () => {
   const executorResponse: ModelResponse = {
@@ -237,6 +239,28 @@ test("detectTaskType recognizes Chinese research prompts instead of falling back
   assert.equal(taskType, "research");
 });
 
+test("buildPlannerMessages includes matched skill candidates for coding prompts", () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Code task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+
+  const messages = orchestratorTestables.buildPlannerMessages(
+    config,
+    "Debug src/index.ts and find the route entrypoint before editing",
+    [],
+    0,
+    routePolicy,
+  );
+
+  const userMessage = messages.find((message) => message.role === "user");
+  const content = typeof userMessage?.content === "string" ? userMessage.content : "";
+  assert.equal(content.includes("Available skills:"), true);
+  assert.equal(content.includes("find.code_symbol"), true);
+});
+
 test("runPlannerStep records and degrades workflow plans during milestone A", async () => {
   const config = buildMinimalConfig();
   const routePolicy = buildRoutePolicy();
@@ -307,6 +331,467 @@ test("runPlannerStep records and degrades workflow plans during milestone A", as
       "workflow.planner.decision",
     ],
   );
+});
+
+test("runPlannerStep materializes builtin code skill into workflow plan", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Code task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "locate repository entrypoints",
+      audit: {
+        verdict: "approved",
+        notes: "Use builtin symbol discovery.",
+      },
+      skill: {
+        skill_id: "find.code_symbol",
+        skill_action: "use_installed",
+        skill_reason: "Need stable repository discovery before editing.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["list_files"],
+        expected_output: "Fallback discovery output.",
+      },
+    }),
+  ]);
+
+  try {
+    installSkillRecord(config, {
+      id: "find.code_symbol",
+      version: "0.1.0",
+      title: "Code Symbol Discovery",
+      description: "Locate relevant repository symbols, entrypoints, routes, and config definitions before editing.",
+      intents: ["coding"],
+      keywords: ["fix", "debug", "implement", "route", "function", "class", "module", "src", ".ts", ".js"],
+      requiredTools: ["list_files", "read_file", "shell_command"],
+      install: {
+        source: "builtin",
+        location: "skills/find.code_symbol",
+      },
+      activation: {
+        mode: "intent_match",
+        priority: 100,
+      },
+      execution: {
+        strategy: "workflow_template",
+        templateId: "find_code_symbol_v1",
+      },
+      verification: {
+        requiredArtifacts: ["symbol_hits", "file_excerpt"],
+        successSignal: "at_least_one_relevant_entrypoint",
+      },
+    });
+
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Debug src/index.ts and locate the route entrypoint",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+    );
+
+    assert.equal(result.skill?.skill_id, "find.code_symbol");
+    assert.equal(result.workflow_plan?.id, "find_code_symbol_v1");
+    assert.equal(result.workflow_plan?.strategy, "code_symbol_discovery+skill:find.code_symbol");
+    assert.equal(result.workflow_plan?.tasks.length, 3);
+    assert.equal(result.workflow_plan?.tasks[0]?.allowed_tools.includes("list_files"), true);
+    assert.equal(result.workflow_plan?.tasks[0]?.allowed_tools.includes("shell_command"), true);
+    assert.equal(result.workflow_plan?.tasks[1]?.allowed_tools.includes("read_file"), true);
+    assert.equal(result.workflow_plan?.tasks[2]?.kind, "verify");
+    assert.equal(result.workflow_plan?.tasks[2]?.constraints?.verifier_profile, "artifact");
+    assert.equal(result.workflow_plan?.tasks[2]?.constraints?.minimum_artifact_count, 2);
+    assert.equal(result.status, "need_executor");
+    assert.equal(result.audit.notes.includes("Skill workflow template applied"), true);
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
+test("runPlannerStep materializes builtin research skill into workflow plan", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "research",
+    plannerInstruction: "Research task.",
+    preferredTools: ["web_search", "url_fetch", "read_file"],
+    requireEvidenceBeforeFinal: true,
+  });
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "find official sources",
+      audit: {
+        verdict: "approved",
+        notes: "Use builtin official source discovery.",
+      },
+      skill: {
+        skill_id: "find.official_sources",
+        skill_action: "use_installed",
+        skill_reason: "Need primary sources before synthesis.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["web_search"],
+        expected_output: "Fallback source list.",
+      },
+    }),
+  ]);
+
+  try {
+    installSkillRecord(config, {
+      id: "find.official_sources",
+      version: "0.1.0",
+      title: "Official Source Discovery",
+      description: "Find official docs, repositories, release notes, and primary sources.",
+      intents: ["research"],
+      keywords: ["official", "latest", "release", "source", "documentation", "repo", "github", "announcement"],
+      requiredTools: ["web_search", "url_fetch", "read_file"],
+      install: {
+        source: "builtin",
+        location: "skills/find.official_sources",
+      },
+      activation: {
+        mode: "intent_match",
+        priority: 100,
+      },
+      execution: {
+        strategy: "workflow_template",
+        templateId: "find_official_sources_v1",
+      },
+      verification: {
+        requiredArtifacts: ["search_results", "primary_source_summary"],
+        successSignal: "at_least_two_non_empty_primary_sources",
+      },
+    });
+
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Find the latest official TypeScript release notes and documentation",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+    );
+
+    assert.equal(result.skill?.skill_id, "find.official_sources");
+    assert.equal(result.workflow_plan?.id, "find_official_sources_v1");
+    assert.equal(result.workflow_plan?.strategy, "official_source_discovery+skill:find.official_sources");
+    assert.equal(result.workflow_plan?.tasks.at(-1)?.kind, "verify");
+    assert.equal(result.workflow_plan?.tasks.at(-1)?.constraints?.minimum_artifact_count, 2);
+    assert.equal(result.status, "need_executor");
+    assert.equal(result.audit.notes.includes("Skill workflow template applied"), true);
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
+test("runPlannerStep materializes builtin workspace file skill into workflow plan", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Workspace file task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "find workspace files",
+      audit: {
+        verdict: "approved",
+        notes: "Use builtin workspace file discovery.",
+      },
+      skill: {
+        skill_id: "find.workspace_files",
+        skill_action: "use_installed",
+        skill_reason: "Need to locate concrete workspace config and schema files first.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["list_files"],
+        expected_output: "Fallback workspace discovery output.",
+      },
+    }),
+  ]);
+
+  try {
+    installSkillRecord(config, {
+      id: "find.workspace_files",
+      version: "0.1.0",
+      title: "Workspace File Discovery",
+      description: "Locate relevant workspace files, schemas, configs, and neighboring assets before deeper analysis or edits.",
+      intents: ["coding"],
+      keywords: ["file", "files", "workspace", "schema", "config", "directory", "folder", ".json", ".yml", ".yaml", ".env"],
+      requiredTools: ["list_files", "read_file", "shell_command"],
+      install: {
+        source: "builtin",
+        location: "skills/find.workspace_files",
+      },
+      activation: {
+        mode: "intent_match",
+        priority: 95,
+      },
+      execution: {
+        strategy: "workflow_template",
+        templateId: "find_workspace_files_v1",
+      },
+      verification: {
+        requiredArtifacts: ["file_hits", "config_excerpt"],
+        successSignal: "at_least_one_relevant_workspace_target",
+      },
+    });
+
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Find the relevant config files and schema files in this workspace",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+    );
+
+    assert.equal(result.skill?.skill_id, "find.workspace_files");
+    assert.equal(result.workflow_plan?.id, "find_workspace_files_v1");
+    assert.equal(result.status, "need_executor");
+    assert.equal(result.audit.notes.includes("Skill workflow template applied"), true);
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
+test("runPlannerStep materializes builtin integration point skill into workflow plan", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Integration tracing task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "find integration points",
+      audit: {
+        verdict: "approved",
+        notes: "Use builtin integration point discovery.",
+      },
+      skill: {
+        skill_id: "find.integration_points",
+        skill_action: "use_installed",
+        skill_reason: "Need to trace handlers, events, and entry points before changing behavior.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["list_files"],
+        expected_output: "Fallback integration discovery output.",
+      },
+    }),
+  ]);
+
+  try {
+    installSkillRecord(config, {
+      id: "find.integration_points",
+      version: "0.1.0",
+      title: "Integration Point Discovery",
+      description: "Identify integration boundaries such as routes, handlers, events, persistence layers, and UI consumption points.",
+      intents: ["coding"],
+      keywords: ["integration", "entrypoint", "entry point", "hook", "handler", "event", "api", "endpoint", "consumer", "producer", "wiring"],
+      requiredTools: ["list_files", "read_file", "shell_command"],
+      install: {
+        source: "builtin",
+        location: "skills/find.integration_points",
+      },
+      activation: {
+        mode: "intent_match",
+        priority: 98,
+      },
+      execution: {
+        strategy: "workflow_template",
+        templateId: "find_integration_points_v1",
+      },
+      verification: {
+        requiredArtifacts: ["integration_hits", "call_path_excerpt"],
+        successSignal: "at_least_one_relevant_integration_boundary",
+      },
+    });
+
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Find the API handlers, event wiring, and integration entry points for this feature",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+    );
+
+    assert.equal(result.skill?.skill_id, "find.integration_points");
+    assert.equal(result.workflow_plan?.id, "find_integration_points_v1");
+    assert.equal(result.status, "need_executor");
+    assert.equal(result.audit.notes.includes("Skill workflow template applied"), true);
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
+test("runPlannerStep does not auto-install builtin skill when skills.auto_install is disabled", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Code task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "locate repository entrypoints",
+      audit: {
+        verdict: "approved",
+        notes: "Install then use builtin symbol discovery.",
+      },
+      skill: {
+        skill_id: "find.code_symbol",
+        skill_action: "install_then_use",
+        skill_reason: "Need stable repository discovery before editing.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["list_files"],
+        expected_output: "Fallback discovery output.",
+      },
+    }),
+  ]);
+
+  try {
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Debug src/index.ts and locate the route entrypoint",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+      {
+        onEvent: (event) => {
+          events.push({ type: event.type, data: event.data });
+        },
+      },
+    );
+
+    assert.equal(result.skill?.skill_id, "find.code_symbol");
+    assert.equal(result.workflow_plan, undefined);
+    assert.equal(result.audit.verdict, "retry");
+    assert.equal(result.audit.notes.includes("skills.auto_install=true"), true);
+    assert.equal(getInstalledSkillRecord(config, "find.code_symbol"), null);
+    assert.deepEqual(
+      events.map((event) => event.type),
+      [
+        "workflow.step.start",
+        "system.skill_install_attempted",
+        "system.skill_install_blocked",
+        "workflow.planner.decision",
+      ],
+    );
+    assert.equal(events[1]?.data.skill_id, "find.code_symbol");
+    assert.equal(events[2]?.data.install_status, "blocked");
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
+test("runPlannerStep auto-installs builtin skill when skills.auto_install is enabled", async () => {
+  const config = buildMinimalConfig();
+  config.skills.autoInstall = true;
+  const routePolicy = buildRoutePolicy({
+    type: "code",
+    plannerInstruction: "Code task.",
+    preferredTools: ["list_files", "read_file", "shell_command"],
+  });
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const fakeChat = createFakeChatRunner([
+    modelResponseFromJson({
+      status: "need_executor",
+      step: "locate repository entrypoints",
+      audit: {
+        verdict: "approved",
+        notes: "Install then use builtin symbol discovery.",
+      },
+      skill: {
+        skill_id: "find.code_symbol",
+        skill_action: "install_then_use",
+        skill_reason: "Need stable repository discovery before editing.",
+      },
+      executor_request: {
+        instruction: "Fallback if workflow cannot run.",
+        allowed_tools: ["list_files"],
+        expected_output: "Fallback discovery output.",
+      },
+    }),
+  ]);
+
+  try {
+    const result = await orchestratorTestables.runPlannerStep(
+      config,
+      "Debug src/index.ts and locate the route entrypoint",
+      [],
+      0,
+      routePolicy,
+      1,
+      undefined,
+      createFakeRuntimeDeps({
+        runChatCompletionDetailed: fakeChat.runner,
+      }),
+      {
+        onEvent: (event) => {
+          events.push({ type: event.type, data: event.data });
+        },
+      },
+    );
+
+    assert.equal(result.skill?.skill_id, "find.code_symbol");
+    assert.equal(result.workflow_plan?.id, "find_code_symbol_v1");
+    assert.equal(result.audit.notes.includes("Skill workflow template applied"), true);
+    assert.notEqual(getInstalledSkill("find.code_symbol", config), null);
+    assert.notEqual(getInstalledSkillRecord(config, "find.code_symbol"), null);
+    assert.deepEqual(
+      events.slice(0, 3).map((event) => event.type),
+      [
+        "workflow.step.start",
+        "system.skill_install_attempted",
+        "system.skill_install_completed",
+      ],
+    );
+    assert.equal(events.some((event) => event.type === "workflow.plan.created"), true);
+    assert.equal(events.some((event) => event.type === "workflow.plan.validated"), true);
+    assert.equal(events.at(-1)?.type, "workflow.planner.decision");
+    assert.equal(events[1]?.data.skill_id, "find.code_symbol");
+    assert.equal(events[2]?.data.install_status, "installed");
+  } finally {
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
 });
 
 test("runPlannerStep scopes research readback requests to current-run artifact paths", async () => {

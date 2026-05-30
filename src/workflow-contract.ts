@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Artifact, ExecutorArtifact, ExecutorOutput, Job, JobMode, JobStatus, Plan, TaskRun, TaskRunStatus, VerificationResult, WorkflowGraph } from "./types.js";
+import type { Artifact, CandidateSkillSummary, ExecutorArtifact, ExecutorOutput, IntentRouteMetadata, Job, JobMode, JobStatus, Plan, SelectedSkillSummary, TaskRun, TaskRunStatus, VerificationResult, WorkflowGraph } from "./types.js";
 
 function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
@@ -100,6 +100,9 @@ export function createPlanRecord(params: {
   mode: JobMode;
   taskRunIds: readonly string[];
   summary?: string;
+  intentRoute?: IntentRouteMetadata;
+  candidateSkills?: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }): Plan {
   return {
     id: params.id ?? createId("plan"),
@@ -107,6 +110,9 @@ export function createPlanRecord(params: {
     mode: params.mode,
     taskRunIds: [...params.taskRunIds],
     summary: params.summary,
+    intentRoute: params.intentRoute,
+    candidateSkills: params.candidateSkills ? [...params.candidateSkills] : undefined,
+    selectedSkill: params.selectedSkill,
   };
 }
 
@@ -123,6 +129,9 @@ export function createJobRecord(params: {
   memorySummary?: string;
   workflowGraph?: WorkflowGraph;
   verificationResult?: VerificationResult;
+  intentRoute?: IntentRouteMetadata;
+  candidateSkills?: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }): Job {
   return {
     id: params.id ?? createId("job"),
@@ -137,6 +146,9 @@ export function createJobRecord(params: {
     memorySummary: params.memorySummary,
     workflowGraph: params.workflowGraph,
     verificationResult: params.verificationResult,
+    intentRoute: params.intentRoute,
+    candidateSkills: params.candidateSkills ? [...params.candidateSkills] : undefined,
+    selectedSkill: params.selectedSkill,
   };
 }
 
@@ -153,6 +165,9 @@ export function buildSingleTaskContract(params: {
   verified: boolean;
   output: string;
   executorHistory: readonly ExecutorOutput[];
+  intentRoute?: IntentRouteMetadata;
+  candidateSkills?: CandidateSkillSummary[];
+  selectedSkill?: SelectedSkillSummary;
 }): { job: Job; plan: Plan; taskRuns: TaskRun[]; artifacts: Artifact[] } {
   const taskRunId = params.taskRunId ?? createId("taskrun");
   const artifacts = collectArtifactsFromExecutorHistory(params.executorHistory, taskRunId);
@@ -174,6 +189,9 @@ export function buildSingleTaskContract(params: {
     mode: params.mode ?? "task",
     taskRunIds: [taskRun.id],
     summary: "Single-task orchestration result.",
+    intentRoute: params.intentRoute,
+    candidateSkills: params.candidateSkills,
+    selectedSkill: params.selectedSkill,
   });
   const job = createJobRecord({
     id: params.jobId,
@@ -185,6 +203,9 @@ export function buildSingleTaskContract(params: {
     plan,
     taskRuns: [taskRun],
     artifacts,
+    intentRoute: params.intentRoute,
+    candidateSkills: params.candidateSkills,
+    selectedSkill: params.selectedSkill,
   });
 
   return {

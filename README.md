@@ -12,17 +12,22 @@ Chinese documentation: [Readme-CN.md](./Readme-CN.md)
 
 Additional project planning docs:
 
-- [Roadmap And Implementation Checklist](./docs/%E8%B7%AF%E7%BA%BF%E5%9B%BE-%E5%88%86%E9%98%B6%E6%AE%B5%E6%8C%81%E7%BB%AD%E6%8E%A8%E8%BF%9B%E4%B8%8E%E5%AE%9E%E6%96%BD%E6%B8%85%E5%8D%95-20260526.md)
+- [Docs Navigation](./docs/文档索引-导航页-20260529.md)
+- [Project Milestones](./docs/里程碑-项目主要功能实现-20260530.md)
+- [Current Goal Plan](./docs/Goal任务-待完成路线分步实施计划-20260529.md)
+- [Skill Evolution Implementation Checklist](./docs/执行清单-Skill自进化集成任务拆解-20260529.md)
 - [Frontend Recovery Status And CTA Contract](./docs/%E5%89%8D%E7%AB%AF%E6%81%A2%E5%A4%8D%E7%8A%B6%E6%80%81%E4%B8%8ECTA%E5%AF%B9%E6%8E%A5-20260527.md)
 
 ## Overview
 
-The runtime is built around two model roles:
+The runtime started from two core model roles and now supports broader multi-role collaboration:
 
 - `planner`: the stronger model that understands the goal, breaks work into steps, audits progress, decides retries, and produces final answers
 - `executor`: the cheaper or more local model that performs deterministic tool work such as file I/O, shell commands, search, and URL fetching
+- `verifier`: a verification role that checks whether outputs are real, sufficient, and policy-compliant
+- `team agents`: additional role-scoped agents used by team mode for decomposition, execution, review, and synthesis
 
-By default, those roles are configured as one `planner` and one `executor`. The runtime now also supports a compatible multi-model extension:
+By default, the simplest deployment still uses one `planner` and one `executor`. The runtime now also supports a compatible multi-model and multi-role extension:
 
 - keep the legacy top-level `planner` and `executor` fields
 - optionally register additional models under `models`
@@ -34,6 +39,7 @@ The current implementation supports both:
 
 - direct chat-style use through `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`
 - first-class jobs through `/v1/jobs`
+- multi-agent team execution with role-aware routing, approval gates, verifier participation, and resumable control-plane workflows
 
 ## Current Status
 
@@ -42,7 +48,7 @@ This is now a working orchestration service rather than a CLI skeleton. The curr
 - OpenAI-compatible and Anthropic-style chat endpoints
 - async job creation with persistent job records
 - task-mode and team-mode job execution
-- planner/executor iteration history, task runs, artifacts, and verification results
+- planner/executor/verifier and team-mode execution history, task runs, artifacts, and verification results
 - realtime workflow event streaming over SSE
 - workflow-plan parsing, validation, and runtime execution
 - runtime DAG summaries with active and superseded workflow lanes
@@ -54,6 +60,26 @@ This is now a working orchestration service rather than a CLI skeleton. The curr
 - protocol compatibility guards for OpenAI-style and Anthropic-style clients
 - file-write validation so the system cannot claim a report was saved unless `write_file` actually succeeded
 - lazy multi-model executor warmup for retrieval-heavy steps, so the first real search/fetch request can double as candidate admission
+
+### Skill Evolution Maturity
+
+The skill-evolution path is now partially productized rather than just a design note.
+
+- shipped: skill-aware outcome summaries, reflection records, proposal/audit/validate/accept-reject APIs, timeline/dashboard observability, and a first-pass auto pipeline driven by config flags
+- shipped: event and replay coverage for skill reflection and skill-evolution lifecycle updates
+- shipped: deployment validation now has deterministic isolated manifest replay, candidate runtime workflow materialization, manual runtime replay validation, and an opt-in automatic validation path via `skill_evolution.runtime_replay_in_auto_pipeline`
+- v1 heuristic only: auto-generated proposals currently produce minimal safe candidate edits instead of deep skill rewrites
+- not yet mature for broad autonomous rollout: automatic accept remains guarded by config, risk tiering, dynamic risk signals, stability checks, and validation readiness
+
+## Milestones
+
+| Date | Milestone | Main Functionality Implemented |
+| --- | --- | --- |
+| 2026-05-26 | Workflow control-plane stabilization | Job dashboard/timeline recovery docs, resumable event streams, phase-3 operational checklists, and workflow observability conventions. |
+| 2026-05-27 | Frontend recovery and CTA contract | Recovery-state semantics, retry/resume/cancel CTA behavior, stream replay expectations, and frontend-facing workflow status contracts. |
+| 2026-05-28 | Goal Mode and skill foundation planning | Goal-mode execution planning, task decomposition direction, skill-aware planner/install design consolidation, and older task cleanup. |
+| 2026-05-29 | Skill Evolution v1 control plane | Outcome capture, reflection records, proposal generation, auditor gate, deployment validation, decision/rollback records, Ops summaries, SKILL.md structure governance, and dynamic risk foundations. |
+| 2026-05-30 | Runtime replay validation checkpoint | Deterministic isolated manifest replay, replay job events, candidate workflow materialization, manual `stage=executed` validation reports, opt-in auto-pipeline runtime replay, and updated readiness/auto-accept gates. |
 
 ## Terminology
 

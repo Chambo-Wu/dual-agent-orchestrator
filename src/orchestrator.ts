@@ -18,6 +18,9 @@ import { buildRuntimeProfile } from "./runtime/profile.js";
 import { buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, validateWorkflowPlan, assessWorkflowExecutionSupport } from "./workflow-plan.js";
 import { runWorkflowPlan } from "./workflow-runtime.js";
 import { getExecutorDecisionText, getExecutorDisplaySummary, getPlannerDecisionText } from "./output-contract.js";
+import { listBuiltinSkills, matchSkills } from "./skill-registry.js";
+import type { PlannerSkillDecision } from "./types.js";
+import { applySkillWorkflow } from "./skill-runtime.js";
 
 export class PlannerUnavailableError extends Error {
   readonly causeError?: Error;
@@ -441,6 +444,31 @@ function parsePlannerAudit(
   };
 }
 
+function parsePlannerSkillDecision(value: unknown): PlannerSkillDecision | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const skill_id = typeof value.skill_id === "string" && value.skill_id.trim().length > 0
+    ? value.skill_id.trim()
+    : undefined;
+  const skill_action = value.skill_action === "use_installed"
+    || value.skill_action === "install_then_use"
+    || value.skill_action === "skip_skill"
+    ? value.skill_action
+    : undefined;
+  const skill_reason = typeof value.skill_reason === "string" && value.skill_reason.trim().length > 0
+    ? value.skill_reason.trim()
+    : undefined;
+  if (!skill_id && !skill_action && !skill_reason) {
+    return undefined;
+  }
+  return {
+    skill_id,
+    skill_action,
+    skill_reason,
+  };
+}
+
 function parsePlannerOutputRecord(
   userGoal: string,
   parsed: Record<string, unknown>,
@@ -452,6 +480,7 @@ function parsePlannerOutputRecord(
     reasoning_summary: typeof parsed.step === "string" ? parsed.step : "",
     next_step: typeof parsed.step === "string" ? parsed.step : "",
     audit: parsePlannerAudit(parsed.audit, hasExecutorHistory),
+    skill: parsePlannerSkillDecision(parsed.skill),
     workflow_plan: parseWorkflowPlan(parsed.workflow_plan),
     executor_request: parsePlannerExecutorRequest(parsed.executor_request),
     final_answer: typeof parsed.answer === "string" ? parsed.answer : undefined,
@@ -1659,6 +1688,9 @@ function finalizeRunTaskResult(params: {
     verified: params.verified,
     output: params.output,
     executorHistory: params.executorHistory,
+    intentRoute: params.options?.intentExecutionPlan?.intent,
+    candidateSkills: params.options?.intentExecutionPlan?.candidateSkills,
+    selectedSkill: params.options?.intentExecutionPlan?.selectedSkill,
   });
   return {
     status: params.status,
@@ -1977,7 +2009,23 @@ async function runPlannerStep(
     rankingArtifactPath,
     requestedOutputPath,
   );
-  const normalizedPlanner = applyWorkflowMilestoneAFallback(fullyScopedPlanner, stepNumber, logger, options);
+  const skillWorkflowResult = applySkillWorkflow(config, userGoal, fullyScopedPlanner);
+  for (const installEvent of skillWorkflowResult.installEvents) {
+    options?.onEvent?.({
+      type: installEvent.type,
+      step: stepNumber,
+      data: installEvent.data,
+    });
+  }
+  const normalizedPlanner = applyWorkflowMilestoneAFallback(skillWorkflowResult.planner, stepNumber, logger, options);
+  const plannerIntentKind = routePolicy.type === "code"
+    ? "coding"
+    : routePolicy.type === "research" || routePolicy.type === "fact_research" || routePolicy.type === "web_search"
+      ? "research"
+      : routePolicy.type === "data_analysis"
+        ? "research"
+        : "coding";
+  const plannerSkillCandidates = options?.intentExecutionPlan?.candidateSkills ?? matchSkills(userGoal, plannerIntentKind);
 
   logger?.log("planner.response.parsed", { step: stepNumber, parsed: normalizedPlanner });
   options?.onEvent?.({
@@ -1989,6 +2037,19 @@ async function runPlannerStep(
       next_step: normalizedPlanner.next_step,
       decision_text: getPlannerDecisionText(normalizedPlanner),
       verdict: normalizedPlanner.audit?.verdict,
+      candidate_skills: plannerSkillCandidates,
+      skill_id: normalizedPlanner.skill?.skill_id,
+      skill_action: normalizedPlanner.skill?.skill_action,
+      skill_install_status: normalizedPlanner.skill?.skill_action === "use_installed"
+        ? "installed"
+        : normalizedPlanner.skill?.skill_action === "install_then_use"
+          ? "install_required"
+          : normalizedPlanner.skill?.skill_action === "skip_skill"
+            ? "skipped"
+            : normalizedPlanner.skill?.skill_id
+              ? "unavailable"
+              : undefined,
+      skill_reason: normalizedPlanner.skill?.skill_reason,
       workflow_id: normalizedPlanner.workflow_plan?.id,
       workflow_task_count: normalizedPlanner.workflow_plan?.tasks.length ?? 0,
     },
@@ -2054,7 +2115,19 @@ function buildPlannerHistoryText(config: OrchestratorConfig, executorHistory: Ex
   );
   const poorSearchCount = recentSearchSteps.filter((item) => {
     const previews = item.artifacts.map((a) => a.content_preview ?? "").join(" ");
-    return previews.length < 150 || /(登录|注册|首页|navigation|sign\s*in)/i.test(previews);
+    const hasParsedSearchResults = (() => {
+      try {
+        const parsed = JSON.parse(item.raw_result) as unknown;
+        return Array.isArray(parsed)
+          && parsed.some((entry) =>
+            isRecord(entry)
+            && isNonEmptyString(entry.title)
+            && isNonEmptyString(entry.url));
+      } catch {
+        return false;
+      }
+    })();
+    return !hasParsedSearchResults && (previews.length < 150 || /(登录|注册|首页|navigation|sign\s*in)/i.test(previews));
   }).length;
   if (recentSearchSteps.length >= 2 && poorSearchCount >= 2) {
     historyLines.push("⚠ SEARCH QUALITY WARNING: The last search results appear irrelevant or low-quality. Consider changing the search query significantly, or skip search and use your own knowledge instead.");
@@ -2082,6 +2155,20 @@ function buildPlannerMessages(
     `Completion checklist: ${routePolicy.completionChecklist.join(" | ") || "none"}`,
     `Fallback rule: ${routePolicy.fallbackRule}`,
   ].join("\n");
+  const inferredIntent = routePolicy.type === "code"
+    ? "coding"
+    : routePolicy.type === "research" || routePolicy.type === "fact_research" || routePolicy.type === "web_search"
+      ? "research"
+      : routePolicy.type === "data_analysis"
+        ? "research"
+        : "direct_answer";
+  const skillCandidates = matchSkills(userGoal, inferredIntent);
+  const availableSkillBlock = skillCandidates.length > 0
+    ? `\nAvailable skills:\n${listBuiltinSkills()
+        .filter((skill) => skillCandidates.some((candidate) => candidate.skillId === skill.id))
+        .map((skill) => `- ${skill.id}: ${skill.description}`)
+        .join("\n")}\nSkill candidates: ${skillCandidates.map((skill) => `${skill.skillId}(${skill.score})`).join(", ")}\nIf one skill clearly fits, include a "skill" object with skill_id, skill_action, and skill_reason.`
+    : "";
 
   // Build step budget guidance
   let stepBudgetBlock = "";
@@ -2106,7 +2193,7 @@ function buildPlannerMessages(
     { role: "system", content: `${PLANNER_PROMPT}\n\nRuntime profile:\n${runtimeProfileText(config)}\n\nAvailable tools:\n${toolListText()}` },
     {
       role: "user",
-      content: `Goal: ${userGoal}\n${routePolicyBlock}\nReplan budget remaining: ${remainingReplans}${stepBudgetBlock}\nWorker history:\n${historyText}${routePolicy.enableRanking ? `\n\nDeterministic candidate ranking:\n${rankingText || "none"}` : ""}`,
+      content: `Goal: ${userGoal}\n${routePolicyBlock}\nReplan budget remaining: ${remainingReplans}${stepBudgetBlock}\nWorker history:\n${historyText}${routePolicy.enableRanking ? `\n\nDeterministic candidate ranking:\n${rankingText || "none"}` : ""}${availableSkillBlock}`,
     },
   ];
 }

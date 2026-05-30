@@ -1,0 +1,34 @@
+{
+  "id": "find_official_sources_v1",
+  "strategy": "official_source_discovery",
+  "summary": "Find and validate official documentation, repositories, and release notes.",
+  "tasks": [
+    {
+      "id": "search_sources",
+      "title": "Search candidate official sources",
+      "kind": "search",
+      "role": "worker",
+      "instruction": "Search for official docs, repositories, release notes, and announcements related to the user goal.",
+      "allowed_tools": ["web_search"],
+      "depends_on": [],
+      "required": true
+    },
+    {
+      "id": "fetch_primary",
+      "title": "Fetch primary sources",
+      "kind": "fetch",
+      "role": "worker",
+      "instruction": "Fetch the strongest official candidate sources and summarize why they are primary.",
+      "allowed_tools": ["url_fetch", "read_file"],
+      "depends_on": ["search_sources"],
+      "required": true
+    }
+  ],
+  "finish_when": {
+    "mode": "all_required_tasks_completed"
+  },
+  "replan_policy": {
+    "allow_runtime_replan": true,
+    "max_replans": 1
+  }
+}

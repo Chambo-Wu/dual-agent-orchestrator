@@ -1,0 +1,34 @@
+{
+  "id": "find.code_symbol",
+  "version": "0.1.0",
+  "title": "Code Symbol Discovery",
+  "description": "Locate relevant repository symbols, entrypoints, routes, and config definitions before editing.",
+  "intents": ["coding"],
+  "keywords": ["fix", "debug", "implement", "route", "function", "class", "module", "src", ".ts", ".js"],
+  "requiredTools": ["list_files", "read_file", "shell_command"],
+  "install": {
+    "source": "builtin",
+    "location": "skills/find.code_symbol"
+  },
+  "activation": {
+    "mode": "intent_match",
+    "priority": 100
+  },
+  "execution": {
+    "strategy": "workflow_template",
+    "templateId": "find_code_symbol_v1"
+  },
+  "verification": {
+    "requiredArtifacts": ["symbol_hits", "file_excerpt"],
+    "successSignal": "at_least_one_relevant_entrypoint",
+    "artifactLabels": {
+      "symbol_hits": "relevant symbol hits",
+      "file_excerpt": "supporting file excerpts"
+    },
+    "successSignalLabel": "identify at least one relevant entrypoint",
+    "remediation": {
+      "insufficient": "Capture concrete symbol hits and supporting file excerpts, then rerun skill verification.",
+      "failed": "Inspect the recorded symbol evidence and repair any missing or invalid repository excerpts before continuing."
+    }
+  }
+}
