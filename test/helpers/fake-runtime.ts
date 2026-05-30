@@ -168,6 +168,7 @@ export function buildMinimalConfig(): OrchestratorConfig {
       autoAudit: true,
       autoValidate: false,
       autoAccept: false,
+      runtimeReplayInAutoPipeline: false,
       candidateDir: "runtime/skill-evolution",
       riskTiering: {
         enabled: false,
@@ -178,6 +179,11 @@ export function buildMinimalConfig(): OrchestratorConfig {
           high: "auto_propose",
         },
       },
+    },
+    goalMode: {
+      autoInsertLargeChecks: true,
+      largeCheckInterval: 3,
+      largeCheckMode: "team",
     },
     policy: {
       maxSteps: 4,

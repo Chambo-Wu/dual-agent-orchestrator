@@ -81,6 +81,12 @@ export interface SkillEvolutionConfig {
   };
 }
 
+export interface GoalModeConfig {
+  autoInsertLargeChecks: boolean;
+  largeCheckInterval: number;
+  largeCheckMode: "task" | "team";
+}
+
 export interface SearchResult {
   title: string;
   url: string;
@@ -107,6 +113,7 @@ export interface OrchestratorConfig {
   search?: SearchConfig;
   skills: SkillsConfig;
   skillEvolution: SkillEvolutionConfig;
+  goalMode: GoalModeConfig;
   policy: {
     maxSteps: number;
     maxReplans: number;

@@ -385,6 +385,46 @@ policy:
   }
 });
 
+test("loadConfig reads goal mode large_check configuration", () => {
+  const path = writeConfigFile(`
+planner:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "literal-planner"
+  model: "planner-model"
+executor:
+  base_url: "http://127.0.0.1:1234/v1"
+  api_key: "literal-executor"
+  model: "executor-model"
+goal_mode:
+  auto_insert_large_checks: false
+  large_check_interval: 2
+  large_check_mode: "task"
+policy:
+  auto_resume_concurrency: 7
+`);
+
+  try {
+    const config = loadConfig(path);
+    assert.equal(config.goalMode.autoInsertLargeChecks, false);
+    assert.equal(config.goalMode.largeCheckInterval, 2);
+    assert.equal(config.goalMode.largeCheckMode, "task");
+    const health = __testables.buildHealthResponse(config) as {
+      runtime?: {
+        goal_mode?: {
+          auto_insert_large_checks?: boolean;
+          large_check_interval?: number;
+          large_check_mode?: string;
+        };
+      };
+    };
+    assert.equal(health.runtime?.goal_mode?.auto_insert_large_checks, false);
+    assert.equal(health.runtime?.goal_mode?.large_check_interval, 2);
+    assert.equal(health.runtime?.goal_mode?.large_check_mode, "task");
+  } finally {
+    rmSync(dirname(path), { recursive: true, force: true });
+  }
+});
+
 test("loadConfig accepts bing_html search provider with inline provider section", () => {
   const path = writeConfigFile(`
 planner:

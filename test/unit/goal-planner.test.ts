@@ -38,6 +38,22 @@ test("large_check insertion can be reused for explicit goal tasks", () => {
   assert.equal(tasks[4]?.title, "Task 4");
 });
 
+test("large_check insertion supports configurable cadence and mode", () => {
+  const tasks = insertLargeCheckTasks([
+    { title: "Task A", description: "Task A", mode: "task", kind: "goal_task" },
+    { title: "Task B", description: "Task B", mode: "task", kind: "goal_task" },
+    { title: "Task C", description: "Task C", mode: "task", kind: "goal_task" },
+  ], {
+    interval: 2,
+    mode: "task",
+  });
+
+  assert.equal(tasks.length, 4);
+  assert.equal(tasks[2]?.kind, "large_check");
+  assert.equal(tasks[2]?.mode, "task");
+  assert.equal(tasks[3]?.title, "Task C");
+});
+
 test("goal planner falls back to a single task for compact goals", () => {
   const tasks = planGoalTasks("完善 goal mode");
 

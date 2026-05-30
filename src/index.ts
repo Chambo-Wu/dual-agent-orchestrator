@@ -2555,6 +2555,9 @@ function buildHealthResponse(
       },
       goal_mode: {
         enabled: true,
+        auto_insert_large_checks: config.goalMode.autoInsertLargeChecks,
+        large_check_interval: config.goalMode.largeCheckInterval,
+        large_check_mode: config.goalMode.largeCheckMode,
         total_goals: goalsSummary.total,
         running_goals: goalsSummary.running,
         blocked_goals: goalsSummary.blocked,
@@ -5732,7 +5735,7 @@ async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promi
   });
 }
 
-function normalizeCreateGoalInput(body: CreateGoalRequest): CreateGoalInput {
+function normalizeCreateGoalInput(body: CreateGoalRequest, config: OrchestratorConfig): CreateGoalInput {
   const goal = typeof body.goal === "string" ? body.goal.trim() : "";
   if (!goal) {
     throw new Error("`goal` must be a non-empty string.");
@@ -5753,8 +5756,17 @@ function normalizeCreateGoalInput(body: CreateGoalRequest): CreateGoalInput {
       })
     : undefined;
   const plannedTasks = tasks && tasks.length > 0
-    ? (body.insert_large_checks === true ? insertLargeCheckTasks(tasks) : tasks)
-    : planGoalTasks(goal);
+    ? (body.insert_large_checks === true
+        ? insertLargeCheckTasks(tasks, {
+            interval: config.goalMode.largeCheckInterval,
+            mode: config.goalMode.largeCheckMode,
+          })
+        : tasks)
+    : planGoalTasks(goal, {
+        autoInsertLargeChecks: config.goalMode.autoInsertLargeChecks,
+        largeCheckInterval: config.goalMode.largeCheckInterval,
+        largeCheckMode: config.goalMode.largeCheckMode,
+      });
   return {
     goal,
     tasks: plannedTasks,
@@ -5830,7 +5842,8 @@ function buildListedGoalsResponse(routeBasePath = "/v1/goals"): GoalDashboardIte
 
 async function handleCreateGoal(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<CreateGoalRequest>(req);
-  const input = normalizeCreateGoalInput(body);
+  const config = getRuntimeConfig();
+  const input = normalizeCreateGoalInput(body, config);
   const record = buildGoalRecord(input);
   persistGoal(record);
   appendGoalEvent(record.id, {
@@ -5841,6 +5854,9 @@ async function handleCreateGoal(req: IncomingMessage, res: ServerResponse): Prom
     meta: {
       goal_id: record.id,
       task_count: record.tasks.length,
+      large_check_count: record.tasks.filter((task) => task.kind === "large_check").length,
+      large_check_interval: config.goalMode.largeCheckInterval,
+      large_check_mode: config.goalMode.largeCheckMode,
       status: record.status,
     },
   });

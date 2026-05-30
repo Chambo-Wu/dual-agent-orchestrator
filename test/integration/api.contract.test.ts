@@ -370,7 +370,11 @@ test("goal API only inserts large checks for explicit tasks when requested", asy
 
 test("goal API can execute inserted large_check tasks through run-next", async () => {
   const executedKinds: string[] = [];
-  __testables.setTaskExecutorForTests(async (goal, _model, _requirePlannerCircuit, context) => {
+  const buildExecutionPayload = (goal: string, mode: "task" | "team", context?: {
+    jobId?: string;
+    planId?: string;
+    taskRunId?: string;
+  }) => {
     const taskRun = createTaskRunRecord({
       id: context?.taskRunId,
       title: goal,
@@ -384,13 +388,13 @@ test("goal API can execute inserted large_check tasks through run-next", async (
     const plan = createPlanRecord({
       id: context?.planId,
       goal,
-      mode: "task",
+      mode,
       taskRunIds: [taskRun.id],
     });
     const job = createJobRecord({
       id: context?.jobId,
       goal,
-      mode: "task",
+      mode,
       status: "completed",
       verified: true,
       output: `${goal} completed.`,
@@ -407,6 +411,13 @@ test("goal API can execute inserted large_check tasks through run-next", async (
       taskRuns: [taskRun],
       artifacts: [],
     };
+  };
+
+  __testables.setTaskExecutorForTests(async (goal, _model, _requirePlannerCircuit, context) => {
+    return buildExecutionPayload(goal, "task", context);
+  });
+  __testables.setTeamExecutorForTests(async (goal, _model, context) => {
+    return buildExecutionPayload(goal, "team", context);
   });
 
   try {
@@ -459,6 +470,7 @@ test("goal API can execute inserted large_check tasks through run-next", async (
     assert.equal(getBody.goal.tasks[4]?.status, "pending");
   } finally {
     __testables.setTaskExecutorForTests(null);
+    __testables.setTeamExecutorForTests(null);
   }
 });
 

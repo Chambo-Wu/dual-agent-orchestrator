@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatSchemaIssues, isPlainObject, parseSimpleYamlDocument, SchemaValidationError, type ValidationIssue } from "./config-format.js";
-import type { AgentLimits, AgentToolPolicy, ModelConfig, ModelRole, ModelRoutingConfig, OrchestratorConfig, RegisteredAgent, RegisteredModel, SearchConfig, SearchProviderType, SkillEvolutionConfig, SkillsConfig } from "./types.js";
+import type { AgentLimits, AgentToolPolicy, GoalModeConfig, ModelConfig, ModelRole, ModelRoutingConfig, OrchestratorConfig, RegisteredAgent, RegisteredModel, SearchConfig, SearchProviderType, SkillEvolutionConfig, SkillsConfig } from "./types.js";
 
 let dotenvLoaded = false;
 
@@ -637,6 +637,28 @@ function validateSkillEvolutionSection(root: Record<string, unknown>, issues: Va
   };
 }
 
+function validateGoalModeSection(root: Record<string, unknown>, issues: ValidationIssue[]): GoalModeConfig {
+  const defaults: GoalModeConfig = {
+    autoInsertLargeChecks: true,
+    largeCheckInterval: 3,
+    largeCheckMode: "team",
+  };
+  const raw = root.goal_mode;
+  if (raw === undefined) {
+    return defaults;
+  }
+  if (!isPlainObject(raw)) {
+    pushIssue(issues, "goal_mode", "must be an object when provided");
+    return defaults;
+  }
+  const section = raw as Record<string, unknown>;
+  return {
+    autoInsertLargeChecks: readOptionalBoolean(section, "goal_mode", "auto_insert_large_checks", defaults.autoInsertLargeChecks, issues),
+    largeCheckInterval: readOptionalNumber(section, "goal_mode", "large_check_interval", defaults.largeCheckInterval, issues, { integer: true, min: 1, max: 20 }),
+    largeCheckMode: readOptionalEnum(section, "goal_mode", "large_check_mode", defaults.largeCheckMode, ["task", "team"], issues),
+  };
+}
+
 export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig {
   loadDotEnvFile();
   const absPath = resolve(configPath);
@@ -661,6 +683,7 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
   const search = validateSearchSection(root, issues);
   const skills = validateSkillsSection(root, issues);
   const skillEvolution = validateSkillEvolutionSection(root, issues);
+  const goalMode = validateGoalModeSection(root, issues);
   const agentConfig = validateAgentsSection(root, issues);
   const explicitModelRegistry = validateModelRegistrySection(root, issues);
   const modelRegistry: Record<string, RegisteredModel> = {
@@ -690,6 +713,7 @@ export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig
     search,
     skills,
     skillEvolution,
+    goalMode,
     policy: {
       maxSteps: readOptionalNumber(policySection, "policy", "max_steps", 12, issues, { integer: true, min: 1 }),
       maxReplans: readOptionalNumber(policySection, "policy", "max_replans", 3, issues, { integer: true, min: 0 }),

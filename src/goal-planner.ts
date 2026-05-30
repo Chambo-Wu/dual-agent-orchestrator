@@ -1,5 +1,13 @@
 import type { GoalTaskInput } from "./goal-types.js";
 
+export interface LargeCheckPlanningOptions {
+  interval?: number;
+  mode?: "task" | "team";
+}
+
+const DEFAULT_LARGE_CHECK_INTERVAL = 3;
+const DEFAULT_LARGE_CHECK_MODE: "task" | "team" = "team";
+
 const SPLIT_PATTERN = /\n+|(?:^|\s)(?:1\.|2\.|3\.|4\.|5\.|6\.|7\.|8\.|9\.)\s+/u;
 
 function compact(text: string): string {
@@ -21,7 +29,7 @@ function buildFallbackTasks(goal: string): GoalTaskInput[] {
   ];
 }
 
-function buildLargeCheckTask(index: number, priorTasks: GoalTaskInput[]): GoalTaskInput {
+function buildLargeCheckTask(index: number, priorTasks: GoalTaskInput[], mode: "task" | "team"): GoalTaskInput {
   const scope = priorTasks
     .slice(Math.max(0, index - 3), index)
     .map((task) => task.title)
@@ -29,18 +37,22 @@ function buildLargeCheckTask(index: number, priorTasks: GoalTaskInput[]): GoalTa
   return {
     title: `Large Check ${Math.floor(index / 3)}`,
     description: `Review progress across the recent goal tasks, validate coherence, and identify blockers or gaps before continuing. Scope: ${scope || "recent tasks"}.`,
-    mode: "team",
+    mode,
     kind: "large_check",
   };
 }
 
-export function insertLargeCheckTasks(tasks: GoalTaskInput[]): GoalTaskInput[] {
+export function insertLargeCheckTasks(tasks: GoalTaskInput[], options?: LargeCheckPlanningOptions): GoalTaskInput[] {
   const normalizedTasks = tasks.filter((task) => task.kind !== "large_check");
   const planned: GoalTaskInput[] = [];
+  const interval = Number.isInteger(options?.interval) && (options?.interval ?? 0) > 0
+    ? options!.interval!
+    : DEFAULT_LARGE_CHECK_INTERVAL;
+  const mode = options?.mode ?? DEFAULT_LARGE_CHECK_MODE;
 
   for (let index = 0; index < normalizedTasks.length; index += 1) {
-    if (index > 0 && index % 3 === 0) {
-      planned.push(buildLargeCheckTask(index, normalizedTasks));
+    if (index > 0 && index % interval === 0) {
+      planned.push(buildLargeCheckTask(index, normalizedTasks, mode));
     }
     planned.push(normalizedTasks[index]!);
   }
@@ -48,7 +60,11 @@ export function insertLargeCheckTasks(tasks: GoalTaskInput[]): GoalTaskInput[] {
   return planned;
 }
 
-export function planGoalTasks(goal: string): GoalTaskInput[] {
+export function planGoalTasks(goal: string, options?: {
+  autoInsertLargeChecks?: boolean;
+  largeCheckInterval?: number;
+  largeCheckMode?: "task" | "team";
+}): GoalTaskInput[] {
   const normalized = compact(goal);
   if (!normalized) {
     return [];
@@ -78,5 +94,10 @@ export function planGoalTasks(goal: string): GoalTaskInput[] {
         }));
 
   const tasks = seedTasks.length > 0 ? seedTasks : buildFallbackTasks(goal);
-  return insertLargeCheckTasks(tasks);
+  return options?.autoInsertLargeChecks === false
+    ? tasks
+    : insertLargeCheckTasks(tasks, {
+        interval: options?.largeCheckInterval,
+        mode: options?.largeCheckMode,
+      });
 }

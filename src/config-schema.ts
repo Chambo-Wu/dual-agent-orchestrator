@@ -429,6 +429,25 @@ export const CONFIG_SCHEMA: Record<string, ConfigFieldSchema> = {
     description: "Highest allowed automation stage for high-risk skills",
     default: "auto_propose",
   },
+  "goal_mode.auto_insert_large_checks": {
+    type: "boolean",
+    required: false,
+    description: "Whether auto-planned goals should insert periodic large_check tasks",
+    default: true,
+  },
+  "goal_mode.large_check_interval": {
+    type: "number",
+    required: false,
+    description: "Number of normal goal tasks between inserted large_check tasks",
+    default: 3,
+    constraints: { integer: true, min: 1, max: 20 },
+  },
+  "goal_mode.large_check_mode": {
+    type: "string",
+    required: false,
+    description: "Execution mode for inserted large_check tasks: task or team",
+    default: "team",
+  },
   "search.mcp.server_url": {
     type: "string",
     required: false,

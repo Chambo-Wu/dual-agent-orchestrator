@@ -93,6 +93,14 @@ policy:
   auto_resume_concurrency: 3
   task_routing_path: "config/task-routing.yml"
 
+# Goal mode configuration (optional)
+# Auto-planned goals insert large_check tasks by default after every 3 normal tasks.
+# Explicit `tasks` requests are not rewritten unless the request sets `insert_large_checks: true`.
+# goal_mode:
+#   auto_insert_large_checks: true
+#   large_check_interval: 3
+#   large_check_mode: "team"
+
 # Search provider configuration (optional)
 # Defaults to Bing HTML scraping when absent.
 # Supported providers: bing_html, searxng, serpapi, bing_api, google_cse, url_template, mcp
