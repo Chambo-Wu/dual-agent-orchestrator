@@ -3,7 +3,7 @@ import * as process from "node:process";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { loadConfig, materializeRuntimeModelSelection } from "./config.js";
 import { compressJsonOutput, compressToolOutput } from "./compress.js";
 import { createRunLogger } from "./logger.js";
@@ -12,7 +12,14 @@ import { PlannerUnavailableError, runOrchestrator, runTask, detectTaskType, getR
 import { loadTaskRoutingConfig } from "./task-routing.js";
 import { runChatCompletionDetailed, type ChatMessage } from "./providers/openai-compatible.js";
 import { TOOL_DEFINITIONS, configureSearchTools } from "./tools.js";
-import type { ApprovalRequest, Artifact, ExecutorOutput, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, Task, TaskRun, VerificationCheck } from "./types.js";
+import type { ApprovalRequest, Artifact, CandidateSkillSummary, ExecutorOutput, IntentRouteMetadata, Job, OrchestratorConfig, OrchestratorEvent, OrchestratorEventCallback, Plan, RoutePolicy, SelectedSkillSummary, Task, TaskRun, VerificationCheck } from "./types.js";
+import type {
+  SkillEvolutionAutomationBlockSummary,
+  SkillEvolutionDecisionRecord,
+  SkillEvolutionProposal,
+  SkillProposalStatus,
+  SkillReflectionRecord,
+} from "./skill-evolution-types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
 import { runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
@@ -26,10 +33,45 @@ import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type
 import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
 import { renderTimelineHtml } from "./timeline.js";
 import { renderJobsDashboardHtml } from "./jobs-dashboard.js";
+import { renderGoalsDashboardHtml, type GoalDashboardItem } from "./goals-dashboard.js";
+import { renderGoalTimelineHtml } from "./goal-timeline.js";
 import { buildWorkflowGraph } from "./workflow-graph.js";
 import { describeJobState, mapJobStatusToLifecycleType, mapJobStatusToUiStatus, mapTaskRunStatusToUiStatus } from "./status-semantics.js";
 import { classifyFailure, getFailureCategoryLabel, listFailureCategories } from "./failure-classification.js";
 import { getExecutorDisplaySummary, getPlannerDecisionText, summarizeVerification } from "./output-contract.js";
+import { detectIntentRoute } from "./intent-router.js";
+import { dispatchTaskIntentRoute, shouldDispatchToTeam } from "./intent-dispatch.js";
+import { appendGoalEvent, buildGoalRecord, listGoals, persistGoal, readGoal, readGoalEvents, summarizeGoals } from "./goal-store.js";
+import { resumeGoal, reviewGoal, retryGoalTask, runNextGoalTask } from "./goal-runtime.js";
+import type { CreateGoalInput, GoalRecord, GoalTaskInput, GoalTaskMode } from "./goal-types.js";
+import { insertLargeCheckTasks, planGoalTasks } from "./goal-planner.js";
+import { buildGoalResponse } from "./goal-contract.js";
+import { getSkillManifest, listAvailableSkills, listBuiltinSkills, listInstalledSkills } from "./skill-registry.js";
+import { getInstalledSkillRecord, installSkillById } from "./skill-installer.js";
+import { buildSkillVerificationSummary } from "./skill-verification.js";
+import { buildSkillOutcomeSummary } from "./skill-outcome.js";
+import { buildSkillReflectionRecord } from "./skill-reflection.js";
+import { auditSkillEvolutionProposal } from "./skill-auditor.js";
+import { validateSkillEvolutionProposal, validateSkillEvolutionProposalWithRuntimeReplay } from "./skill-deployment-validator.js";
+import { generateSkillEvolutionProposal } from "./skill-evolver.js";
+import {
+  applyAcceptedSkillProposal,
+  getSkillEvolutionProposalCandidateRoot,
+  getSkillEvolutionProposalRollbackRoot,
+  listSkillEvolutionProposals,
+  persistSkillEvolutionDecisionRecord,
+  listSkillReflectionRecords,
+  persistSkillAuditReport,
+  persistSkillDeploymentValidationReport,
+  persistSkillEvolutionProposal,
+  persistSkillReflectionRecord,
+  readSkillAuditReport,
+  readSkillDeploymentValidationReport,
+  readSkillEvolutionDecisionRecord,
+  readSkillEvolutionProposal,
+  readSkillReflectionRecord,
+  updateSkillEvolutionProposal,
+} from "./skill-evolution-store.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
@@ -39,6 +81,11 @@ const DEFAULT_AUTO_RESUME_CONCURRENCY = 3;
 const MAX_TOOL_RESULT_CHARS = 2000;
 const MAX_TOOL_MODE_ROUNDS = 4;
 const MAX_TOOL_CONTEXT_CHARS = 1200;
+let configOverrideForTests: OrchestratorConfig | null = null;
+
+function getRuntimeConfig(): OrchestratorConfig {
+  return configOverrideForTests ?? loadConfig();
+}
 
 type PlannerCircuitState = {
   consecutiveFailures: number;
@@ -106,6 +153,16 @@ interface CreateJobRequest {
   };
 }
 
+interface CreateGoalRequest {
+  goal?: string;
+  insert_large_checks?: boolean;
+  tasks?: Array<{
+    title?: string;
+    description?: string;
+    mode?: "task" | "team";
+  }>;
+}
+
 interface ResponseInputItem {
   role?: string;
   content?: string | Array<{ type?: string; text?: string }>;
@@ -167,8 +224,156 @@ type HealthResponse = {
   planner: Record<string, unknown>;
   executor: Record<string, unknown>;
   runtime: Record<string, unknown>;
+  skills?: Record<string, unknown>;
+  skill_evolution?: Record<string, unknown>;
   models: string[];
 };
+
+function inferSkillInstallStatus(
+  skillId: string | undefined,
+  skillAction: SelectedSkillSummary["skill_action"] | undefined,
+): SelectedSkillSummary["skill_install_status"] | undefined {
+  if (skillAction === "use_installed") {
+    return "installed";
+  }
+  if (skillAction === "install_then_use") {
+    return "install_required";
+  }
+  if (skillAction === "skip_skill") {
+    return "skipped";
+  }
+  if (skillId) {
+    return listBuiltinSkills().some((skill) => skill.id === skillId) ? "installed" : "unavailable";
+  }
+  return undefined;
+}
+
+function resolveSelectedSkillSummary(
+  record: StoredJobRecord,
+  events?: WorkflowUiEvent[],
+): SelectedSkillSummary | null {
+  const direct = record.job.selectedSkill ?? record.plan.selectedSkill;
+  if (direct?.skill_id || direct?.skill_action || direct?.skill_reason || direct?.skill_install_status) {
+    return {
+      ...direct,
+      skill_install_status: direct.skill_install_status ?? inferSkillInstallStatus(direct.skill_id, direct.skill_action),
+    };
+  }
+
+  const plannerEvent = [...(events ?? [])]
+    .reverse()
+    .find((event) => event.type === "planner.decision" || event.type === "workflow.planner.decision");
+  const meta = plannerEvent?.meta ?? {};
+  const skillId = typeof meta.selected_skill === "string" && meta.selected_skill.trim().length > 0
+    ? meta.selected_skill.trim()
+    : typeof meta.skill_id === "string" && meta.skill_id.trim().length > 0
+      ? meta.skill_id.trim()
+      : undefined;
+  const skillAction = meta.skill_action === "use_installed"
+    || meta.skill_action === "install_then_use"
+    || meta.skill_action === "skip_skill"
+    ? meta.skill_action
+    : undefined;
+  const skillReason = typeof meta.skill_reason === "string" && meta.skill_reason.trim().length > 0
+    ? meta.skill_reason.trim()
+    : undefined;
+  const skillInstallStatus = typeof meta.skill_install_status === "string" && meta.skill_install_status.trim().length > 0
+    ? meta.skill_install_status.trim() as SelectedSkillSummary["skill_install_status"]
+    : inferSkillInstallStatus(skillId, skillAction);
+
+  if (!skillId && !skillAction && !skillReason && !skillInstallStatus) {
+    return null;
+  }
+
+  return {
+    skill_id: skillId,
+    skill_action: skillAction,
+    skill_reason: skillReason,
+    skill_install_status: skillInstallStatus,
+  };
+}
+
+function isCandidateSkillSummary(value: unknown): value is CandidateSkillSummary {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const entry = value as Record<string, unknown>;
+  return typeof entry.skillId === "string"
+    && typeof entry.score === "number"
+    && Array.isArray(entry.reasons)
+    && (entry.source === "rule" || entry.source === "planner");
+}
+
+function resolveCandidateSkillsSummary(
+  record: StoredJobRecord,
+  events?: WorkflowUiEvent[],
+): CandidateSkillSummary[] {
+  const direct = record.job.candidateSkills ?? record.plan.candidateSkills;
+  if (Array.isArray(direct) && direct.every(isCandidateSkillSummary)) {
+    return [...direct];
+  }
+
+  const skillEvent = [...(events ?? [])]
+    .reverse()
+    .find((event) => event.type === "system.skill_selected");
+  const raw = skillEvent?.meta?.candidate_skills;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter(isCandidateSkillSummary);
+}
+
+function resolveSkillVerificationSummary(record: StoredJobRecord): Record<string, unknown> | null {
+  const skillVerifyTaskRun = [...record.taskRuns].reverse().find((taskRun) => taskRun.id.endsWith("__skill_verify"));
+  if (!skillVerifyTaskRun) {
+    return null;
+  }
+  const skillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
+  return buildSkillVerificationSummary(skillVerifyTaskRun, skillId ?? null);
+}
+
+function resolveSkillEvolutionSummary(record: StoredJobRecord): Record<string, unknown> | null {
+  const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
+  if (!selectedSkillId) {
+    return null;
+  }
+
+  const candidateDir = getRuntimeConfig().skillEvolution.candidateDir;
+  const reflectionIds = new Set(
+    listSkillReflectionRecords(selectedSkillId, candidateDir)
+      .filter((reflection) => reflection.jobId === record.job.id)
+      .map((reflection) => reflection.id),
+  );
+  if (reflectionIds.size === 0) {
+    return null;
+  }
+  const proposals = listSkillEvolutionProposals(candidateDir)
+    .filter((proposal) => proposal.skillId === selectedSkillId && reflectionIds.has(proposal.sourceReflectionId))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+  if (proposals.length === 0) {
+    return null;
+  }
+
+  const latest = proposals[0]!;
+  const latestRecord = buildSkillEvolutionProposalControlPlaneRecord(latest, getRuntimeConfig());
+  return {
+    proposal_count: proposals.length,
+    latest_proposal_id: latest.id,
+    latest_status: latest.status,
+    latest_patch_summary: latest.patchSummary,
+    latest_change_summary: latest.controlPlaneSummary?.changeHeadline ?? latest.diffSummary?.changedFiles.map((file) => file.summary).join(" ") ?? null,
+    latest_rationale_summary: latest.controlPlaneSummary?.rationaleHeadline ?? latest.rationaleSummary?.reason ?? null,
+    latest_changed_files: latest.controlPlaneSummary?.changedFiles ?? latest.targetFiles,
+    latest_created_at: latest.createdAt,
+    latest_decided_at: latest.decidedAt ?? null,
+    latest_validation_summary: latestRecord.validation_summary,
+    latest_ops_summary: latestRecord.ops_summary,
+    statuses: proposals.reduce<Record<string, number>>((acc, proposal) => {
+      acc[proposal.status] = (acc[proposal.status] ?? 0) + 1;
+      return acc;
+    }, {}),
+  };
+}
 
 function assertHealthyExecutorSelection(
   healthSelection: Awaited<ReturnType<typeof buildHealthyExecutorRuntimeConfig>>,
@@ -201,6 +406,7 @@ interface TaskExecutionPayload {
   plan: Plan;
   taskRuns: TaskRun[];
   artifacts: Artifact[];
+  intentRoute?: IntentRouteMetadata;
 }
 
 interface TaskExecutionContext {
@@ -292,6 +498,1024 @@ function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "pla
     artifacts: payload.artifacts,
     workflowGraph: payload.job.workflowGraph,
   });
+}
+
+function persistSkillReflectionForRecord(record: StoredJobRecord, config = loadConfig()): void {
+  if (!config.skillEvolution.enabled || !config.skillEvolution.autoReflect) {
+    return;
+  }
+  const events = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
+  const selectedSkill = resolveSelectedSkillSummary(record, events);
+  const skillVerification = resolveSkillVerificationSummary(record);
+  const skillOutcome = buildSkillOutcomeSummary(record, events, selectedSkill, skillVerification);
+  const skillReflection = buildSkillReflectionRecord(skillOutcome, {
+    record,
+    events,
+  });
+  if (!skillReflection) {
+    return;
+  }
+  persistSkillReflectionRecord(skillReflection, config.skillEvolution.candidateDir);
+}
+
+function shouldAutoAcceptSkillEvolution(
+  validation: ReturnType<typeof validateSkillEvolutionProposal>,
+  config: OrchestratorConfig,
+): boolean {
+  return config.skillEvolution.autoAccept
+    && validation.passed
+    && validation.decision.autoAcceptReady;
+}
+
+type SkillEvolutionAutomationStage = "auto_reflect" | "auto_propose" | "auto_audit" | "auto_validate" | "auto_accept";
+
+const SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER: Record<SkillEvolutionAutomationStage, number> = {
+  auto_reflect: 1,
+  auto_propose: 2,
+  auto_audit: 3,
+  auto_validate: 4,
+  auto_accept: 5,
+};
+const SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS = 24;
+
+function isSkillEvolutionAutomationStage(value: unknown): value is SkillEvolutionAutomationStage {
+  return value === "auto_reflect"
+    || value === "auto_propose"
+    || value === "auto_audit"
+    || value === "auto_validate"
+    || value === "auto_accept";
+}
+
+function resolveSkillAutomationRiskTier(
+  manifest: ReturnType<typeof getSkillManifest> | null,
+  config: OrchestratorConfig,
+): "low" | "medium" | "high" {
+  const intents = new Set(manifest?.intents ?? []);
+  if (intents.has("coding") || intents.has("file_ops")) {
+    return "high";
+  }
+  return config.skillEvolution.riskTiering.defaultTier;
+}
+
+function isAutomationStageAllowedForTier(
+  tier: "low" | "medium" | "high",
+  stage: SkillEvolutionAutomationStage,
+  config: OrchestratorConfig,
+): boolean {
+  if (!config.skillEvolution.riskTiering.enabled) {
+    return true;
+  }
+  const ceiling = config.skillEvolution.riskTiering.automationCeilings[tier];
+  return SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[stage] <= SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[ceiling];
+}
+
+function isAutomationStageAllowedForCeiling(
+  ceiling: SkillEvolutionAutomationStage,
+  stage: SkillEvolutionAutomationStage,
+): boolean {
+  return SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[stage] <= SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[ceiling];
+}
+
+function buildAutomationCeilingBlockMeta(
+  skillId: string,
+  tier: "low" | "medium" | "high",
+  blockedStage: SkillEvolutionAutomationStage,
+  config: OrchestratorConfig,
+  context?: {
+    reflectionId?: string;
+    proposalId?: string;
+  },
+): Record<string, unknown> {
+  return {
+    skill_id: skillId,
+    reflection_id: context?.reflectionId,
+    proposal_id: context?.proposalId,
+    risk_tier: tier,
+    blocked_stage: blockedStage,
+    automation_ceiling: config.skillEvolution.riskTiering.automationCeilings[tier],
+  };
+}
+
+function buildDynamicAutomationCeilingBlockMeta(
+  skillId: string,
+  blockedStage: SkillEvolutionAutomationStage,
+  dynamicRisk: Record<string, unknown>,
+  context?: {
+    reflectionId?: string;
+    proposalId?: string;
+  },
+): Record<string, unknown> {
+  const ceiling = isSkillEvolutionAutomationStage(dynamicRisk.automation_ceiling)
+    ? dynamicRisk.automation_ceiling
+    : "auto_validate";
+  return {
+    skill_id: skillId,
+    reflection_id: context?.reflectionId,
+    proposal_id: context?.proposalId,
+    risk_tier: typeof dynamicRisk.tier === "string" ? dynamicRisk.tier : "medium",
+    blocked_stage: blockedStage,
+    automation_ceiling: ceiling,
+    dynamic_risk: true,
+    dynamic_risk_reasons: Array.isArray(dynamicRisk.reasons) ? dynamicRisk.reasons : [],
+  };
+}
+
+type SkillEvolutionProposalControlPlaneRecord = SkillEvolutionProposal & {
+  automation_block: SkillEvolutionAutomationBlockSummary | null;
+  validation_summary: Record<string, unknown> | null;
+  dynamic_risk: Record<string, unknown>;
+  eligibility: Record<string, unknown>;
+  ops_summary: Record<string, unknown>;
+  rollback_guide: Record<string, unknown> | null;
+};
+
+const SKILL_EVOLUTION_QUEUE_STATUSES = new Set<SkillProposalStatus>([
+  "draft",
+  "auditing",
+  "audit_failed",
+  "validated",
+  "validation_failed",
+]);
+
+function classifySkillEvolutionAgeBucket(createdAt: string, now = Date.now()): "under_1h" | "over_1h" | "over_24h" {
+  const createdAtMs = Date.parse(createdAt);
+  const ageMs = Number.isFinite(createdAtMs) ? Math.max(0, now - createdAtMs) : 0;
+  if (ageMs >= 24 * 60 * 60 * 1000) {
+    return "over_24h";
+  }
+  if (ageMs >= 60 * 60 * 1000) {
+    return "over_1h";
+  }
+  return "under_1h";
+}
+
+function resolveSkillEvolutionQueueState(status: SkillProposalStatus): "proposal_queue" | "accepted_history" | "rejected_history" {
+  if (status === "accepted") {
+    return "accepted_history";
+  }
+  if (status === "rejected") {
+    return "rejected_history";
+  }
+  return "proposal_queue";
+}
+
+function resolveSkillEvolutionFunnelStage(status: SkillProposalStatus): string {
+  switch (status) {
+    case "draft":
+      return "proposal_created";
+    case "auditing":
+      return "audit_running";
+    case "audit_failed":
+      return "audit_failed";
+    case "validated":
+      return "validation_passed";
+    case "validation_failed":
+      return "validation_failed";
+    case "accepted":
+      return "accepted";
+    case "rejected":
+      return "rejected";
+  }
+}
+
+function buildSkillEvolutionProposalOpsSummary(
+  proposal: SkillEvolutionProposal,
+  validationSummary: Record<string, unknown> | null,
+  automationBlock: SkillEvolutionAutomationBlockSummary | null,
+  rollbackGuide: Record<string, unknown> | null,
+  dynamicRisk: Record<string, unknown>,
+  eligibility: Record<string, unknown>,
+  now = Date.now(),
+): Record<string, unknown> {
+  const createdAtMs = Date.parse(proposal.createdAt);
+  const ageSeconds = Number.isFinite(createdAtMs) ? Math.max(0, Math.floor((now - createdAtMs) / 1000)) : 0;
+  const queueState = resolveSkillEvolutionQueueState(proposal.status);
+  const validationReady = validationSummary && validationSummary.auto_accept_ready === true;
+  const blockedStage = automationBlock?.blockedStage ?? null;
+  const dynamicCeiling = typeof dynamicRisk.automation_ceiling === "string" ? dynamicRisk.automation_ceiling : null;
+  const eligible = eligibility.eligible === true;
+  const reasons = Array.isArray(eligibility.reasons) ? eligibility.reasons : [];
+  return {
+    queue_state: queueState,
+    funnel_stage: resolveSkillEvolutionFunnelStage(proposal.status),
+    age_seconds: ageSeconds,
+    age_bucket: classifySkillEvolutionAgeBucket(proposal.createdAt, now),
+    actionable: queueState === "proposal_queue" && proposal.status !== "auditing",
+    blocked_stage: blockedStage,
+    auto_accept_ready: validationReady,
+    auto_accept_eligible: eligible,
+    eligibility_reasons: reasons,
+    dynamic_risk_tier: dynamicRisk.tier ?? "low",
+    dynamic_risk_reasons: Array.isArray(dynamicRisk.reasons) ? dynamicRisk.reasons : [],
+    dynamic_risk_cooldown_active: dynamicRisk.cooldown_active === true,
+    dynamic_risk_cooldown_until: dynamicRisk.cooldown_until ?? null,
+    effective_automation_ceiling: dynamicCeiling,
+    stuck_state: resolveSkillEvolutionStuckState(proposal, validationSummary, automationBlock, dynamicRisk, now),
+    rollback_available: rollbackGuide && rollbackGuide.rollback_available === true,
+  };
+}
+
+function resolveSkillEvolutionStuckState(
+  proposal: SkillEvolutionProposal,
+  validationSummary: Record<string, unknown> | null,
+  automationBlock: SkillEvolutionAutomationBlockSummary | null,
+  dynamicRisk: Record<string, unknown>,
+  now = Date.now(),
+): Record<string, unknown> {
+  const ageBucket = classifySkillEvolutionAgeBucket(proposal.createdAt, now);
+  const reasons: string[] = [];
+  if (automationBlock) {
+    reasons.push(`automation blocked at ${automationBlock.blockedStage}`);
+  }
+  if (proposal.status === "audit_failed") {
+    reasons.push("audit failed");
+  }
+  if (proposal.status === "validation_failed") {
+    reasons.push("validation failed");
+  }
+  if (validationSummary && validationSummary.auto_accept_ready !== true && proposal.status === "validated") {
+    reasons.push("validated but not auto-accept eligible");
+  }
+  if (dynamicRisk.tier === "high") {
+    reasons.push("dynamic risk is high");
+  }
+  if (ageBucket !== "under_1h" && SKILL_EVOLUTION_QUEUE_STATUSES.has(proposal.status)) {
+    reasons.push(`proposal age bucket is ${ageBucket}`);
+  }
+  return {
+    stuck: reasons.length > 0,
+    stage: reasons[0] ?? null,
+    reasons,
+    age_bucket: ageBucket,
+  };
+}
+
+function readAutomationBlockForProposal(
+  proposal: SkillEvolutionProposal,
+  config: OrchestratorConfig,
+): SkillEvolutionAutomationBlockSummary | null {
+  const reflection = readSkillReflectionRecord(proposal.skillId, proposal.sourceReflectionId, config.skillEvolution.candidateDir);
+  if (!reflection) {
+    return null;
+  }
+  const events = loadEventsFromDisk(reflection.jobId);
+  const matched = [...events].reverse().find((event) => {
+    if (event.type !== "system.skill_evolution_automation_blocked" || !isObjectRecord(event.meta)) {
+      return false;
+    }
+    if (event.meta.skill_id !== proposal.skillId) {
+      return false;
+    }
+    if (typeof event.meta.proposal_id === "string" && event.meta.proposal_id !== proposal.id) {
+      return false;
+    }
+    if (typeof event.meta.reflection_id === "string" && event.meta.reflection_id !== proposal.sourceReflectionId) {
+      return false;
+    }
+    return event.time >= proposal.createdAt;
+  });
+  if (!matched || !isObjectRecord(matched.meta)) {
+    return null;
+  }
+  const riskTier = matched.meta.risk_tier;
+  const blockedStage = matched.meta.blocked_stage;
+  const automationCeiling = matched.meta.automation_ceiling;
+  if ((riskTier !== "low" && riskTier !== "medium" && riskTier !== "high")
+    || (blockedStage !== "auto_reflect"
+      && blockedStage !== "auto_propose"
+      && blockedStage !== "auto_audit"
+      && blockedStage !== "auto_validate"
+      && blockedStage !== "auto_accept")
+    || (automationCeiling !== "auto_reflect"
+      && automationCeiling !== "auto_propose"
+      && automationCeiling !== "auto_audit"
+      && automationCeiling !== "auto_validate"
+      && automationCeiling !== "auto_accept")) {
+    return null;
+  }
+  return {
+    reason: "automation_ceiling",
+    eventType: "system.skill_evolution_automation_blocked",
+    jobId: reflection.jobId,
+    eventSeq: matched.seq,
+    eventTime: matched.time,
+    summary: matched.summary,
+    riskTier,
+    blockedStage,
+    automationCeiling,
+  };
+}
+
+function buildSkillEvolutionDynamicRiskSummary(
+  proposal: SkillEvolutionProposal,
+  validationSummary: Record<string, unknown> | null,
+  config: OrchestratorConfig,
+  proposalHistory?: SkillEvolutionProposal[],
+): Record<string, unknown> {
+  const now = Date.now();
+  const windowMs = SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS * 60 * 60 * 1000;
+  const skillProposals = (proposalHistory ?? listSkillEvolutionProposals(config.skillEvolution.candidateDir))
+    .filter((item) => item.skillId === proposal.skillId)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
+    .slice(0, 10);
+  const auditReports = skillProposals
+    .map((item) => readSkillAuditReport(item.id, config.skillEvolution.candidateDir))
+    .filter((report): report is NonNullable<typeof report> => report !== null);
+  const validationReports = skillProposals
+    .map((item) => readSkillDeploymentValidationReport(item.id, config.skillEvolution.candidateDir))
+    .filter((report): report is NonNullable<typeof report> => report !== null);
+  const isRecent = (createdAt: string): boolean => {
+    const createdAtMs = Date.parse(createdAt);
+    return Number.isFinite(createdAtMs) && now - createdAtMs <= windowMs;
+  };
+  const auditFailureSignals = [
+    ...auditReports.filter((report) => !report.passed && isRecent(report.createdAt)).map((report) => report.createdAt),
+    ...skillProposals.filter((item) => item.status === "audit_failed" && isRecent(item.createdAt)).map((item) => item.createdAt),
+  ];
+  const validationFailureSignals = [
+    ...validationReports.filter((report) => !report.passed && isRecent(report.createdAt)).map((report) => report.createdAt),
+    ...skillProposals.filter((item) => item.status === "validation_failed" && isRecent(item.createdAt)).map((item) => item.createdAt),
+  ];
+  const replayInstabilitySignals = validationReports.filter((report) => isRecent(report.createdAt) && (report.stability?.autoAcceptBlocked === true
+    || report.stability?.replayInstabilityDetected === true
+    || report.replay?.sameInputComparison?.readiness !== "ready"
+    || report.replay?.runtimeBoundary?.trueRuntimeReplayReady !== true)).map((report) => report.createdAt);
+  const auditFailureCount = auditFailureSignals.length;
+  const validationFailureCount = validationFailureSignals.length;
+  const replayInstabilityCount = replayInstabilitySignals.length;
+  const signalTimes = [...auditFailureSignals, ...validationFailureSignals, ...replayInstabilitySignals]
+    .map((createdAt) => Date.parse(createdAt))
+    .filter((value) => Number.isFinite(value));
+  const newestSignalMs = signalTimes.length > 0 ? Math.max(...signalTimes) : null;
+  const cooldownUntilMs = newestSignalMs === null ? null : newestSignalMs + windowMs;
+  const cooldownActive = cooldownUntilMs !== null && cooldownUntilMs > now;
+  const newestSignalAt = newestSignalMs === null ? null : new Date(newestSignalMs).toISOString();
+  const cooldownUntil = cooldownUntilMs === null ? null : new Date(cooldownUntilMs).toISOString();
+  const currentAutoAcceptReady = validationSummary?.auto_accept_ready === true;
+  const currentReadiness = typeof validationSummary?.same_input_readiness === "string"
+    ? validationSummary.same_input_readiness
+    : null;
+  const reasons: string[] = [];
+  if (auditFailureCount > 0) {
+    reasons.push(`${auditFailureCount} recent audit failure signal(s)`);
+  }
+  if (validationFailureCount > 0) {
+    reasons.push(`${validationFailureCount} recent validation failure signal(s)`);
+  }
+  if (replayInstabilityCount > 0) {
+    reasons.push(`${replayInstabilityCount} recent replay readiness/stability signal(s)`);
+  }
+  if (validationSummary && !currentAutoAcceptReady) {
+    reasons.push("current proposal is not auto-accept ready");
+  }
+  if (currentReadiness && currentReadiness !== "ready") {
+    reasons.push(`current same-input readiness is ${currentReadiness}`);
+  }
+  if (cooldownActive && cooldownUntil) {
+    reasons.push(`dynamic risk cooldown active until ${cooldownUntil}`);
+  }
+
+  const tier: "low" | "medium" | "high" = validationFailureCount > 0 || replayInstabilityCount >= 2
+    ? "high"
+    : auditFailureCount > 0 || replayInstabilityCount > 0
+      ? "medium"
+      : "low";
+  const automationCeiling: SkillEvolutionAutomationStage = validationFailureCount > 0 || replayInstabilityCount >= 2
+    ? "auto_audit"
+    : auditFailureCount > 0
+      ? "auto_propose"
+      : replayInstabilityCount > 0
+        ? "auto_validate"
+        : config.skillEvolution.riskTiering.automationCeilings.low;
+  return {
+    tier,
+    source: "recent_skill_evolution_history",
+    automation_ceiling: automationCeiling,
+    auto_accept_blocked: tier !== "low" || !currentAutoAcceptReady,
+    audit_failure_count: auditFailureCount,
+    validation_failure_count: validationFailureCount,
+    replay_instability_count: replayInstabilityCount,
+    sampled_proposal_count: skillProposals.length,
+    window_hours: SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS,
+    newest_signal_at: newestSignalAt,
+    cooldown_until: cooldownUntil,
+    cooldown_active: cooldownActive,
+    reasons: reasons.length > 0 ? reasons : ["no recent dynamic risk signals"],
+  };
+}
+
+function buildSkillEvolutionEligibilitySummary(
+  proposal: SkillEvolutionProposal,
+  validationSummary: Record<string, unknown> | null,
+  automationBlock: SkillEvolutionAutomationBlockSummary | null,
+  dynamicRisk: Record<string, unknown>,
+): Record<string, unknown> {
+  const reasons: string[] = [];
+  if (proposal.status !== "validated") {
+    reasons.push(`proposal status is ${proposal.status}`);
+  }
+  if (!validationSummary) {
+    reasons.push("validation summary is unavailable");
+  } else {
+    if (validationSummary.passed !== true) {
+      reasons.push("validation has not passed");
+    }
+    if (validationSummary.auto_accept_ready !== true) {
+      reasons.push("validation is not auto-accept ready");
+    }
+    const readiness = typeof validationSummary.same_input_readiness === "string"
+      ? validationSummary.same_input_readiness
+      : null;
+    if (readiness && readiness !== "ready") {
+      reasons.push(`same-input readiness is ${readiness}`);
+    }
+  }
+  if (automationBlock) {
+    reasons.push(`automation ceiling blocked ${automationBlock.blockedStage}`);
+  }
+  if (dynamicRisk.auto_accept_blocked === true) {
+    reasons.push("dynamic risk blocks auto-accept");
+  }
+  const eligible = reasons.length === 0;
+  return {
+    eligible,
+    action: eligible ? "auto_accept" : "manual_review",
+    reasons: eligible ? ["auto-accept eligibility checks passed"] : reasons,
+  };
+}
+
+function buildSkillEvolutionProposalControlPlaneRecord(
+  proposal: SkillEvolutionProposal,
+  config: OrchestratorConfig,
+  proposalHistory?: SkillEvolutionProposal[],
+): SkillEvolutionProposalControlPlaneRecord {
+  const validation = readSkillDeploymentValidationReport(proposal.id, config.skillEvolution.candidateDir);
+  const validationSummary = validation ? buildSkillEvolutionValidationSummary(validation) : null;
+  const automationBlock = readAutomationBlockForProposal(proposal, config);
+  const dynamicRisk = buildSkillEvolutionDynamicRiskSummary(proposal, validationSummary, config, proposalHistory);
+  const eligibility = buildSkillEvolutionEligibilitySummary(proposal, validationSummary, automationBlock, dynamicRisk);
+  const acceptedDecision = proposal.status === "accepted"
+    ? readSkillEvolutionDecisionRecord(proposal.id, "accepted", config.skillEvolution.candidateDir)
+    : null;
+  const rollbackGuide = proposal.status === "accepted"
+    ? buildSkillEvolutionRollbackGuide(proposal, acceptedDecision, config)
+    : null;
+  return {
+    ...proposal,
+    automation_block: automationBlock,
+    validation_summary: validationSummary,
+    dynamic_risk: dynamicRisk,
+    eligibility,
+    ops_summary: buildSkillEvolutionProposalOpsSummary(proposal, validationSummary, automationBlock, rollbackGuide, dynamicRisk, eligibility),
+    rollback_guide: rollbackGuide,
+  };
+}
+
+function buildSkillEvolutionOpsItem(
+  record: SkillEvolutionProposalControlPlaneRecord,
+  config: OrchestratorConfig,
+): Record<string, unknown> {
+  return {
+    id: record.id,
+    skill_id: record.skillId,
+    source_reflection_id: record.sourceReflectionId,
+    status: record.status,
+    created_at: record.createdAt,
+    decided_at: record.decidedAt ?? null,
+    patch_summary: record.patchSummary,
+    change_summary: record.controlPlaneSummary?.changeHeadline ?? null,
+    rationale_summary: record.controlPlaneSummary?.rationaleHeadline ?? null,
+    changed_files: record.controlPlaneSummary?.changedFiles ?? record.targetFiles,
+    target_files: record.targetFiles,
+    audit_report_path: record.auditReportPath ?? null,
+    validation_report_path: record.validationReportPath ?? null,
+    validation_summary: record.validation_summary,
+    automation_block: record.automation_block,
+    dynamic_risk: record.dynamic_risk,
+    eligibility: record.eligibility,
+    ops_summary: record.ops_summary,
+    proposal_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}`,
+    audit_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/audit`,
+    validate_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/validate`,
+    accept_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/accept`,
+    reject_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/reject`,
+    candidate_path: getSkillEvolutionProposalCandidateRoot(record.id, config.skillEvolution.candidateDir),
+  };
+}
+
+function buildSkillEvolutionRollbackGuide(
+  record: SkillEvolutionProposal,
+  decision: SkillEvolutionDecisionRecord | null,
+  config: OrchestratorConfig,
+): Record<string, unknown> {
+  const rollbackPath = getSkillEvolutionProposalRollbackRoot(record.id, config.skillEvolution.candidateDir);
+  return {
+    proposal_id: record.id,
+    skill_id: record.skillId,
+    accepted_at: decision?.createdAt ?? record.decidedAt ?? null,
+    reason: decision?.reason ?? null,
+    rollback_path: rollbackPath,
+    rollback_available: existsSync(rollbackPath),
+    changed_files: record.controlPlaneSummary?.changedFiles ?? record.targetFiles,
+    guide: [
+      "Inspect changed_files and rollback_path before restoring.",
+      "Restore the needed file(s) from rollback_path back to the live skill path.",
+      "Re-run the affected skill workflow and validation before accepting another proposal.",
+    ],
+  };
+}
+
+function buildSkillEvolutionOpsSummary(config: OrchestratorConfig): Record<string, unknown> {
+  const proposals = listSkillEvolutionProposals(config.skillEvolution.candidateDir);
+  const records = proposals
+    .map((proposal) => buildSkillEvolutionProposalControlPlaneRecord(proposal, config, proposals));
+  const proposalQueue = records
+    .filter((record) => SKILL_EVOLUTION_QUEUE_STATUSES.has(record.status))
+    .map((record) => buildSkillEvolutionOpsItem(record, config));
+  const acceptedRecords = records.filter((record) => record.status === "accepted");
+  const acceptedHistory = acceptedRecords.map((record) => {
+    const decision = readSkillEvolutionDecisionRecord(record.id, "accepted", config.skillEvolution.candidateDir);
+    return {
+      ...buildSkillEvolutionOpsItem(record, config),
+      decision: decision ? {
+        decision: decision.decision,
+        reason: decision.reason ?? null,
+        created_at: decision.createdAt,
+      } : null,
+      rollback: buildSkillEvolutionRollbackGuide(record, decision, config),
+    };
+  });
+  const statusCounts = records.reduce<Record<string, number>>((acc, record) => {
+    acc[record.status] = (acc[record.status] ?? 0) + 1;
+    return acc;
+  }, {});
+  const now = Date.now();
+  const agingBuckets = proposalQueue.reduce<Record<string, number>>((acc, item) => {
+    const bucket = classifySkillEvolutionAgeBucket(typeof item.created_at === "string" ? item.created_at : "", now);
+    acc[bucket] = (acc[bucket] ?? 0) + 1;
+    return acc;
+  }, { under_1h: 0, over_1h: 0, over_24h: 0 });
+  const dynamicRiskCounts = records.reduce<Record<string, number>>((acc, record) => {
+    const tier = typeof record.dynamic_risk.tier === "string" ? record.dynamic_risk.tier : "unknown";
+    acc[tier] = (acc[tier] ?? 0) + 1;
+    return acc;
+  }, { low: 0, medium: 0, high: 0 });
+  const eligibilityCounts = records.reduce<Record<string, number>>((acc, record) => {
+    const key = record.eligibility.eligible === true ? "eligible" : "blocked";
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, { eligible: 0, blocked: 0 });
+  const stuckCount = records.filter((record) => {
+    const stuckState = record.ops_summary.stuck_state;
+    return isObjectRecord(stuckState) && stuckState.stuck === true;
+  }).length;
+  return {
+    object: "skill_evolution_ops",
+    generated_at: new Date().toISOString(),
+    summary: {
+      total_proposals: records.length,
+      queue_count: proposalQueue.length,
+      accepted_count: acceptedHistory.length,
+      rejected_count: statusCounts.rejected ?? 0,
+      audit_failed_count: statusCounts.audit_failed ?? 0,
+      validation_failed_count: statusCounts.validation_failed ?? 0,
+      rollback_available_count: acceptedHistory.filter((item) => {
+        const rollback = item.rollback;
+        return isObjectRecord(rollback) && rollback.rollback_available === true;
+      }).length,
+      statuses: statusCounts,
+      funnel: {
+        proposal_created: statusCounts.draft ?? 0,
+        audit_running: statusCounts.auditing ?? 0,
+        audit_failed: statusCounts.audit_failed ?? 0,
+        validation_passed: statusCounts.validated ?? 0,
+        validation_failed: statusCounts.validation_failed ?? 0,
+        accepted: statusCounts.accepted ?? 0,
+        rejected: statusCounts.rejected ?? 0,
+      },
+      aging_buckets: agingBuckets,
+      dynamic_risk: dynamicRiskCounts,
+      eligibility: eligibilityCounts,
+      stuck_count: stuckCount,
+    },
+    proposal_queue: proposalQueue,
+    accepted_history: acceptedHistory,
+    rollback_guides: acceptedHistory.map((item) => item.rollback),
+  };
+}
+
+function summarizeReplayJob(replayJob: {
+  status?: string;
+  verificationStatus?: string;
+  events?: Array<{
+    type?: string;
+    status?: string;
+    summary?: string;
+  }>;
+} | null | undefined): Record<string, unknown> | null {
+  if (!replayJob) {
+    return null;
+  }
+  const events = Array.isArray(replayJob.events) ? replayJob.events : [];
+  const terminal = events.length > 0 ? events[events.length - 1] : null;
+  return {
+    status: replayJob.status ?? null,
+    verification_status: replayJob.verificationStatus ?? null,
+    event_count: events.length,
+    terminal_event_type: terminal?.type ?? null,
+    terminal_event_status: terminal?.status ?? null,
+    terminal_summary: terminal?.summary ?? null,
+  };
+}
+
+function buildSkillEvolutionValidationSummary(validation: {
+  passed: boolean;
+  risk?: {
+    tier?: string;
+  };
+  decision?: {
+    reasonCode?: string;
+    autoAcceptReady?: boolean;
+  };
+  replay?: {
+    runtimeBoundary?: {
+      source?: string;
+      contract?: string;
+      candidateRuntimeConfigPrepared?: boolean;
+      trueRuntimeReplayReady?: boolean;
+      autoAcceptEligible?: boolean;
+    };
+    provenance?: {
+      isolated?: boolean;
+    };
+    sameInputComparison?: {
+      readiness?: string;
+    };
+    baseline?: {
+      replayJob?: {
+        status?: string;
+        verificationStatus?: string;
+        events?: Array<{
+          type?: string;
+          status?: string;
+          summary?: string;
+        }>;
+      };
+    };
+    candidate?: {
+      replayJob?: {
+        status?: string;
+        verificationStatus?: string;
+        events?: Array<{
+          type?: string;
+          status?: string;
+          summary?: string;
+        }>;
+      };
+    };
+  };
+}): Record<string, unknown> {
+  const baselineReplay = summarizeReplayJob(validation.replay?.baseline?.replayJob);
+  const candidateReplay = summarizeReplayJob(validation.replay?.candidate?.replayJob);
+  const candidateTerminalType = candidateReplay && typeof candidateReplay.terminal_event_type === "string"
+    ? candidateReplay.terminal_event_type
+    : null;
+  const candidateEventCount = candidateReplay && typeof candidateReplay.event_count === "number"
+    ? candidateReplay.event_count
+    : 0;
+  const replayHeadline = validation.replay?.provenance?.isolated
+    ? `Isolated replay ${validation.passed ? "passed" : "ended blocked"} with ${candidateEventCount} candidate event(s) and terminal state ${candidateTerminalType ?? "unknown"}.`
+    : "Isolated replay has not executed for this validation result.";
+  return {
+    passed: validation.passed,
+    risk_tier: validation.risk?.tier ?? null,
+    reason_code: validation.decision?.reasonCode ?? null,
+    auto_accept_ready: validation.decision?.autoAcceptReady ?? false,
+    runtime_boundary: validation.replay?.runtimeBoundary ?? null,
+    isolated_replay: validation.replay?.provenance?.isolated ?? false,
+    same_input_readiness: validation.replay?.sameInputComparison?.readiness ?? null,
+    replay_headline: replayHeadline,
+    baseline_replay: baselineReplay,
+    candidate_replay: candidateReplay,
+  };
+}
+
+async function runAutomaticSkillEvolutionForRecord(record: StoredJobRecord, config = loadConfig()): Promise<void> {
+  if (!config.skillEvolution.enabled || !config.skillEvolution.autoReflect) {
+    return;
+  }
+  const reflection = buildSkillReflectionFromRecord(record);
+  if (!reflection) {
+    return;
+  }
+  const manifest = getSkillManifest(reflection.skillId, config);
+  const riskTier = resolveSkillAutomationRiskTier(manifest, config);
+
+  persistSkillReflectionRecord(reflection, config.skillEvolution.candidateDir);
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: reflection.createdAt,
+    type: "system.skill_reflection_recorded",
+    title: "Skill reflection recorded",
+    summary: reflection.reason,
+    status: reflection.reflectionKind === "skill_defect" || reflection.reflectionKind === "execution_lapse" ? "blocked" : "success",
+    meta: {
+      skill_id: reflection.skillId,
+      reflection_id: reflection.id,
+      reflection_kind: reflection.reflectionKind,
+      recommended_action: reflection.recommendedAction,
+      verification_status: reflection.evidence.verificationStatus ?? null,
+      failed_check_names: reflection.evidence.failedCheckNames,
+      missing_requirements: reflection.evidence.missingRequirements,
+      related_event_ids: reflection.evidence.eventIds,
+      related_artifact_ids: reflection.evidence.artifactIds,
+      silent_bypass_signal: reflection.evidence.silentBypassSignal ?? false,
+    },
+  }));
+
+  if (!config.skillEvolution.autoPropose || !isAutomationStageAllowedForTier(riskTier, "auto_propose", config)) {
+    if (config.skillEvolution.autoPropose && config.skillEvolution.riskTiering.enabled) {
+      appendEvent(createLifecycleEvent({
+        jobId: reflection.jobId,
+        seq: getNextSeq(reflection.jobId),
+        time: new Date().toISOString(),
+        type: "system.skill_evolution_automation_blocked",
+        title: "Skill evolution automation blocked",
+        summary: `Automatic skill evolution stopped before proposal because the ${riskTier}-risk automation ceiling does not allow auto_propose.`,
+        status: "blocked",
+        meta: buildAutomationCeilingBlockMeta(reflection.skillId, riskTier, "auto_propose", config, {
+          reflectionId: reflection.id,
+        }),
+      }));
+    }
+    return;
+  }
+
+  const proposal = buildSkillEvolutionProposal(reflection, config.skillEvolution.candidateDir, config);
+  persistSkillEvolutionProposal(proposal, config.skillEvolution.candidateDir);
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: proposal.createdAt,
+    type: "system.skill_evolution_proposed",
+    title: "Skill evolution proposed",
+    summary: proposal.patchSummary,
+    status: "running",
+    meta: {
+      skill_id: proposal.skillId,
+      reflection_id: proposal.sourceReflectionId,
+      proposal_id: proposal.id,
+      proposal_status: proposal.status,
+      patch_summary: proposal.patchSummary,
+      change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
+      rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
+      changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
+    },
+  }));
+
+  const proposalDynamicRisk = buildSkillEvolutionDynamicRiskSummary(proposal, null, config);
+  const proposalDynamicCeiling = isSkillEvolutionAutomationStage(proposalDynamicRisk.automation_ceiling)
+    ? proposalDynamicRisk.automation_ceiling
+    : "auto_validate";
+  if (config.skillEvolution.autoAudit
+    && config.skillEvolution.riskTiering.enabled
+    && !isAutomationStageAllowedForCeiling(proposalDynamicCeiling, "auto_audit")) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: new Date().toISOString(),
+      type: "system.skill_evolution_automation_blocked",
+      title: "Skill evolution automation blocked",
+      summary: `Automatic skill evolution stopped before audit because dynamic risk lowered the automation ceiling to ${proposalDynamicCeiling}.`,
+      status: "blocked",
+      meta: buildDynamicAutomationCeilingBlockMeta(reflection.skillId, "auto_audit", proposalDynamicRisk, {
+        reflectionId: reflection.id,
+        proposalId: proposal.id,
+      }),
+    }));
+    return;
+  }
+
+  if (!config.skillEvolution.autoAudit || !isAutomationStageAllowedForTier(riskTier, "auto_audit", config)) {
+    if (config.skillEvolution.autoAudit && config.skillEvolution.riskTiering.enabled) {
+      appendEvent(createLifecycleEvent({
+        jobId: reflection.jobId,
+        seq: getNextSeq(reflection.jobId),
+        time: new Date().toISOString(),
+        type: "system.skill_evolution_automation_blocked",
+        title: "Skill evolution automation blocked",
+        summary: `Automatic skill evolution stopped before audit because the ${riskTier}-risk automation ceiling does not allow auto_audit.`,
+        status: "blocked",
+        meta: buildAutomationCeilingBlockMeta(reflection.skillId, riskTier, "auto_audit", config, {
+          reflectionId: reflection.id,
+          proposalId: proposal.id,
+        }),
+      }));
+    }
+    return;
+  }
+
+  const audit = auditSkillEvolutionProposal({
+    proposal,
+    reflection,
+    manifest,
+  });
+  const auditPath = persistSkillAuditReport(audit, config.skillEvolution.candidateDir);
+  const auditedProposal = updateSkillEvolutionProposal(proposal.id, (current) => ({
+    ...current,
+    status: audit.passed ? "validated" : "audit_failed",
+    auditReportPath: auditPath,
+  }), config.skillEvolution.candidateDir);
+  if (!auditedProposal) {
+    return;
+  }
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: new Date().toISOString(),
+    type: audit.passed ? "system.skill_evolution_audit_passed" : "system.skill_evolution_audit_failed",
+    title: audit.passed ? "Skill evolution audit passed" : "Skill evolution audit failed",
+    summary: audit.summary,
+    status: audit.passed ? "success" : "blocked",
+    meta: {
+      skill_id: auditedProposal.skillId,
+      reflection_id: auditedProposal.sourceReflectionId,
+      proposal_id: auditedProposal.id,
+      proposal_status: auditedProposal.status,
+      audit_report_path: auditPath,
+    },
+  }));
+
+  const auditDynamicRisk = buildSkillEvolutionDynamicRiskSummary(auditedProposal, null, config);
+  const auditDynamicCeiling = isSkillEvolutionAutomationStage(auditDynamicRisk.automation_ceiling)
+    ? auditDynamicRisk.automation_ceiling
+    : "auto_validate";
+  if (audit.passed
+    && config.skillEvolution.autoValidate
+    && config.skillEvolution.riskTiering.enabled
+    && !isAutomationStageAllowedForCeiling(auditDynamicCeiling, "auto_validate")) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: new Date().toISOString(),
+      type: "system.skill_evolution_automation_blocked",
+      title: "Skill evolution automation blocked",
+      summary: `Automatic skill evolution stopped before validation because dynamic risk lowered the automation ceiling to ${auditDynamicCeiling}.`,
+      status: "blocked",
+      meta: buildDynamicAutomationCeilingBlockMeta(reflection.skillId, "auto_validate", auditDynamicRisk, {
+        reflectionId: reflection.id,
+        proposalId: auditedProposal.id,
+      }),
+    }));
+    return;
+  }
+
+  if (!audit.passed || !config.skillEvolution.autoValidate || !isAutomationStageAllowedForTier(riskTier, "auto_validate", config)) {
+    if (audit.passed && config.skillEvolution.autoValidate && config.skillEvolution.riskTiering.enabled
+      && !isAutomationStageAllowedForTier(riskTier, "auto_validate", config)) {
+      appendEvent(createLifecycleEvent({
+        jobId: reflection.jobId,
+        seq: getNextSeq(reflection.jobId),
+        time: new Date().toISOString(),
+        type: "system.skill_evolution_automation_blocked",
+        title: "Skill evolution automation blocked",
+        summary: `Automatic skill evolution stopped before validation because the ${riskTier}-risk automation ceiling does not allow auto_validate.`,
+        status: "blocked",
+        meta: buildAutomationCeilingBlockMeta(reflection.skillId, riskTier, "auto_validate", config, {
+          reflectionId: reflection.id,
+          proposalId: auditedProposal.id,
+        }),
+      }));
+    }
+    return;
+  }
+
+  const baselineRecord = readJobRecord(reflection.jobId);
+  const validation = config.skillEvolution.runtimeReplayInAutoPipeline
+    ? await validateSkillEvolutionProposalWithRuntimeReplay({
+      proposal: auditedProposal,
+      reflection,
+      baselineRecord,
+      config,
+    })
+    : validateSkillEvolutionProposal({
+      proposal: auditedProposal,
+      reflection,
+      baselineRecord,
+      config,
+    });
+  const validationPath = persistSkillDeploymentValidationReport(validation, config.skillEvolution.candidateDir);
+  const validatedProposal = updateSkillEvolutionProposal(auditedProposal.id, (current) => ({
+    ...current,
+    status: validation.passed ? "validated" : "validation_failed",
+    validationReportPath: validationPath,
+  }), config.skillEvolution.candidateDir);
+  if (!validatedProposal) {
+    return;
+  }
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: new Date().toISOString(),
+    type: validation.passed ? "system.skill_evolution_validation_passed" : "system.skill_evolution_validation_failed",
+    title: validation.passed ? "Skill evolution validation passed" : "Skill evolution validation failed",
+    summary: validation.summary,
+    status: validation.passed ? "success" : "blocked",
+    meta: {
+      skill_id: validatedProposal.skillId,
+      reflection_id: validatedProposal.sourceReflectionId,
+      proposal_id: validatedProposal.id,
+      proposal_status: validatedProposal.status,
+      validation_report_path: validationPath,
+    },
+  }));
+  const validationSummary = buildSkillEvolutionValidationSummary(validation);
+  const dynamicRisk = buildSkillEvolutionDynamicRiskSummary(validatedProposal, validationSummary, config);
+  const dynamicCeiling = isSkillEvolutionAutomationStage(dynamicRisk.automation_ceiling)
+    ? dynamicRisk.automation_ceiling
+    : "auto_validate";
+  if (config.skillEvolution.autoAccept
+    && config.skillEvolution.riskTiering.enabled
+    && !isAutomationStageAllowedForCeiling(dynamicCeiling, "auto_accept")) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: new Date().toISOString(),
+      type: "system.skill_evolution_automation_blocked",
+      title: "Skill evolution automation blocked",
+      summary: `Automatic skill evolution stopped before acceptance because dynamic risk lowered the automation ceiling to ${dynamicCeiling}.`,
+      status: "blocked",
+      meta: buildDynamicAutomationCeilingBlockMeta(reflection.skillId, "auto_accept", dynamicRisk, {
+        reflectionId: reflection.id,
+        proposalId: validatedProposal.id,
+      }),
+    }));
+    return;
+  }
+  if (!shouldAutoAcceptSkillEvolution(validation, config) || !isAutomationStageAllowedForTier(riskTier, "auto_accept", config)) {
+    if (shouldAutoAcceptSkillEvolution(validation, config) && config.skillEvolution.riskTiering.enabled
+      && !isAutomationStageAllowedForTier(riskTier, "auto_accept", config)) {
+      appendEvent(createLifecycleEvent({
+        jobId: reflection.jobId,
+        seq: getNextSeq(reflection.jobId),
+        time: new Date().toISOString(),
+        type: "system.skill_evolution_automation_blocked",
+        title: "Skill evolution automation blocked",
+        summary: `Automatic skill evolution stopped before acceptance because the ${riskTier}-risk automation ceiling does not allow auto_accept.`,
+        status: "blocked",
+        meta: buildAutomationCeilingBlockMeta(reflection.skillId, riskTier, "auto_accept", config, {
+          reflectionId: reflection.id,
+          proposalId: validatedProposal.id,
+        }),
+      }));
+    }
+    return;
+  }
+
+  try {
+    applyAcceptedSkillProposal(validatedProposal, config.skillEvolution.candidateDir);
+  } catch {
+    return;
+  }
+  const decisionRecord: SkillEvolutionDecisionRecord = {
+    proposalId: validatedProposal.id,
+    skillId: validatedProposal.skillId,
+    decision: "accepted",
+    reason: "Automatically accepted after passing audit and validation.",
+    createdAt: new Date().toISOString(),
+  };
+  persistSkillEvolutionDecisionRecord(decisionRecord, config.skillEvolution.candidateDir);
+  const acceptedProposal = updateSkillEvolutionProposal(validatedProposal.id, (current) => ({
+    ...current,
+    status: "accepted",
+    decidedAt: decisionRecord.createdAt,
+  }), config.skillEvolution.candidateDir);
+  if (!acceptedProposal) {
+    return;
+  }
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: decisionRecord.createdAt,
+    type: "system.skill_evolution_accepted",
+    title: "Skill evolution accepted",
+    summary: acceptedProposal.controlPlaneSummary?.changeHeadline
+      ? `${acceptedProposal.controlPlaneSummary.changeHeadline}. ${decisionRecord.reason}`
+      : acceptedProposal.patchSummary,
+    status: "success",
+    meta: {
+      skill_id: acceptedProposal.skillId,
+      reflection_id: acceptedProposal.sourceReflectionId,
+      proposal_id: acceptedProposal.id,
+      proposal_status: acceptedProposal.status,
+      patch_summary: acceptedProposal.patchSummary,
+      change_summary: acceptedProposal.controlPlaneSummary?.changeHeadline ?? null,
+      rationale_summary: acceptedProposal.controlPlaneSummary?.rationaleHeadline ?? null,
+      changed_files: acceptedProposal.controlPlaneSummary?.changedFiles ?? acceptedProposal.targetFiles,
+      decision_reason: decisionRecord.reason,
+    },
+  }));
 }
 
 async function verifyWorkflowPayload(
@@ -693,6 +1917,23 @@ function jsonErrorResponse(
       ...(extras ?? {}),
     },
   });
+}
+
+function parseNonNegativeIntegerParam(
+  value: string | null | undefined,
+  name: string,
+): { ok: true; value: number | undefined } | { ok: false; message: string } {
+  if (value === null || value === undefined || value === "") {
+    return { ok: true, value: undefined };
+  }
+  if (!/^\d+$/.test(value)) {
+    return { ok: false, message: `${name} must be a non-negative integer.` };
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return { ok: false, message: `${name} must be a non-negative integer.` };
+  }
+  return { ok: true, value: parsed };
 }
 
 function secondsUntilCircuitHalfOpen(): number {
@@ -1261,6 +2502,16 @@ function buildHealthResponse(
   const probedHealthyCandidates = executorHealthResults
     ?.filter((result) => result.status === "healthy")
     .map((result) => result.modelId) ?? [];
+  const recentIntentRoutes = summarizeRecentIntentRoutes();
+  const availableSkills = listAvailableSkills(config);
+  const builtinSkills = listBuiltinSkills(config);
+  const installedSkills = listInstalledSkills(config);
+  const goalsSummary = summarizeGoals();
+  const skillEvolutionProposals = listSkillEvolutionProposals(config.skillEvolution.candidateDir);
+  const lastProposalAt = skillEvolutionProposals
+    .map((proposal) => proposal.createdAt)
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .sort((left, right) => right.localeCompare(left))[0] ?? null;
   return {
     status: circuitOpen ? "degraded" : "ok",
     planner: {
@@ -1296,17 +2547,757 @@ function buildHealthResponse(
     },
     runtime: {
       auto_resume_concurrency: config.policy.autoResumeConcurrency,
+      intent_routing: {
+        enabled: true,
+        supported_kinds: ["direct_answer", "research", "goal", "coding"],
+        planner_fallback_enabled: true,
+        recent_jobs: recentIntentRoutes,
+      },
+      goal_mode: {
+        enabled: true,
+        total_goals: goalsSummary.total,
+        running_goals: goalsSummary.running,
+        blocked_goals: goalsSummary.blocked,
+        waiting_review_goals: goalsSummary.waitingReview,
+        by_status: goalsSummary.byStatus,
+      },
+    },
+    skills: {
+      enabled: config.skills.enabled,
+      auto_install: config.skills.autoInstall,
+      builtin_dir: config.skills.builtinDir,
+      install_dir: config.skills.installDir,
+      allow_sources: config.skills.allowSources,
+      available_count: availableSkills.length,
+      builtin_count: builtinSkills.length,
+      explicit_install_count: installedSkills.filter((skill) => Boolean(getInstalledSkillRecord(config, skill.id))).length,
+      installed_count: installedSkills.length,
+      installed: installedSkills.map((skill) => {
+        const manifest = availableSkills.find((entry) => entry.id === skill.id);
+        return {
+          skill_id: skill.id,
+          title: manifest?.title ?? skill.id,
+          install_status: skill.enabled ? "installed" : "disabled",
+          source: skill.source,
+          intents: manifest?.intents ?? [],
+          location: skill.location,
+          explicit_install: Boolean(getInstalledSkillRecord(config, skill.id)),
+        };
+      }),
+    },
+    skill_evolution: {
+      enabled: config.skillEvolution.enabled,
+      auto_reflect: config.skillEvolution.autoReflect,
+      auto_propose: config.skillEvolution.autoPropose,
+      auto_audit: config.skillEvolution.autoAudit,
+      auto_validate: config.skillEvolution.autoValidate,
+      auto_accept: config.skillEvolution.autoAccept,
+      runtime_replay_in_auto_pipeline: config.skillEvolution.runtimeReplayInAutoPipeline,
+      candidate_dir: config.skillEvolution.candidateDir,
+      risk_tiering: {
+        enabled: config.skillEvolution.riskTiering.enabled,
+        default_tier: config.skillEvolution.riskTiering.defaultTier,
+        automation_ceilings: config.skillEvolution.riskTiering.automationCeilings,
+      },
+      proposal_count: skillEvolutionProposals.length,
+      audit_failed_count: skillEvolutionProposals.filter((proposal) => proposal.status === "audit_failed").length,
+      validation_failed_count: skillEvolutionProposals.filter((proposal) => proposal.status === "validation_failed").length,
+      accepted_count: skillEvolutionProposals.filter((proposal) => proposal.status === "accepted").length,
+      last_proposal_at: lastProposalAt,
     },
     models: getExposedModels(config).map((model) => model.id),
   };
 }
 
+function buildSkillListResponse(config = loadConfig()): Record<string, unknown> {
+  const available = listAvailableSkills(config);
+  return {
+    object: "list",
+    data: available.map((skill) => {
+      const installedRecord = getInstalledSkillRecord(config, skill.id);
+      const runtimeInstalled = listInstalledSkills(config).find((entry) => entry.id === skill.id);
+      return {
+        skill_id: skill.id,
+        version: skill.version,
+        title: skill.title,
+        description: skill.description,
+        intents: skill.intents,
+        source: skill.install.source,
+        install_status: installedRecord
+          ? "installed"
+          : runtimeInstalled
+            ? "builtin_available"
+            : "available",
+        auto_install_eligible: config.skills.enabled
+          && config.skills.autoInstall
+          && config.skills.allowSources.includes(skill.install.source),
+        explicit_install: Boolean(installedRecord),
+        location: runtimeInstalled?.location ?? skill.install.location,
+      };
+    }),
+  };
+}
+
+async function handleListSkills(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  jsonResponse(res, 200, buildSkillListResponse(config));
+}
+
+async function handleInstallSkill(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody<{ skill_id?: string }>(req);
+  const skillId = typeof body.skill_id === "string" ? body.skill_id.trim() : "";
+  if (!skillId) {
+    throw new Error("`skill_id` must be a non-empty string.");
+  }
+  const config = getRuntimeConfig();
+  const result = installSkillById(config, skillId);
+  const statusCode = result.status === "installed" || result.status === "already_installed"
+    ? 200
+    : result.status === "blocked" || result.status === "unavailable"
+      ? 409
+      : 400;
+  jsonResponse(res, statusCode, {
+    skill_id: result.skillId,
+    status: result.status,
+    reason: result.reason,
+    source: result.source ?? null,
+    location: result.location ?? result.record?.location ?? null,
+    record: result.record ?? null,
+  });
+}
+
+function buildSkillReflectionsResponse(skillId: string, candidateDir: string, limit?: number): Record<string, unknown> {
+  const records = listSkillReflectionRecords(skillId, candidateDir);
+  const data = Number.isFinite(limit) && (limit as number) >= 0
+    ? records.slice(0, limit as number)
+    : records;
+  return {
+    object: "list",
+    skill_id: skillId,
+    count: data.length,
+    data,
+  };
+}
+
+async function handleListSkillReflections(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  if (!getSkillManifest(skillId, config)) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill not found: ${skillId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  const limitRaw = url.searchParams.get("limit");
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
+  jsonResponse(res, 200, buildSkillReflectionsResponse(skillId, config.skillEvolution.candidateDir, limit));
+}
+
+function buildSkillReflectionFromRecord(record: StoredJobRecord): ReturnType<typeof buildSkillReflectionRecord> {
+  const events = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
+  const selectedSkill = resolveSelectedSkillSummary(record, events);
+  const skillVerification = resolveSkillVerificationSummary(record);
+  const skillOutcome = buildSkillOutcomeSummary(record, events, selectedSkill, skillVerification);
+  return buildSkillReflectionRecord(skillOutcome, {
+    record,
+    events,
+  });
+}
+
+function findLatestSkillJobRecord(skillId: string): StoredJobRecord | null {
+  for (const stored of listStoredJobs()) {
+    const record = readJobRecord(stored.id);
+    if (!record) {
+      continue;
+    }
+    const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
+    if (selectedSkillId === skillId) {
+      return record;
+    }
+  }
+  return null;
+}
+
+function findLatestSkillReflectionRecord(skillId: string, candidateDir: string): SkillReflectionRecord | null {
+  return listSkillReflectionRecords(skillId, candidateDir)[0] ?? null;
+}
+
+function findReflectionForProposalCreate(
+  config: OrchestratorConfig,
+  input: { skillId?: string; reflectionId?: string },
+): SkillReflectionRecord | null {
+  const requestedSkillId = input.skillId?.trim() ?? "";
+  const requestedReflectionId = input.reflectionId?.trim() ?? "";
+  if (requestedSkillId && requestedReflectionId) {
+    return readSkillReflectionRecord(requestedSkillId, requestedReflectionId, config.skillEvolution.candidateDir);
+  }
+  if (requestedReflectionId) {
+    for (const skill of listAvailableSkills(config)) {
+      const reflection = readSkillReflectionRecord(skill.id, requestedReflectionId, config.skillEvolution.candidateDir);
+      if (reflection) {
+        return reflection;
+      }
+    }
+    return null;
+  }
+  if (requestedSkillId) {
+    return findLatestSkillReflectionRecord(requestedSkillId, config.skillEvolution.candidateDir);
+  }
+  return null;
+}
+
+function appendBulletToMarkdownSection(markdown: string, heading: string, bullet: string): string {
+  const headingPattern = new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "im");
+  const lines = markdown.split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i").test(line.trim()));
+  if (headingIndex === -1) {
+    return `${markdown.trimEnd()}\n\n## ${heading}\n${bullet}\n`;
+  }
+  let insertIndex = lines.length;
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    if (/^##\s+/.test(lines[index] ?? "")) {
+      insertIndex = index;
+      break;
+    }
+  }
+  lines.splice(insertIndex, 0, bullet);
+  const next = lines.join("\n");
+  return headingPattern.test(next) ? next : `${next.trimEnd()}\n`;
+}
+
+function buildStructuredSkillMarkdown(
+  reflection: SkillReflectionRecord,
+  existingMarkdown: string | null,
+  skillId: string,
+): string {
+  const title = skillId;
+  const coreBullet = reflection.recommendedAction === "patch_verification"
+    ? `- Clarify the verification-critical steps for the ${reflection.reflectionKind} scenario: ${reflection.reason}`
+    : `- Refine the core procedure for the ${reflection.reflectionKind} scenario: ${reflection.reason}`;
+  const appendixBullet = `- Auto-evolve note (${reflection.reflectionKind}): ${reflection.reason}`;
+
+  const template = [
+    `# Skill: ${title}`,
+    "",
+    "## Core Procedure",
+    "- Start from the most relevant repository evidence before taking downstream action.",
+    "",
+    "## Scenario Extensions",
+    "- Add scenario-specific guidance here when repeated runs expose a reusable pattern.",
+    "",
+    "## Appendix",
+    "- Capture recurring pitfalls, evidence expectations, and reminders here.",
+    "",
+  ].join("\n");
+
+  let markdown = existingMarkdown && existingMarkdown.trim().length > 0
+    ? existingMarkdown
+    : template;
+  if (!/^#\s+Skill:/im.test(markdown)) {
+    markdown = `# Skill: ${title}\n\n${markdown.trimStart()}`;
+  }
+  if (!/^##\s+Core Procedure\s*$/im.test(markdown)) {
+    markdown = `${markdown.trimEnd()}\n\n## Core Procedure\n- Establish the stable body steps for this skill.\n`;
+  }
+  if (!/^##\s+Scenario Extensions\s*$/im.test(markdown)) {
+    markdown = `${markdown.trimEnd()}\n\n## Scenario Extensions\n- Add scenario-specific extensions here.\n`;
+  }
+  if (!/^##\s+Appendix\s*$/im.test(markdown)) {
+    markdown = `${markdown.trimEnd()}\n\n## Appendix\n- Capture recurring pitfalls and reminders here.\n`;
+  }
+
+  if (reflection.recommendedAction !== "append_appendix") {
+    markdown = appendBulletToMarkdownSection(markdown, "Core Procedure", coreBullet);
+  }
+  markdown = appendBulletToMarkdownSection(markdown, "Appendix", appendixBullet);
+  return markdown.endsWith("\n") ? markdown : `${markdown}\n`;
+}
+
+function buildSkillEvolutionProposal(
+  reflection: SkillReflectionRecord,
+  candidateDir: string,
+  config: OrchestratorConfig,
+): SkillEvolutionProposal {
+  return generateSkillEvolutionProposal({
+    reflection,
+    candidateDir,
+    config,
+    manifest: getSkillManifest(reflection.skillId, config),
+  });
+}
+
+async function handleCreateSkillReflection(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  if (!getSkillManifest(skillId, config)) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill not found: ${skillId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const body = await readJsonBody<{ job_id?: string }>(req);
+  const requestedJobId = typeof body.job_id === "string" ? body.job_id.trim() : "";
+  const record = requestedJobId
+    ? readJobRecord(requestedJobId)
+    : findLatestSkillJobRecord(skillId);
+
+  if (!record) {
+    jsonResponse(res, 404, {
+      error: {
+        message: requestedJobId
+          ? `Job not found: ${requestedJobId}`
+          : `No job history found for skill ${skillId}.`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
+  if (selectedSkillId !== skillId) {
+    jsonResponse(res, 409, {
+      error: {
+        message: `Job ${record.job.id} is associated with skill ${selectedSkillId ?? "unknown"}, not ${skillId}.`,
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  const reflection = buildSkillReflectionFromRecord(record);
+  if (!reflection) {
+    jsonResponse(res, 409, {
+      error: {
+        message: `Unable to build a reflection for skill ${skillId} from job ${record.job.id}.`,
+        type: "invalid_request_error",
+      },
+    });
+    return;
+  }
+
+  const path = persistSkillReflectionRecord(reflection, config.skillEvolution.candidateDir);
+  jsonResponse(res, 201, {
+    skill_id: skillId,
+    job_id: record.job.id,
+    reflection,
+    path,
+  });
+}
+
+async function handleCreateSkillProposal(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  if (!getSkillManifest(skillId, config)) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill not found: ${skillId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const body = await readJsonBody<{ reflection_id?: string }>(req);
+  const requestedReflectionId = typeof body.reflection_id === "string" ? body.reflection_id.trim() : "";
+  const reflection = requestedReflectionId
+    ? readSkillReflectionRecord(skillId, requestedReflectionId, config.skillEvolution.candidateDir)
+    : findLatestSkillReflectionRecord(skillId, config.skillEvolution.candidateDir);
+
+  if (!reflection) {
+    jsonResponse(res, 404, {
+      error: {
+        message: requestedReflectionId
+          ? `Reflection not found: ${requestedReflectionId}`
+          : `No reflection history found for skill ${skillId}.`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const proposal = buildSkillEvolutionProposal(reflection, config.skillEvolution.candidateDir, config);
+  const path = persistSkillEvolutionProposal(proposal, config.skillEvolution.candidateDir);
+  const candidatePath = getSkillEvolutionProposalCandidateRoot(proposal.id, config.skillEvolution.candidateDir);
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: proposal.createdAt,
+    type: "system.skill_evolution_proposed",
+    title: "Skill evolution proposed",
+    summary: proposal.patchSummary,
+    status: "running",
+    meta: {
+      skill_id: proposal.skillId,
+      reflection_id: proposal.sourceReflectionId,
+      proposal_id: proposal.id,
+      proposal_status: proposal.status,
+      patch_summary: proposal.patchSummary,
+      change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
+      rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
+      changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
+    },
+  }));
+  jsonResponse(res, 201, {
+    skill_id: skillId,
+    reflection_id: reflection.id,
+    proposal,
+    path,
+    candidate_path: candidatePath,
+  });
+}
+
+async function handleListSkillEvolutionProposals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  const ops = buildSkillEvolutionOpsSummary(config);
+  const proposals = listSkillEvolutionProposals(config.skillEvolution.candidateDir);
+  jsonResponse(res, 200, {
+    object: "list",
+    summary: isObjectRecord(ops.summary) ? ops.summary : {},
+    data: proposals
+      .map((proposal) => buildSkillEvolutionProposalControlPlaneRecord(proposal, config, proposals)),
+  });
+}
+
+async function handleSkillEvolutionOps(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  jsonResponse(res, 200, buildSkillEvolutionOpsSummary(config));
+}
+
+async function handleGetSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  const proposal = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
+  if (!proposal) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill evolution proposal not found: ${proposalId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+  jsonResponse(res, 200, buildSkillEvolutionProposalControlPlaneRecord(proposal, config));
+}
+
+async function handleCreateSkillEvolutionProposal(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  const body = await readJsonBody<{ skill_id?: string; reflection_id?: string }>(req);
+  const reflection = findReflectionForProposalCreate(config, {
+    skillId: typeof body.skill_id === "string" ? body.skill_id : undefined,
+    reflectionId: typeof body.reflection_id === "string" ? body.reflection_id : undefined,
+  });
+  if (!reflection) {
+    jsonResponse(res, 404, {
+      error: {
+        message: "No matching reflection found for proposal creation.",
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const proposal = buildSkillEvolutionProposal(reflection, config.skillEvolution.candidateDir, config);
+  const path = persistSkillEvolutionProposal(proposal, config.skillEvolution.candidateDir);
+  const candidatePath = getSkillEvolutionProposalCandidateRoot(proposal.id, config.skillEvolution.candidateDir);
+  appendEvent(createLifecycleEvent({
+    jobId: reflection.jobId,
+    seq: getNextSeq(reflection.jobId),
+    time: proposal.createdAt,
+    type: "system.skill_evolution_proposed",
+    title: "Skill evolution proposed",
+    summary: proposal.patchSummary,
+    status: "running",
+    meta: {
+      skill_id: proposal.skillId,
+      reflection_id: proposal.sourceReflectionId,
+      proposal_id: proposal.id,
+      proposal_status: proposal.status,
+      patch_summary: proposal.patchSummary,
+      change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
+      rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
+      changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
+    },
+  }));
+  jsonResponse(res, 201, {
+    skill_id: reflection.skillId,
+    reflection_id: reflection.id,
+    proposal,
+    path,
+    candidate_path: candidatePath,
+  });
+}
+
+async function handleAuditSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
+  if (!existing) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill evolution proposal not found: ${proposalId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  if (existing.status !== "draft") {
+    jsonResponse(res, 409, {
+      error: {
+        message: `Skill evolution proposal ${proposalId} cannot be audited from status ${existing.status}.`,
+        type: "conflict_error",
+      },
+    });
+    return;
+  }
+
+  const auditing = updateSkillEvolutionProposal(proposalId, (proposal) => ({
+    ...proposal,
+    status: "auditing",
+  }), config.skillEvolution.candidateDir);
+
+  if (!auditing) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill evolution proposal not found: ${proposalId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const reflection = readSkillReflectionRecord(auditing.skillId, auditing.sourceReflectionId, config.skillEvolution.candidateDir);
+  const manifest = getSkillManifest(auditing.skillId, config);
+  const audit = auditSkillEvolutionProposal({
+    proposal: auditing,
+    reflection,
+    manifest,
+  });
+  const path = persistSkillAuditReport(audit, config.skillEvolution.candidateDir);
+  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
+    ...current,
+    status: audit.passed ? "validated" : "audit_failed",
+    auditReportPath: path,
+  }), config.skillEvolution.candidateDir);
+  if (reflection && proposal) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: new Date().toISOString(),
+      type: audit.passed ? "system.skill_evolution_audit_passed" : "system.skill_evolution_audit_failed",
+      title: audit.passed ? "Skill evolution audit passed" : "Skill evolution audit failed",
+      summary: audit.summary,
+      status: audit.passed ? "success" : "blocked",
+      meta: {
+        skill_id: proposal.skillId,
+        reflection_id: proposal.sourceReflectionId,
+        proposal_id: proposal.id,
+        proposal_status: proposal.status,
+        audit_report_path: path,
+      },
+    }));
+  }
+
+  jsonResponse(res, 200, {
+    proposal,
+    audit,
+    path,
+  });
+}
+
+async function handleValidateSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
+  const config = getRuntimeConfig();
+  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
+  if (!existing) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill evolution proposal not found: ${proposalId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  if (existing.status !== "validated") {
+    jsonResponse(res, 409, {
+      error: {
+        message: `Skill evolution proposal ${proposalId} cannot be validated from status ${existing.status}.`,
+        type: "conflict_error",
+      },
+    });
+    return;
+  }
+
+  const reflection = readSkillReflectionRecord(existing.skillId, existing.sourceReflectionId, config.skillEvolution.candidateDir);
+  const baselineRecord = reflection?.jobId ? readJobRecord(reflection.jobId) : null;
+  const validation = await validateSkillEvolutionProposalWithRuntimeReplay({
+    proposal: existing,
+    reflection,
+    baselineRecord,
+    config,
+  });
+  const path = persistSkillDeploymentValidationReport(validation, config.skillEvolution.candidateDir);
+  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
+    ...current,
+    status: validation.passed ? "validated" : "validation_failed",
+    validationReportPath: path,
+  }), config.skillEvolution.candidateDir);
+  if (reflection && proposal) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: new Date().toISOString(),
+      type: validation.passed ? "system.skill_evolution_validation_passed" : "system.skill_evolution_validation_failed",
+      title: validation.passed ? "Skill evolution validation passed" : "Skill evolution validation failed",
+      summary: validation.summary,
+      status: validation.passed ? "success" : "blocked",
+      meta: {
+        skill_id: proposal.skillId,
+        reflection_id: proposal.sourceReflectionId,
+        proposal_id: proposal.id,
+        proposal_status: proposal.status,
+        validation_report_path: path,
+      },
+    }));
+  }
+
+  jsonResponse(res, 200, {
+    proposal,
+    validation,
+    path,
+  });
+}
+
+async function handleSkillEvolutionDecision(
+  req: IncomingMessage,
+  res: ServerResponse,
+  proposalId: string,
+  decision: SkillEvolutionDecisionRecord["decision"],
+): Promise<void> {
+  const config = getRuntimeConfig();
+  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
+  if (!existing) {
+    jsonResponse(res, 404, {
+      error: {
+        message: `Skill evolution proposal not found: ${proposalId}`,
+        type: "not_found_error",
+      },
+    });
+    return;
+  }
+
+  const allowedStatuses = decision === "accepted" ? new Set(["validated"]) : new Set(["validated", "validation_failed", "audit_failed", "draft"]);
+  if (!allowedStatuses.has(existing.status)) {
+    jsonResponse(res, 409, {
+      error: {
+        message: `Skill evolution proposal ${proposalId} cannot be ${decision} from status ${existing.status}.`,
+        type: "conflict_error",
+      },
+    });
+    return;
+  }
+
+  const body = await readJsonBody<{ reason?: string }>(req);
+  const reason = typeof body.reason === "string" && body.reason.trim().length > 0 ? body.reason.trim() : undefined;
+  let acceptResult: { appliedFiles: string[]; rollbackDir: string } | null = null;
+  if (decision === "accepted") {
+    try {
+      acceptResult = applyAcceptedSkillProposal(existing, config.skillEvolution.candidateDir);
+    } catch (error) {
+      jsonResponse(res, 409, {
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "conflict_error",
+        },
+      });
+      return;
+    }
+  }
+  const record: SkillEvolutionDecisionRecord = {
+    proposalId: existing.id,
+    skillId: existing.skillId,
+    decision,
+    reason,
+    createdAt: new Date().toISOString(),
+  };
+  const path = persistSkillEvolutionDecisionRecord(record, config.skillEvolution.candidateDir);
+  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
+    ...current,
+    status: decision,
+    decidedAt: record.createdAt,
+  }), config.skillEvolution.candidateDir);
+  const reflection = readSkillReflectionRecord(existing.skillId, existing.sourceReflectionId, config.skillEvolution.candidateDir);
+  if (reflection && proposal) {
+    appendEvent(createLifecycleEvent({
+      jobId: reflection.jobId,
+      seq: getNextSeq(reflection.jobId),
+      time: record.createdAt,
+      type: decision === "accepted" ? "system.skill_evolution_accepted" : "system.skill_evolution_rejected",
+      title: decision === "accepted" ? "Skill evolution accepted" : "Skill evolution rejected",
+      summary: proposal.controlPlaneSummary?.changeHeadline
+        ? `${proposal.controlPlaneSummary.changeHeadline}${reason ? `. ${reason}` : ""}`
+        : reason ? `${proposal.patchSummary}. ${reason}` : proposal.patchSummary,
+      status: decision === "accepted" ? "success" : "blocked",
+      meta: {
+        skill_id: proposal.skillId,
+        reflection_id: proposal.sourceReflectionId,
+        proposal_id: proposal.id,
+        proposal_status: proposal.status,
+        patch_summary: proposal.patchSummary,
+        change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
+        rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
+        changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
+        decision_reason: reason ?? null,
+      },
+    }));
+  }
+
+  jsonResponse(res, 200, {
+    proposal,
+    decision: record,
+    path,
+    applied_files: acceptResult?.appliedFiles ?? [],
+    rollback_path: decision === "accepted" ? getSkillEvolutionProposalRollbackRoot(existing.id, config.skillEvolution.candidateDir) : null,
+  });
+}
+
 function buildWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): unknown {
   return {
+    intent_route: payload.job.intentRoute ?? payload.plan.intentRoute ?? null,
     job: payload.job,
     plan: payload.plan,
     taskRuns: payload.taskRuns,
     artifacts: payload.artifacts,
+  };
+}
+
+function summarizeRecentIntentRoutes(limit = 10): Record<string, unknown> {
+  const records = listStoredJobs()
+    .slice(0, limit)
+    .map((stored) => readJobRecord(stored.id))
+    .filter((record): record is StoredJobRecord => Boolean(record));
+  const byKind: Record<string, number> = {};
+  const latest = records.map((record) => {
+    const route = record.job.intentRoute ?? record.plan.intentRoute;
+    const kind = route?.kind ?? "unknown";
+    byKind[kind] = (byKind[kind] ?? 0) + 1;
+    return {
+      job_id: record.job.id,
+      saved_at: record.savedAt,
+      kind,
+      source: route?.source ?? null,
+      reason: route?.reason ?? null,
+      mode: record.job.mode,
+      status: record.job.status,
+    };
+  });
+  return {
+    sample_size: records.length,
+    by_kind: byKind,
+    latest,
   };
 }
 
@@ -1374,6 +3365,17 @@ function createLifecycleEvent(input: {
     taskRunId: input.taskRunId,
     meta: input.meta ?? {},
   });
+}
+
+function intentRouteToMeta(intentRoute: IntentRouteMetadata | undefined): Record<string, unknown> {
+  if (!intentRoute) {
+    return {};
+  }
+  return {
+    intent_kind: intentRoute.kind,
+    intent_reason: intentRoute.reason,
+    intent_source: intentRoute.source,
+  };
 }
 
 function mapVerificationCheckType(check: VerificationCheck): string {
@@ -1476,6 +3478,7 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
       mode: record.job.mode,
       goal: record.job.goal,
       plan_id: record.plan.id,
+      ...intentRouteToMeta(record.job.intentRoute ?? record.plan.intentRoute),
     },
   }));
 
@@ -1490,8 +3493,27 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
     meta: {
       mode: record.plan.mode,
       task_run_ids: record.plan.taskRunIds,
+      ...intentRouteToMeta(record.plan.intentRoute ?? record.job.intentRoute),
     },
   }));
+
+  if (record.job.intentRoute ?? record.plan.intentRoute) {
+    const intentRoute = record.job.intentRoute ?? record.plan.intentRoute;
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: record.savedAt,
+      type: "system.intent_routed",
+      title: "Intent route selected",
+      summary: `Request routed to ${intentRoute?.kind ?? "unknown"}.`,
+      status: "running",
+      meta: {
+        ...intentRouteToMeta(intentRoute),
+        mode: record.job.mode,
+      },
+      phase: "decision",
+    }));
+  }
 
   for (const taskRun of record.taskRuns) {
     push(createLifecycleEvent({
@@ -1592,6 +3614,44 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
     }));
   }
 
+  const selectedSkill = resolveSelectedSkillSummary(record, events);
+  const skillVerification = resolveSkillVerificationSummary(record);
+  const skillOutcome = buildSkillOutcomeSummary(record, events, selectedSkill, skillVerification);
+  const skillReflection = buildSkillReflectionRecord(skillOutcome, {
+    record,
+    events,
+  });
+  if (skillReflection) {
+    push(createLifecycleEvent({
+      jobId: record.job.id,
+      seq,
+      time: skillReflection.createdAt,
+      type: "system.skill_reflection_recorded",
+      title: "Skill reflection recorded",
+      summary: skillReflection.reason,
+      status: skillReflection.reflectionKind === "skill_defect" || skillReflection.reflectionKind === "execution_lapse"
+        ? "blocked"
+        : "success",
+      meta: {
+        skill_id: skillReflection.skillId,
+        reflection_id: skillReflection.id,
+        reflection_kind: skillReflection.reflectionKind,
+        recommended_action: skillReflection.recommendedAction,
+        verification_status: skillReflection.evidence.verificationStatus ?? null,
+        failed_check_names: skillReflection.evidence.failedCheckNames,
+        missing_requirements: skillReflection.evidence.missingRequirements,
+        related_event_ids: skillReflection.evidence.eventIds,
+        related_artifact_ids: skillReflection.evidence.artifactIds,
+        silent_bypass_signal: skillReflection.evidence.silentBypassSignal ?? false,
+        failure_category: skillReflection.reflectionKind === "skill_defect"
+          ? "verification_failure"
+          : skillReflection.reflectionKind === "execution_lapse"
+            ? "execution_failure"
+            : undefined,
+      },
+    }));
+  }
+
   if (record.control?.cancelledAt) {
     push(createLifecycleEvent({
       jobId: record.job.id,
@@ -1658,6 +3718,7 @@ function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
     meta: {
       verified: record.job.verified,
       output_preview: record.job.output.slice(0, 200),
+      ...intentRouteToMeta(record.job.intentRoute ?? record.plan.intentRoute),
     },
   }));
 
@@ -1925,10 +3986,21 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
     .map((event, index) => ({ ...event, seq: index + 1 }));
 }
 
-async function recoverInterruptedJobs(autoResumeConcurrency = DEFAULT_AUTO_RESUME_CONCURRENCY): Promise<string[]> {
+async function recoverInterruptedJobs(
+  autoResumeConcurrency = DEFAULT_AUTO_RESUME_CONCURRENCY,
+  options?: {
+    jobIds?: string[];
+  },
+): Promise<string[]> {
   const recoveredJobIds: string[] = [];
   const recoveryCandidates: StoredJobRecord[] = [];
+  const allowedJobIds = Array.isArray(options?.jobIds)
+    ? new Set(options.jobIds.filter((jobId): jobId is string => typeof jobId === "string" && jobId.trim().length > 0))
+    : null;
   for (const stored of listStoredJobs()) {
+    if (allowedJobIds && !allowedJobIds.has(stored.id)) {
+      continue;
+    }
     if (stored.status !== "running") {
       continue;
     }
@@ -2094,14 +4166,37 @@ function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     : latestExecutorStatus(record);
   const follow = buildResumeFollowTarget(record.job.id, record.control?.resumedToJobId, routeBasePath);
   const actions = buildControlActions(record, routeBasePath);
+  const candidateSkills = resolveCandidateSkillsSummary(record, persistedEvents);
   const workflowSummary = buildWorkflowSummary(record);
+  const selectedSkill = resolveSelectedSkillSummary(record, persistedEvents);
+  const skillOutcome = buildSkillOutcomeSummary(
+    record,
+    persistedEvents,
+    selectedSkill,
+    isObjectRecord(workflowSummary.skill_verification) ? workflowSummary.skill_verification : null,
+  );
+  const skillReflection = buildSkillReflectionRecord(skillOutcome, {
+    record,
+    events: persistedEvents,
+  });
   return {
     saved_at: record.savedAt,
+    intent_route: record.job.intentRoute ?? record.plan.intentRoute ?? null,
+    candidate_skills: candidateSkills,
+    selected_skill: selectedSkill,
+    skill_outcome: skillOutcome,
+    skill_reflection: skillReflection,
     job: {
       ...record.job,
       status: liveJobStatus,
+      candidateSkills: record.job.candidateSkills ?? candidateSkills,
+      selectedSkill: record.job.selectedSkill ?? selectedSkill ?? undefined,
     },
-    plan: record.plan,
+    plan: {
+      ...record.plan,
+      candidateSkills: record.plan.candidateSkills ?? candidateSkills,
+      selectedSkill: record.plan.selectedSkill ?? selectedSkill ?? undefined,
+    },
     taskRuns: record.taskRuns,
     artifacts: record.artifacts,
     step_count: record.taskRuns.length,
@@ -2136,6 +4231,9 @@ function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     mode: record.job.mode,
     status: typeof job?.status === "string" ? job.status : record.job.status,
     verified: record.job.verified,
+    intent_route: response.intent_route ?? null,
+    candidate_skills: response.candidate_skills ?? [],
+    selected_skill: response.selected_skill ?? null,
     saved_at: response.saved_at,
     step_count: response.step_count,
     artifact_count: response.artifact_count,
@@ -2143,6 +4241,7 @@ function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     control: response.control,
     follow: response.follow,
     actions: response.actions,
+    workflow_summary: response.workflow_summary ?? null,
     ...buildJobRouteSet(record.job.id, routeBasePath),
     recovery: snapshot?.recovery ?? null,
   };
@@ -2162,6 +4261,174 @@ function buildListedJobsResponse(routeBasePath = "/v1/jobs"): Array<Record<strin
     }
     return [buildJobListItem(record, routeBasePath)];
   });
+}
+
+function normalizeJobDashboardFilter(value: string | null | undefined): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, "_")
+    .replaceAll(/^_+|_+$/g, "");
+}
+
+function getJobRouteKind(record: StoredJobRecord): string {
+  return normalizeJobDashboardFilter(record.job.intentRoute?.kind ?? record.plan.intentRoute?.kind ?? "unknown");
+}
+
+function buildListedJobsPageResponse(
+  routeBasePath = "/jobs",
+  options?: {
+    page?: number;
+    pageSize?: number;
+    status?: string | null;
+    route?: string | null;
+    query?: string | null;
+  },
+): {
+  object: "list";
+  data: Array<Record<string, unknown>>;
+  pagination: {
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+    has_prev: boolean;
+    has_next: boolean;
+  };
+  counts: {
+    by_status: Record<string, number>;
+    by_route: Record<string, number>;
+  };
+} {
+  const pageSize = Math.min(Math.max(options?.pageSize ?? 50, 1), 100);
+  const page = Math.max(options?.page ?? 1, 1);
+  const statusFilter = normalizeJobDashboardFilter(options?.status);
+  const routeFilter = normalizeJobDashboardFilter(options?.route);
+  const query = String(options?.query ?? "").trim().toLowerCase();
+
+  type DashboardJobRow = {
+    id: string;
+    goal: string;
+    status: string;
+    routeKind: string;
+    fallback?: Record<string, unknown>;
+    record?: StoredJobRecord;
+  };
+
+  const buildFallbackRow = (stored: { id: string; savedAt: string; status: Job["status"]; goal: string }): DashboardJobRow => ({
+    id: stored.id,
+    goal: stored.goal,
+    status: normalizeJobDashboardFilter(stored.status),
+    routeKind: "unknown",
+    fallback: {
+      id: stored.id,
+      goal: stored.goal,
+      status: stored.status,
+      saved_at: stored.savedAt,
+      ...buildJobRouteSet(stored.id, routeBasePath),
+    },
+  });
+
+  const queryRows = listStoredJobs()
+    .filter((stored) => {
+      if (!query) {
+        return true;
+      }
+      return stored.id.toLowerCase().includes(query) || stored.goal.toLowerCase().includes(query);
+    })
+    .map(buildFallbackRow);
+
+  const routeScopedRows = routeFilter
+    ? queryRows.flatMap<DashboardJobRow>((row) => {
+        const record = readJobRecord(row.id);
+        if (!record) {
+          return routeFilter === "unknown" ? [row] : [];
+        }
+        const routeKind = getJobRouteKind(record);
+        if (routeKind !== routeFilter) {
+          return [];
+        }
+        return [{
+          id: record.job.id,
+          goal: record.job.goal,
+          status: normalizeJobDashboardFilter(record.job.status),
+          routeKind,
+          record,
+        }];
+      })
+    : queryRows;
+
+  const byStatus = routeScopedRows.reduce<Record<string, number>>((acc, row) => {
+    acc[row.status] = (acc[row.status] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const statusScopedRows = statusFilter
+    ? routeScopedRows.filter((row) => row.status === statusFilter)
+    : routeScopedRows;
+
+  const total = statusScopedRows.length;
+  const totalPages = total === 0 ? 1 : Math.ceil(total / pageSize);
+  const safePage = Math.min(page, totalPages);
+  const start = (safePage - 1) * pageSize;
+  const pageRows = statusScopedRows.slice(start, start + pageSize);
+  const hydratePageRecords = Boolean(query || routeFilter);
+  const pageItems = pageRows.flatMap((row) => {
+    if (row.record) {
+      return [{
+        row: {
+          ...row,
+          routeKind: getJobRouteKind(row.record),
+        },
+        item: buildJobListItem(row.record, routeBasePath),
+      }];
+    }
+    const record = hydratePageRecords ? readJobRecord(row.id) : null;
+    if (record) {
+      return [{
+        row: {
+          ...row,
+          status: normalizeJobDashboardFilter(record.job.status),
+          routeKind: getJobRouteKind(record),
+        },
+        item: buildJobListItem(record, routeBasePath),
+      }];
+    }
+    return [{
+      row,
+      item: row.fallback ?? {
+        id: row.id,
+        goal: row.goal,
+        status: row.status,
+        ...buildJobRouteSet(row.id, routeBasePath),
+      },
+    }];
+  });
+
+  const routeCountRows = routeFilter
+    ? statusScopedRows
+    : pageItems.map((entry) => entry.row);
+  const byRoute = routeCountRows.reduce<Record<string, number>>((acc, row) => {
+    acc[row.routeKind] = (acc[row.routeKind] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  return {
+    object: "list",
+    data: pageItems.map((entry) => entry.item),
+    pagination: {
+      page: safePage,
+      page_size: pageSize,
+      total,
+      total_pages: totalPages,
+      has_prev: safePage > 1,
+      has_next: safePage < totalPages,
+    },
+    counts: {
+      by_status: byStatus,
+      by_route: byRoute,
+    },
+  };
 }
 
 function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> {
@@ -2204,9 +4471,26 @@ function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> 
   const currentTask = getWorkflowCurrentTask(record);
   const awaitingApprovalTask = getWorkflowAwaitingApprovalTask(record);
   const workflowGraph = record.workflowGraph ?? record.job.workflowGraph ?? buildWorkflowGraph(record.plan.id, record.taskRuns, record.plan.summary);
+  const persistedEvents = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
+  const candidateSkills = resolveCandidateSkillsSummary(record, persistedEvents);
+  const selectedSkill = resolveSelectedSkillSummary(record, persistedEvents);
+  const skillVerification = resolveSkillVerificationSummary(record);
+  const skillEvolution = resolveSkillEvolutionSummary(record);
+  const skillOutcome = buildSkillOutcomeSummary(record, persistedEvents, selectedSkill, skillVerification);
+  const skillReflection = buildSkillReflectionRecord(skillOutcome, {
+    record,
+    events: persistedEvents,
+  });
 
   return {
     workflow_id: record.plan.id,
+    intent_route: record.job.intentRoute ?? record.plan.intentRoute ?? null,
+    candidate_skills: candidateSkills,
+    selected_skill: selectedSkill,
+    skill_verification: skillVerification,
+    skill_evolution: skillEvolution,
+    skill_outcome: skillOutcome,
+    skill_reflection: skillReflection,
     task_counts: counts,
     current_task: currentTask
       ? {
@@ -2769,6 +5053,7 @@ async function executeTaskGoal(
   onEvent?: OrchestratorEventCallback,
   fixedIds?: FixedTaskIds,
   onRegistered?: (jobId: string) => void,
+  presetIntentRoute?: IntentRouteMetadata,
 ): Promise<TaskExecutionPayload> {
   ensureRuntimeDirectories();
   const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
@@ -2816,6 +5101,11 @@ async function executeTaskGoal(
     onEvent?.(event);
   };
 
+  let verificationConfig: OrchestratorConfig | undefined;
+  let modelSelection: { exposed: ExposedModel; resolvedConfig: OrchestratorConfig } | undefined;
+  let resolvedIntentRoute = presetIntentRoute;
+  let logger: ReturnType<typeof createRunLogger> | undefined;
+
   registerActiveJobSession(jobId, userGoal, abortController);
   onRegistered?.(jobId);
   const pendingTaskRun = createTaskRunRecord({
@@ -2834,6 +5124,7 @@ async function executeTaskGoal(
     mode: "task",
     taskRunIds: [taskRunId],
     summary: "Single-task orchestration run.",
+    intentRoute: resolvedIntentRoute,
   });
   const pendingJob = createJobRecord({
     id: jobId,
@@ -2845,6 +5136,7 @@ async function executeTaskGoal(
     plan: pendingPlan,
     taskRuns: [pendingTaskRun],
     artifacts: [],
+    intentRoute: resolvedIntentRoute,
   });
   persistWorkflowPayload({
     job: pendingJob,
@@ -2856,18 +5148,56 @@ async function executeTaskGoal(
     mode: pendingJob.mode,
     goal: pendingJob.goal,
     plan_id: pendingPlan.id,
+    ...intentRouteToMeta(resolvedIntentRoute),
   }, "start");
   emitLifecycle("job.started", "Job started", "Execution started for the requested goal.", "running", {
     plan_id: pendingPlan.id,
     task_run_id: pendingTaskRun.id,
+    ...intentRouteToMeta(resolvedIntentRoute),
   }, "start");
+
+  if (!injectedTaskExecutor) {
+    const baseConfig = loadConfig();
+    modelSelection = resolveRequestedModel(baseConfig, model);
+    verificationConfig = modelSelection.resolvedConfig;
+    logger = createRunLogger(userGoal);
+    resolvedIntentRoute = presetIntentRoute ?? await detectIntentRoute({
+      config: modelSelection.resolvedConfig,
+      userGoal,
+      logger,
+      options: {
+        abortSignal: abortController.signal,
+        jobId,
+        planId,
+        taskRunId,
+        onEvent: forwardRuntimeEvent,
+      },
+      allowPlannerFallback: true,
+    });
+  }
+
+  if (resolvedIntentRoute) {
+    updateStoredJobRecord(jobId, (record) => {
+      const plan = { ...record.plan, intentRoute: resolvedIntentRoute };
+      const job = { ...record.job, intentRoute: resolvedIntentRoute, plan };
+      return {
+        ...record,
+        savedAt: new Date().toISOString(),
+        job,
+        plan,
+      };
+    });
+    emitLifecycle("system.intent_routed", "Intent route selected", `Request routed to ${resolvedIntentRoute.kind}.`, "running", {
+      mode: pendingJob.mode,
+      ...intentRouteToMeta(resolvedIntentRoute),
+    }, "decision");
+  }
   try {
     if (abortController.signal.aborted) {
       throw new Error("Run cancelled before start.");
     }
 
     let payload: TaskExecutionPayload;
-    let verificationConfig: OrchestratorConfig | undefined;
     if (injectedTaskExecutor) {
       payload = await injectedTaskExecutor(userGoal, model, requirePlannerCircuit, {
         jobId,
@@ -2877,25 +5207,30 @@ async function executeTaskGoal(
         emitEvent: forwardRuntimeEvent,
       });
     } else {
-      const baseConfig = loadConfig();
-      const modelSelection = resolveRequestedModel(baseConfig, model);
-      verificationConfig = modelSelection.resolvedConfig;
       if (requirePlannerCircuit) {
         assertPlannerCircuitClosed();
       }
-      const logger = createRunLogger(userGoal);
-      const routing = loadTaskRoutingConfig(modelSelection.resolvedConfig.taskRoutingPath);
-      const taskType = detectTaskType(userGoal, routing);
-      const routePolicy = getRoutePolicy(taskType, routing);
       let result;
       try {
-        result = await runTask(modelSelection.resolvedConfig, userGoal, routePolicy, logger, undefined, {
+        const runOptions = {
           abortSignal: abortController.signal,
           jobId,
           planId,
           taskRunId,
           onEvent: forwardRuntimeEvent,
-        });
+        };
+        result = await dispatchTaskIntentRoute(
+          modelSelection!.resolvedConfig,
+          userGoal,
+          resolvedIntentRoute ?? {
+            kind: "research",
+            reason: "defaulted task dispatch route",
+            source: "heuristic",
+          },
+          logger,
+          undefined,
+          runOptions,
+        );
         if (requirePlannerCircuit) {
           markPlannerSuccess();
         }
@@ -2908,12 +5243,19 @@ async function executeTaskGoal(
 
       payload = {
         content: result.output || "",
-        logPath: logger.logPath,
-        resolvedModel: modelSelection.exposed.id,
-        job: result.job,
-        plan: result.plan,
+        logPath: logger!.logPath,
+        resolvedModel: modelSelection!.exposed.id,
+        job: {
+          ...result.job,
+          intentRoute: resolvedIntentRoute,
+        },
+        plan: {
+          ...result.plan,
+          intentRoute: resolvedIntentRoute,
+        },
         taskRuns: result.taskRuns,
         artifacts: result.artifacts,
+        intentRoute: resolvedIntentRoute,
       };
     }
 
@@ -2931,6 +5273,10 @@ async function executeTaskGoal(
       taskRuns: payload.taskRuns,
       artifacts: payload.artifacts,
     });
+    const persistedRecord = readJobRecord(verifiedJob.id);
+    if (persistedRecord) {
+      await runAutomaticSkillEvolutionForRecord(persistedRecord, verificationConfig ?? loadConfig());
+    }
     emitLifecycle(mapJobStatusToLifecycleType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatusToUiStatus(verifiedJob.status), {
       verified: verifiedJob.verified,
       output_preview: verifiedJob.output.slice(0, 200),
@@ -2989,6 +5335,13 @@ async function executeTeamGoal(
   model: string | undefined,
   fixedIds?: FixedTaskIds,
   approvalMode?: string,
+  onEvent?: OrchestratorEventCallback,
+  onRegistered?: (jobId: string) => void,
+  intentRoute: IntentRouteMetadata = {
+    kind: "goal",
+    reason: "team execution path selected",
+    source: "heuristic",
+  },
 ): Promise<TaskExecutionPayload> {
   ensureRuntimeDirectories();
   const jobId = fixedIds?.jobId ?? `job_${randomUUID()}`;
@@ -3032,9 +5385,11 @@ async function executeTeamGoal(
       new Date().toISOString(),
       taskRunId,
     ));
+    onEvent?.(event);
   };
 
   registerActiveJobSession(jobId, userGoal, abortController);
+  onRegistered?.(jobId);
   const pendingTaskRun = createTaskRunRecord({
     id: taskRunId,
     title: "Team Root Task",
@@ -3051,6 +5406,7 @@ async function executeTeamGoal(
     mode: "team",
     taskRunIds: [taskRunId],
     summary: "Team orchestration run.",
+    intentRoute,
   });
   const pendingJob = createJobRecord({
     id: jobId,
@@ -3062,6 +5418,7 @@ async function executeTeamGoal(
     plan: pendingPlan,
     taskRuns: [pendingTaskRun],
     artifacts: [],
+    intentRoute,
   });
   persistWorkflowPayload({
     job: pendingJob,
@@ -3073,11 +5430,17 @@ async function executeTeamGoal(
     mode: pendingJob.mode,
     goal: pendingJob.goal,
     plan_id: pendingPlan.id,
+    ...intentRouteToMeta(intentRoute),
   }, "start");
   emitLifecycle("job.started", "Job started", "Execution started for the requested team goal.", "running", {
     plan_id: pendingPlan.id,
     task_run_id: pendingTaskRun.id,
+    ...intentRouteToMeta(intentRoute),
   }, "start");
+  emitLifecycle("system.intent_routed", "Intent route selected", `Request routed to ${intentRoute.kind}.`, "running", {
+    mode: pendingJob.mode,
+    ...intentRouteToMeta(intentRoute),
+  }, "decision");
 
   try {
     let payload: TaskExecutionPayload;
@@ -3115,10 +5478,12 @@ async function executeTeamGoal(
           ...result.job,
           id: jobId,
           plan: { ...result.plan, id: planId },
+          intentRoute,
         },
-        plan: { ...result.plan, id: planId },
+        plan: { ...result.plan, id: planId, intentRoute },
         taskRuns: result.taskRuns,
         artifacts: result.artifacts,
+        intentRoute,
       };
     }
 
@@ -3136,6 +5501,10 @@ async function executeTeamGoal(
       taskRuns: payload.taskRuns,
       artifacts: payload.artifacts,
     });
+    const persistedRecord = readJobRecord(verifiedJob.id);
+    if (persistedRecord) {
+      await runAutomaticSkillEvolutionForRecord(persistedRecord, verificationConfig ?? loadConfig());
+    }
     emitLifecycle(mapJobStatusToLifecycleType(verifiedJob.status), "Job finished", `Job finished with status ${verifiedJob.status}.`, mapJobStatusToUiStatus(verifiedJob.status), {
       verified: verifiedJob.verified,
       output_preview: verifiedJob.output.slice(0, 200),
@@ -3198,6 +5567,25 @@ async function executeJobByMode(
   return executeTaskGoal(goal, model, options?.requirePlannerCircuit ?? true, undefined, options?.fixedIds);
 }
 
+async function executePromptByIntent(
+  goal: string,
+  model: string | undefined,
+  onEvent?: OrchestratorEventCallback,
+  onRegistered?: (jobId: string) => void,
+): Promise<TaskExecutionPayload> {
+  const baseConfig = loadConfig();
+  const modelSelection = resolveRequestedModel(baseConfig, model);
+  const intentRoute = await detectIntentRoute({
+    config: modelSelection.resolvedConfig,
+    userGoal: goal,
+    allowPlannerFallback: true,
+  });
+  if (shouldDispatchToTeam(intentRoute)) {
+    return executeTeamGoal(goal, model, undefined, undefined, onEvent, onRegistered, intentRoute);
+  }
+  return executeTaskGoal(goal, model, true, onEvent, undefined, onRegistered, intentRoute);
+}
+
 async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExecutionPayload> {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
@@ -3214,7 +5602,17 @@ async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExec
     return controlResponse;
   }
 
-  return executeTaskGoal(userGoal, body.model, false);
+  const baseConfig = loadConfig();
+  const modelSelection = resolveRequestedModel(baseConfig, body.model);
+  const intentRoute = await detectIntentRoute({
+    config: modelSelection.resolvedConfig,
+    userGoal,
+    allowPlannerFallback: true,
+  });
+  if (shouldDispatchToTeam(intentRoute)) {
+    return executeTeamGoal(userGoal, body.model, undefined, undefined, undefined, undefined, intentRoute);
+  }
+  return executeTaskGoal(userGoal, body.model, false, undefined, undefined, undefined, intentRoute);
 }
 
 async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
@@ -3233,7 +5631,7 @@ async function runTaskFromMessages(messages: OpenAIMessage[], model: string | un
     return controlResponse;
   }
 
-  return executeTaskGoal(userGoal, model, true, onEvent);
+  return executePromptByIntent(userGoal, model, onEvent);
 }
 
 async function runTaskFromMessagesWithRegistration(
@@ -3257,7 +5655,7 @@ async function runTaskFromMessagesWithRegistration(
     return controlResponse;
   }
 
-  return executeTaskGoal(userGoal, model, true, onEvent, undefined, onRegistered);
+  return executePromptByIntent(userGoal, model, onEvent, onRegistered);
 }
 
 function attachRequestAbortCancellation(
@@ -3318,7 +5716,7 @@ async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise
 }
 
 async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = loadConfig();
+  const config = getRuntimeConfig();
   const healthSelection = await buildHealthyExecutorRuntimeConfig(config);
   const payload = buildHealthResponse(healthSelection.config, healthSelection.results);
   if (healthSelection.healthyExecutorIds.length === 0) {
@@ -3334,8 +5732,393 @@ async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promi
   });
 }
 
+function normalizeCreateGoalInput(body: CreateGoalRequest): CreateGoalInput {
+  const goal = typeof body.goal === "string" ? body.goal.trim() : "";
+  if (!goal) {
+    throw new Error("`goal` must be a non-empty string.");
+  }
+  const tasks: GoalTaskInput[] | undefined = Array.isArray(body.tasks)
+    ? body.tasks.flatMap((task) => {
+        const title = typeof task?.title === "string" ? task.title.trim() : "";
+        const description = typeof task?.description === "string" ? task.description.trim() : "";
+        if (!title && !description) {
+          return [];
+        }
+        const mode: GoalTaskMode = task?.mode === "team" ? "team" : "task";
+        return [{
+          title: title || description,
+          description: description || title,
+          mode,
+        }];
+      })
+    : undefined;
+  const plannedTasks = tasks && tasks.length > 0
+    ? (body.insert_large_checks === true ? insertLargeCheckTasks(tasks) : tasks)
+    : planGoalTasks(goal);
+  return {
+    goal,
+    tasks: plannedTasks,
+  };
+}
+
+async function handleListGoals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  jsonResponse(res, 200, {
+    object: "list",
+    data: listGoals(),
+  });
+}
+
+function buildGoalRouteSet(
+  goalId: string,
+  routeBasePath = "/v1/goals",
+): Pick<GoalDashboardItem, "detail_url" | "timeline_url" | "events_url"> {
+  return {
+    detail_url: `${routeBasePath}/${goalId}`,
+    timeline_url: `${routeBasePath}/${goalId}/timeline`,
+    events_url: `${routeBasePath}/${goalId}/events`,
+  };
+}
+
+function buildGoalActions(record: GoalRecord, routeBasePath = "/v1/goals"): GoalDashboardItem["actions"] {
+  const actions: GoalDashboardItem["actions"] = [
+    { label: "Timeline", href: `${routeBasePath}/${record.id}/timeline`, kind: "link", emphasis: "primary" },
+    { label: "Details", href: `${routeBasePath}/${record.id}`, kind: "link" },
+  ];
+  if (record.status === "waiting_review") {
+    actions.push({ label: "Review", href: `${routeBasePath}/${record.id}/review`, kind: "api", method: "POST" });
+  } else if (record.tasks.some((task) => task.status === "blocked")) {
+    actions.push({ label: "Resume", href: `${routeBasePath}/${record.id}/resume`, kind: "api", method: "POST" });
+    actions.push({ label: "Retry", href: `${routeBasePath}/${record.id}/retry`, kind: "api", method: "POST" });
+  } else if (record.tasks.some((task) => task.status === "failed")) {
+    actions.push({ label: "Retry", href: `${routeBasePath}/${record.id}/retry`, kind: "api", method: "POST" });
+  } else if (record.tasks.some((task) => task.status === "pending")) {
+    actions.push({ label: "Run Next", href: `${routeBasePath}/${record.id}/run-next`, kind: "api", method: "POST" });
+  }
+  return actions;
+}
+
+function buildGoalListItem(record: GoalRecord, routeBasePath = "/v1/goals"): GoalDashboardItem {
+  const currentTask = record.tasks.find((task) => task.id === record.currentTaskId) ?? null;
+  return {
+    id: record.id,
+    goal: record.goal,
+    status: record.status,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+    completed_task_count: record.completedTaskCount,
+    total_task_count: record.tasks.length,
+    current_task: currentTask
+      ? {
+          id: currentTask.id,
+          title: currentTask.title,
+          status: currentTask.status,
+          mode: currentTask.mode,
+        }
+      : null,
+    final_review_status: record.finalReview.status,
+    actions: buildGoalActions(record, routeBasePath),
+    ...buildGoalRouteSet(record.id, routeBasePath),
+  };
+}
+
+function buildListedGoalsResponse(routeBasePath = "/v1/goals"): GoalDashboardItem[] {
+  return listGoals().flatMap((stored) => {
+    const record = readGoal(stored.id);
+    return record ? [buildGoalListItem(record, routeBasePath)] : [];
+  });
+}
+
+async function handleCreateGoal(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody<CreateGoalRequest>(req);
+  const input = normalizeCreateGoalInput(body);
+  const record = buildGoalRecord(input);
+  persistGoal(record);
+  appendGoalEvent(record.id, {
+    type: "goal.created",
+    title: "Goal created",
+    summary: `Created goal ${record.id} with ${record.tasks.length} planned tasks.`,
+    status: "success",
+    meta: {
+      goal_id: record.id,
+      task_count: record.tasks.length,
+      status: record.status,
+    },
+  });
+  jsonResponse(res, 201, buildGoalResponse(record));
+}
+
+async function handleGoalEvents(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const record = readGoal(goalId);
+  if (!record) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  jsonResponse(res, 200, {
+    object: "list",
+    goal_id: goalId,
+    data: readGoalEvents(goalId),
+  });
+}
+
+async function handleGetGoal(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const record = readGoal(goalId);
+  if (!record) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  jsonResponse(res, 200, buildGoalResponse(record));
+}
+
+async function handleRunNextGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const body = await readJsonBody<{ model?: string }>(req);
+  const existing = readGoal(goalId);
+  if (!existing) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const pendingTask = existing.tasks.find((task) => task.status === "pending");
+  appendGoalEvent(goalId, {
+    type: "goal.run_next_started",
+    title: "Run-next started",
+    summary: pendingTask
+      ? `Starting goal task ${pendingTask.title}.`
+      : "Starting next pending goal task.",
+    status: "running",
+    meta: {
+      goal_id: goalId,
+      task_id: pendingTask?.id ?? null,
+      task_title: pendingTask?.title ?? null,
+      task_kind: pendingTask?.kind ?? null,
+    },
+  });
+  let result;
+  try {
+    result = await runNextGoalTask(goalId, {
+      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
+    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const statusCode = message.includes("no pending tasks") ? 409 : 400;
+    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  appendGoalEvent(goalId, {
+    type: "goal.run_next_completed",
+    title: "Run-next completed",
+    summary: `Task ${result.executedTask.title} finished with status ${result.executedTask.status}.`,
+    status: result.executedTask.status === "completed" ? "success" : result.executedTask.status === "blocked" ? "blocked" : "failed",
+    meta: {
+      goal_id: goalId,
+      task_id: result.executedTask.id,
+      task_title: result.executedTask.title,
+      task_kind: result.executedTask.kind,
+      task_status: result.executedTask.status,
+      job_id: result.execution.job.id,
+      goal_status: result.goal.status,
+      verified: result.execution.job.verified,
+    },
+  });
+  jsonResponse(res, 200, {
+    object: "goal_run",
+    goal: result.goal,
+    executed_task: result.executedTask,
+    execution: {
+      job_id: result.execution.job.id,
+      status: result.execution.job.status,
+      verified: result.execution.job.verified,
+      output: result.execution.job.output,
+    },
+    control: buildGoalResponse(result.goal).control,
+    recent_events: readGoalEvents(goalId).slice(-10),
+    links: {
+      goal: `/v1/goals/${goalId}`,
+      events: `/v1/goals/${goalId}/events`,
+      job: `/v1/jobs/${result.execution.job.id}`,
+    },
+  });
+}
+
+async function handleRetryGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const body = await readJsonBody<{ model?: string }>(req);
+  const existing = readGoal(goalId);
+  if (!existing) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const retryableTask = [...existing.tasks].reverse().find((task) => task.status === "failed" || task.status === "blocked");
+  appendGoalEvent(goalId, {
+    type: "goal.retry_started",
+    title: "Goal retry started",
+    summary: retryableTask
+      ? `Retrying goal task ${retryableTask.title}.`
+      : "Retrying latest failed or blocked goal task.",
+    status: "running",
+    meta: {
+      goal_id: goalId,
+      task_id: retryableTask?.id ?? null,
+      task_title: retryableTask?.title ?? null,
+      task_kind: retryableTask?.kind ?? null,
+    },
+  });
+  try {
+    const result = await retryGoalTask(goalId, {
+      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
+    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
+    appendGoalEvent(goalId, {
+      type: "goal.retry_completed",
+      title: "Goal retry completed",
+      summary: `Retried task ${result.executedTask.title} finished with status ${result.executedTask.status}.`,
+      status: result.executedTask.status === "completed" ? "success" : result.executedTask.status === "blocked" ? "blocked" : "failed",
+      meta: {
+        goal_id: goalId,
+        task_id: result.executedTask.id,
+        task_title: result.executedTask.title,
+        task_kind: result.executedTask.kind,
+        task_status: result.executedTask.status,
+        job_id: result.execution.job.id,
+        goal_status: result.goal.status,
+        verified: result.execution.job.verified,
+      },
+    });
+    jsonResponse(res, 200, {
+      object: "goal_run",
+      goal: result.goal,
+      executed_task: result.executedTask,
+      execution: {
+        job_id: result.execution.job.id,
+        status: result.execution.job.status,
+        verified: result.execution.job.verified,
+        output: result.execution.job.output,
+      },
+      control: buildGoalResponse(result.goal).control,
+      recent_events: readGoalEvents(goalId).slice(-10),
+      links: {
+        goal: `/v1/goals/${goalId}`,
+        events: `/v1/goals/${goalId}/events`,
+        job: `/v1/jobs/${result.execution.job.id}`,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const statusCode = message.includes("not found") ? 404 : message.includes("no retryable tasks") ? 409 : 400;
+    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : statusCode === 404 ? "not_found_error" : "invalid_request_error", {
+      status: "failed",
+    });
+  }
+}
+
+async function handleResumeGoal(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const existing = readGoal(goalId);
+  if (!existing) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  try {
+    const record = resumeGoal(goalId);
+    const resumedTask = record.tasks.find((task) => task.status === "pending" && task.id === record.currentTaskId);
+    appendGoalEvent(goalId, {
+      type: "goal.resumed",
+      title: "Goal resumed",
+      summary: resumedTask
+        ? `Resumed blocked task ${resumedTask.title}.`
+        : "Goal moved back to ready state.",
+      status: "success",
+      meta: {
+        goal_id: goalId,
+        task_id: resumedTask?.id ?? null,
+        task_title: resumedTask?.title ?? null,
+        task_kind: resumedTask?.kind ?? null,
+        goal_status: record.status,
+      },
+    });
+    jsonResponse(res, 200, buildGoalResponse(record));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const statusCode = message.includes("no resumable tasks") ? 409 : 400;
+    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
+      status: "failed",
+    });
+  }
+}
+
+async function handleReviewGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
+  const body = await readJsonBody<{ model?: string }>(req);
+  const existing = readGoal(goalId);
+  if (!existing) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  appendGoalEvent(goalId, {
+    type: "goal.review_started",
+    title: "Goal review started",
+    summary: "Starting final review for the completed goal tasks.",
+    status: "running",
+    meta: {
+      goal_id: goalId,
+      completed_task_count: existing.completedTaskCount,
+      total_task_count: existing.tasks.length,
+    },
+  });
+  try {
+    const result = await reviewGoal(goalId, {
+      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
+    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
+    appendGoalEvent(goalId, {
+      type: "goal.review_completed",
+      title: "Goal review completed",
+      summary: `Final review finished with status ${result.goal.finalReview.status}.`,
+      status: result.goal.finalReview.status === "completed" ? "completed" : result.goal.finalReview.status === "blocked" ? "blocked" : "failed",
+      meta: {
+        goal_id: goalId,
+        job_id: result.execution.job.id,
+        review_status: result.goal.finalReview.status,
+        goal_status: result.goal.status,
+        verified: result.execution.job.verified,
+      },
+    });
+    jsonResponse(res, 200, {
+      object: "goal_review",
+      goal: result.goal,
+      final_review: result.goal.finalReview,
+      execution: {
+        job_id: result.execution.job.id,
+        status: result.execution.job.status,
+        verified: result.execution.job.verified,
+        output: result.execution.job.output,
+      },
+      control: buildGoalResponse(result.goal).control,
+      recent_events: readGoalEvents(goalId).slice(-10),
+      links: {
+        goal: `/v1/goals/${goalId}`,
+        events: `/v1/goals/${goalId}/events`,
+        job: `/v1/jobs/${result.execution.job.id}`,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const statusCode = message.includes("not ready for final review") || message.includes("already completed") ? 409 : 400;
+    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
+      status: "failed",
+    });
+  }
+}
+
 async function handleJobsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const html = renderJobsDashboardHtml(buildListedJobsResponse("/jobs") as Array<{
+  const html = renderJobsDashboardHtml([] as Array<{
     id: string;
     goal: string;
     mode?: string;
@@ -3348,11 +6131,63 @@ async function handleJobsDashboard(_req: IncomingMessage, res: ServerResponse): 
   res.end(html);
 }
 
-async function handleBrowserListJobs(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleGoalsDashboard(_req: IncomingMessage, res: ServerResponse, routeBasePath = "/v1/goals"): Promise<void> {
+  const html = renderGoalsDashboardHtml(buildListedGoalsResponse(routeBasePath), {
+    dataUrl: routeBasePath === "/goals" ? "/goals/data" : "/v1/goals/data",
+  });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
+}
+
+async function handleBrowserListGoals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   jsonResponse(res, 200, {
     object: "list",
-    data: buildListedJobsResponse("/jobs"),
+    data: buildListedGoalsResponse("/goals"),
   });
+}
+
+async function handleGoalTimeline(_req: IncomingMessage, res: ServerResponse, goalId: string, routeBasePath = "/v1/goals"): Promise<void> {
+  const record = readGoal(goalId);
+  if (!record) {
+    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const html = renderGoalTimelineHtml(record, readGoalEvents(goalId), {
+    routeBasePath,
+    apiBasePath: routeBasePath === "/goals" ? "/v1/goals" : routeBasePath,
+  });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
+}
+
+async function handleBrowserListJobs(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url || "/", "http://localhost");
+  const pageResult = parseNonNegativeIntegerParam(url.searchParams.get("page"), "page");
+  if (!pageResult.ok) {
+    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const pageSizeResult = parseNonNegativeIntegerParam(url.searchParams.get("page_size"), "page_size");
+  if (!pageSizeResult.ok) {
+    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+
+  jsonResponse(res, 200, buildListedJobsPageResponse("/jobs", {
+    page: Math.max(pageResult.value ?? 1, 1),
+    pageSize: Math.min(Math.max(pageSizeResult.value ?? 50, 1), 100),
+    status: url.searchParams.get("status"),
+    route: url.searchParams.get("route"),
+    query: url.searchParams.get("q"),
+  }));
 }
 
 async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -3551,10 +6386,25 @@ async function handleGetJobEvents(
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const sinceSeqRaw = url.searchParams.get("since_seq");
   const limitRaw = url.searchParams.get("limit");
-  const sinceSeq = sinceSeqRaw ? Number.parseInt(sinceSeqRaw, 10) : undefined;
-  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
+  const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
+  if (!sinceSeqResult.ok) {
+    jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const limitResult = parseNonNegativeIntegerParam(limitRaw, "limit");
+  if (!limitResult.ok) {
+    jsonErrorResponse(res, 400, limitResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const sinceSeq = sinceSeqResult.value;
+  const limit = limitResult.value;
 
-  let events = mergeJobEvents(record, loadEventsFromDisk(jobId));
+  const fullEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
+  let events = fullEvents;
   if (Number.isFinite(sinceSeq)) {
     events = events.filter((event) => event.seq > (sinceSeq as number));
   }
@@ -3564,7 +6414,7 @@ async function handleGetJobEvents(
   jsonResponse(res, 200, {
     job_id: jobId,
     count: events.length,
-    snapshot: buildEventSnapshot(record, events, routeBasePath),
+    snapshot: buildEventSnapshot(record, fullEvents, routeBasePath),
     events,
   });
 }
@@ -3590,8 +6440,22 @@ async function handleJobStream(
   const url = new URL(_req.url ?? "/", "http://127.0.0.1");
   const sinceSeqRaw = url.searchParams.get("since_seq");
   const lastEventIdRaw = getHeaderValue(_req, "last-event-id");
-  const requestedSinceSeq = sinceSeqRaw ? Number.parseInt(sinceSeqRaw, 10) : undefined;
-  const requestedLastEventId = lastEventIdRaw ? Number.parseInt(lastEventIdRaw, 10) : undefined;
+  const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
+  if (!sinceSeqResult.ok) {
+    jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const lastEventIdResult = parseNonNegativeIntegerParam(lastEventIdRaw, "Last-Event-ID");
+  if (!lastEventIdResult.ok) {
+    jsonErrorResponse(res, 400, lastEventIdResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const requestedSinceSeq = sinceSeqResult.value;
+  const requestedLastEventId = lastEventIdResult.value;
   const replayCursor = Number.isFinite(requestedSinceSeq)
     ? requestedSinceSeq as number
     : Number.isFinite(requestedLastEventId)
@@ -4610,6 +7474,34 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    if (method === "GET" && url.pathname === "/goals/dashboard") {
+      await handleGoalsDashboard(req, res, "/goals");
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/goals/data") {
+      await handleBrowserListGoals(req, res);
+      return;
+    }
+
+    const browserGoalMatch = url.pathname.match(/^\/goals\/([^/]+)$/);
+    if (method === "GET" && browserGoalMatch) {
+      await handleGetGoal(req, res, decodeURIComponent(browserGoalMatch[1]!));
+      return;
+    }
+
+    const browserGoalEventsMatch = url.pathname.match(/^\/goals\/([^/]+)\/events$/);
+    if (method === "GET" && browserGoalEventsMatch) {
+      await handleGoalEvents(req, res, decodeURIComponent(browserGoalEventsMatch[1]!));
+      return;
+    }
+
+    const browserGoalTimelineMatch = url.pathname.match(/^\/goals\/([^/]+)\/timeline$/);
+    if (method === "GET" && browserGoalTimelineMatch) {
+      await handleGoalTimeline(req, res, decodeURIComponent(browserGoalTimelineMatch[1]!), "/goals");
+      return;
+    }
+
     const browserJobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
     if (method === "GET" && browserJobMatch) {
       await handleGetJob(req, res, decodeURIComponent(browserJobMatch[1]!), "/jobs");
@@ -4660,8 +7552,99 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    if (method === "GET" && url.pathname === "/v1/skills") {
+      await handleListSkills(req, res);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/skills/install") {
+      await handleInstallSkill(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/skill-evolution/proposals") {
+      await handleListSkillEvolutionProposals(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/skill-evolution/ops") {
+      await handleSkillEvolutionOps(req, res);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/skill-evolution/proposals") {
+      await handleCreateSkillEvolutionProposal(req, res);
+      return;
+    }
+
+    const skillReflectionsMatch = url.pathname.match(/^\/v1\/skills\/([^/]+)\/reflections$/);
+    if (method === "GET" && skillReflectionsMatch) {
+      await handleListSkillReflections(req, res, decodeURIComponent(skillReflectionsMatch[1]!));
+      return;
+    }
+
+    const skillReflectMatch = url.pathname.match(/^\/v1\/skills\/([^/]+)\/reflect$/);
+    if (method === "POST" && skillReflectMatch) {
+      await handleCreateSkillReflection(req, res, decodeURIComponent(skillReflectMatch[1]!));
+      return;
+    }
+
+    const skillProposeMatch = url.pathname.match(/^\/v1\/skills\/([^/]+)\/propose$/);
+    if (method === "POST" && skillProposeMatch) {
+      await handleCreateSkillProposal(req, res, decodeURIComponent(skillProposeMatch[1]!));
+      return;
+    }
+
+    const skillEvolutionProposalMatch = url.pathname.match(/^\/v1\/skill-evolution\/proposals\/([^/]+)$/);
+    if (method === "GET" && skillEvolutionProposalMatch) {
+      await handleGetSkillEvolutionProposal(req, res, decodeURIComponent(skillEvolutionProposalMatch[1]!));
+      return;
+    }
+
+    const skillEvolutionProposalAuditMatch = url.pathname.match(/^\/v1\/skill-evolution\/proposals\/([^/]+)\/audit$/);
+    if (method === "POST" && skillEvolutionProposalAuditMatch) {
+      await handleAuditSkillEvolutionProposal(req, res, decodeURIComponent(skillEvolutionProposalAuditMatch[1]!));
+      return;
+    }
+
+    const skillEvolutionProposalValidateMatch = url.pathname.match(/^\/v1\/skill-evolution\/proposals\/([^/]+)\/validate$/);
+    if (method === "POST" && skillEvolutionProposalValidateMatch) {
+      await handleValidateSkillEvolutionProposal(req, res, decodeURIComponent(skillEvolutionProposalValidateMatch[1]!));
+      return;
+    }
+
+    const skillEvolutionProposalAcceptMatch = url.pathname.match(/^\/v1\/skill-evolution\/proposals\/([^/]+)\/accept$/);
+    if (method === "POST" && skillEvolutionProposalAcceptMatch) {
+      await handleSkillEvolutionDecision(req, res, decodeURIComponent(skillEvolutionProposalAcceptMatch[1]!), "accepted");
+      return;
+    }
+
+    const skillEvolutionProposalRejectMatch = url.pathname.match(/^\/v1\/skill-evolution\/proposals\/([^/]+)\/reject$/);
+    if (method === "POST" && skillEvolutionProposalRejectMatch) {
+      await handleSkillEvolutionDecision(req, res, decodeURIComponent(skillEvolutionProposalRejectMatch[1]!), "rejected");
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/goals") {
+      await handleListGoals(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/goals/data") {
+      jsonResponse(res, 200, {
+        object: "list",
+        data: buildListedGoalsResponse(),
+      });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/v1/jobs/dashboard") {
       await handleJobsDashboard(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/goals/dashboard") {
+      await handleGoalsDashboard(req, res);
       return;
     }
 
@@ -4670,9 +7653,56 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    if (method === "POST" && url.pathname === "/v1/goals") {
+      await handleCreateGoal(req, res);
+      return;
+    }
+
     const jobMatch = url.pathname.match(/^\/v1\/jobs\/([^/]+)$/);
     if (method === "GET" && jobMatch) {
       await handleGetJob(req, res, decodeURIComponent(jobMatch[1]!));
+      return;
+    }
+
+    const goalMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)$/);
+    if (method === "GET" && goalMatch) {
+      await handleGetGoal(req, res, decodeURIComponent(goalMatch[1]!));
+      return;
+    }
+
+    const goalEventsMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/events$/);
+    if (method === "GET" && goalEventsMatch) {
+      await handleGoalEvents(req, res, decodeURIComponent(goalEventsMatch[1]!));
+      return;
+    }
+
+    const goalTimelineMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/timeline$/);
+    if (method === "GET" && goalTimelineMatch) {
+      await handleGoalTimeline(req, res, decodeURIComponent(goalTimelineMatch[1]!));
+      return;
+    }
+
+    const goalRunNextMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/run-next$/);
+    if (method === "POST" && goalRunNextMatch) {
+      await handleRunNextGoal(req, res, decodeURIComponent(goalRunNextMatch[1]!));
+      return;
+    }
+
+    const goalRetryMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/retry$/);
+    if (method === "POST" && goalRetryMatch) {
+      await handleRetryGoal(req, res, decodeURIComponent(goalRetryMatch[1]!));
+      return;
+    }
+
+    const goalResumeMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/resume$/);
+    if (method === "POST" && goalResumeMatch) {
+      await handleResumeGoal(req, res, decodeURIComponent(goalResumeMatch[1]!));
+      return;
+    }
+
+    const goalReviewMatch = url.pathname.match(/^\/v1\/goals\/([^/]+)\/review$/);
+    if (method === "POST" && goalReviewMatch) {
+      await handleReviewGoal(req, res, decodeURIComponent(goalReviewMatch[1]!));
       return;
     }
 
@@ -5148,15 +8178,23 @@ function runDoctor(configPath?: string): void {
 }
 
 async function runCliTask(task: string): Promise<void> {
-  const logger = createRunLogger(task);
   const baseConfig = loadConfig();
   const healthSelection = await buildHealthyExecutorRuntimeConfig(baseConfig);
   assertHealthyExecutorSelection(healthSelection);
   configureSearchTools(healthSelection.config.search);
-  const routing = loadTaskRoutingConfig(healthSelection.config.taskRoutingPath);
-  const taskType = detectTaskType(task, routing);
-  const routePolicy = getRoutePolicy(taskType, routing);
-  const result = await runTask(healthSelection.config, task, routePolicy, logger);
+  const intentRoute = await detectIntentRoute({
+    config: healthSelection.config,
+    userGoal: task,
+    allowPlannerFallback: true,
+  });
+
+  if (shouldDispatchToTeam(intentRoute)) {
+    await runCliTeam(task);
+    return;
+  }
+
+  const logger = createRunLogger(task);
+  const result = await dispatchTaskIntentRoute(healthSelection.config, task, intentRoute, logger);
   console.error(`Run log: ${logger.logPath}`);
   console.log(JSON.stringify({
     status: result.status,
@@ -5185,7 +8223,18 @@ async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): P
   const result = await runTeam(healthSelection.config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
 
   // Export dashboard
-  const dashData = buildDashboardData(logger.runId, goal, result.tasks, tracer.getEvents(), startedAt);
+  const dashData = buildDashboardData(
+    logger.runId,
+    goal,
+    result.tasks,
+    tracer.getEvents(),
+    startedAt,
+    result.job.intentRoute ?? {
+      kind: "goal",
+      reason: "team CLI mode selected",
+      source: "heuristic",
+    },
+  );
   const jsonPath = exportDashboardJson(dashData);
   const htmlPath = exportDashboardHtml(dashData);
   console.error(`Run log: ${logger.logPath}`);
@@ -5289,4 +8338,14 @@ export const __testables = {
   getActiveJobSession,
   recoverInterruptedJobs,
   buildDoctorReport,
+  buildSkillReflectionRecord,
+  persistSkillReflectionForRecord,
+  runAutomaticSkillEvolutionForRecord,
+  shouldAutoAcceptSkillEvolution,
+  resolveSkillAutomationRiskTier,
+  isAutomationStageAllowedForTier,
+  buildSkillEvolutionDynamicRiskSummary,
+  setConfigOverrideForTests: (config: OrchestratorConfig | null) => {
+    configOverrideForTests = config;
+  },
 };

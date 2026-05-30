@@ -37,6 +37,79 @@ type JobDashboardItem = {
   timeline_url?: string;
   events_url?: string;
   stream_url?: string;
+  intent_route?: {
+    kind?: string;
+    reason?: string;
+    source?: string;
+  } | null;
+  candidate_skills?: Array<{
+    skillId?: string;
+    score?: number;
+    reasons?: string[];
+    source?: string;
+  }>;
+  selected_skill?: {
+    skill_id?: string;
+    skill_action?: string;
+    skill_install_status?: string;
+    skill_reason?: string;
+  } | null;
+  workflow_summary?: {
+    skill_verification?: {
+      title?: string;
+      verification_status?: string;
+      verification_label?: string;
+      action_required?: boolean;
+      summary?: string | null;
+      outcome_summary?: string | null;
+      next_action?: string | null;
+      missing_requirements?: string[];
+    } | null;
+    skill_evolution?: {
+      proposal_count?: number;
+      latest_proposal_id?: string;
+      latest_status?: string;
+      latest_patch_summary?: string;
+      latest_change_summary?: string;
+      latest_rationale_summary?: string;
+      latest_changed_files?: string[];
+      latest_validation_summary?: {
+        passed?: boolean;
+        reason_code?: string;
+        auto_accept_ready?: boolean;
+        isolated_replay?: boolean;
+        same_input_readiness?: string;
+        replay_headline?: string;
+        candidate_replay?: {
+          status?: string;
+          verification_status?: string;
+          event_count?: number;
+          terminal_event_type?: string;
+        } | null;
+      } | null;
+      latest_ops_summary?: {
+        queue_state?: string;
+        funnel_stage?: string;
+        age_bucket?: string;
+        actionable?: boolean;
+        blocked_stage?: string | null;
+        auto_accept_ready?: boolean;
+        auto_accept_eligible?: boolean;
+        dynamic_risk_tier?: string;
+        dynamic_risk_cooldown_active?: boolean;
+        dynamic_risk_cooldown_until?: string | null;
+        effective_automation_ceiling?: string | null;
+        eligibility_reasons?: string[];
+        dynamic_risk_reasons?: string[];
+        stuck_state?: {
+          stuck?: boolean;
+          stage?: string | null;
+          reasons?: string[];
+        };
+        rollback_available?: boolean;
+      } | null;
+    } | null;
+  } | null;
 };
 
 function escapeHtml(value: string): string {
@@ -55,6 +128,21 @@ function renderAction(action: JobDashboardAction): string {
     return `<button type="button" class="${klass}" data-api-action="${escapeHtml(action.href)}">${label}</button>`;
   }
   return `<a class="${klass}" href="${escapeHtml(action.href || "#")}">${label}</a>`;
+}
+
+function formatIntentRouteLabel(kind?: string): string {
+  switch (kind) {
+    case "direct_answer":
+      return "Direct Answer";
+    case "research":
+      return "Research";
+    case "goal":
+      return "Goal";
+    case "coding":
+      return "Coding";
+    default:
+      return kind || "Unknown";
+  }
 }
 
 export function renderJobsDashboardHtml(
@@ -147,6 +235,38 @@ export function renderJobsDashboardHtml(
       gap: 8px;
       margin-bottom: 16px;
     }
+    .route-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .route-card {
+      background: linear-gradient(180deg, rgba(88,166,255,0.12), rgba(17,23,35,0.92));
+      border: 1px solid rgba(88,166,255,0.22);
+      border-radius: 10px;
+      padding: 14px;
+      cursor: pointer;
+      transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+    }
+    .route-card:hover {
+      border-color: rgba(88,166,255,0.5);
+      transform: translateY(-1px);
+    }
+    .route-card.active {
+      border-color: rgba(88,166,255,0.9);
+      box-shadow: 0 0 0 1px rgba(88,166,255,0.25), 0 10px 24px rgba(1, 4, 9, 0.22);
+    }
+    .route-card-label {
+      color: #8cc7ff;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .route-card-value {
+      color: #f0f6fc;
+      font-size: 24px;
+      font-weight: 700;
+    }
     .status-tab {
       border: 1px solid #30363d;
       background: #111723;
@@ -190,6 +310,50 @@ export function renderJobsDashboardHtml(
     .panel-meta {
       color: #8b949e;
       font-size: 12px;
+    }
+    .loading-banner {
+      margin: 10px 10px 0;
+      border: 1px solid rgba(88,166,255,0.32);
+      border-radius: 8px;
+      background: rgba(88,166,255,0.1);
+      color: #8cc7ff;
+      padding: 10px 12px;
+      font-size: 12px;
+    }
+    .loading-banner[hidden] {
+      display: none;
+    }
+    .pagination {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px 14px;
+      border-top: 1px solid #21262d;
+      background: #111723;
+      flex-wrap: wrap;
+    }
+    .pagination-meta {
+      color: #8b949e;
+      font-size: 12px;
+    }
+    .pagination-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .pagination-button {
+      border: 1px solid #30363d;
+      background: #161b22;
+      color: #c9d1d9;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .pagination-button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
     .job-list {
       padding: 10px;
@@ -262,6 +426,17 @@ export function renderJobsDashboardHtml(
       border: 1px solid #2d333b;
       color: #8b949e;
       font-size: 11px;
+    }
+    .chip.route-chip {
+      border-color: rgba(88,166,255,0.35);
+      background: rgba(88,166,255,0.12);
+      color: #8cc7ff;
+    }
+    .route-subtle {
+      color: #8b949e;
+      font-size: 11px;
+      margin: -2px 0 8px 0;
+      line-height: 1.45;
     }
     .job-recovery {
       color: #c9d1d9;
@@ -392,6 +567,9 @@ export function renderJobsDashboardHtml(
       .summary {
         grid-template-columns: repeat(3, minmax(0, 1fr));
       }
+      .route-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
       .layout {
         grid-template-columns: 1fr;
       }
@@ -416,6 +594,9 @@ export function renderJobsDashboardHtml(
       .summary {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
+      .route-summary {
+        grid-template-columns: 1fr;
+      }
       .metrics {
         grid-template-columns: 1fr;
       }
@@ -435,7 +616,7 @@ export function renderJobsDashboardHtml(
       </div>
       <div class="toolbar">
         <input id="search" type="search" placeholder="Search by goal or job id">
-        <select id="status-filter">
+        <select id="status-filter" autocomplete="off">
           <option value="">All statuses</option>
           <option value="running">Running</option>
           <option value="blocked">Blocked</option>
@@ -444,10 +625,18 @@ export function renderJobsDashboardHtml(
           <option value="failed">Failed</option>
           <option value="cancelled">Cancelled</option>
         </select>
+        <select id="route-filter" autocomplete="off">
+          <option value="">All routes</option>
+          <option value="direct_answer">Direct Answer</option>
+          <option value="research">Research</option>
+          <option value="goal">Goal</option>
+          <option value="coding">Coding</option>
+        </select>
       </div>
     </div>
 
     <div id="summary" class="summary"></div>
+    <div id="route-summary" class="route-summary"></div>
     <div id="status-tabs" class="status-tabs"></div>
 
     <div class="layout">
@@ -456,6 +645,7 @@ export function renderJobsDashboardHtml(
           <h2 class="panel-title">Jobs</h2>
           <div id="list-meta" class="panel-meta"></div>
         </div>
+        <div id="loading-banner" class="loading-banner" hidden>Loading jobs...</div>
         <div id="job-list" class="job-list"></div>
         <div id="empty" class="empty" hidden>No jobs matched the current filter.</div>
       </section>
@@ -471,19 +661,36 @@ export function renderJobsDashboardHtml(
   </div>
 
   <script>
-    let jobs = ${JSON.stringify(initialItems)};
+    let jobs = [];
     let selectedJobId = jobs.length ? jobs[0].id : '';
     let activeStatusTab = '';
+    let activeRouteFilter = '';
+    let page = 1;
+    let pageSize = 50;
+    let totalJobs = 0;
+    let totalPages = 1;
+    let statusCounts = {};
+    let routeCounts = {};
+    let refreshTimer = null;
+    let searchDebounce = null;
+    let loading = false;
 
     const summary = document.getElementById('summary');
+    const routeSummary = document.getElementById('route-summary');
     const statusTabs = document.getElementById('status-tabs');
     const listMeta = document.getElementById('list-meta');
     const detailMeta = document.getElementById('detail-meta');
     const jobList = document.getElementById('job-list');
+    const loadingBanner = document.getElementById('loading-banner');
+    const pagination = document.createElement('div');
     const detail = document.getElementById('detail');
     const emptyState = document.getElementById('empty');
     const searchInput = document.getElementById('search');
     const statusFilter = document.getElementById('status-filter');
+    const routeFilter = document.getElementById('route-filter');
+    pagination.id = 'pagination';
+    pagination.className = 'pagination';
+    jobList.insertAdjacentElement('afterend', pagination);
 
     function escapeHtml(value) {
       return String(value)
@@ -504,6 +711,10 @@ export function renderJobsDashboardHtml(
       const text = String(status || '').trim();
       if (!text) return 'Unknown';
       return text.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+    }
+
+    function normalizeStatus(status) {
+      return String(status || '').trim().toLowerCase().replaceAll(/[^a-z0-9]+/g, '_').replaceAll(/^_+|_+$/g, '');
     }
 
     function statusClass(status) {
@@ -555,6 +766,10 @@ export function renderJobsDashboardHtml(
       return 'Recovery state: ' + formatStatus(recovery.auto_resume_status) + '.';
     }
 
+    function getIntentKind(item) {
+      return item && item.intent_route && item.intent_route.kind ? String(item.intent_route.kind) : 'unknown';
+    }
+
     function latestSummary(item) {
       if (!item.latest_step) {
         return 'No step updates yet.';
@@ -564,6 +779,82 @@ export function renderJobsDashboardHtml(
         ? ' Executor: ' + formatStatus(item.latest_step.latest_executor_status) + '.'
         : '';
       return 'Latest step is ' + stepStatus + '.' + executorStatus;
+    }
+
+    function formatSelectedSkill(item) {
+      const selectedSkill = item && item.selected_skill ? item.selected_skill : null;
+      if (!selectedSkill || !selectedSkill.skill_id) return '';
+      const installStatus = selectedSkill.skill_install_status ? ' (' + selectedSkill.skill_install_status + ')' : '';
+      return selectedSkill.skill_id + installStatus;
+    }
+
+    function formatCandidateSkills(item) {
+      const candidates = item && Array.isArray(item.candidate_skills) ? item.candidate_skills : [];
+      if (candidates.length === 0) return '';
+      return candidates.slice(0, 3).map((candidate) => {
+        const skillId = candidate && candidate.skillId ? String(candidate.skillId) : 'unknown';
+        const score = candidate && typeof candidate.score === 'number' ? ' (' + String(candidate.score) + ')' : '';
+        return skillId + score;
+      }).join(', ');
+    }
+
+    function formatSkillVerification(item) {
+      const verification = item && item.workflow_summary && item.workflow_summary.skill_verification
+        ? item.workflow_summary.skill_verification
+        : null;
+      if (!verification || !verification.verification_status) return '';
+      const title = verification.title ? String(verification.title) : 'Skill verification';
+      const label = verification.verification_label ? String(verification.verification_label) : String(verification.verification_status);
+      const summary = verification.outcome_summary ? ' - ' + String(verification.outcome_summary) : '';
+      const nextAction = verification.action_required && verification.next_action ? ' Next: ' + String(verification.next_action) : '';
+      return title + ' (' + label + ')' + summary + nextAction;
+    }
+
+    function formatSkillEvolution(item) {
+      const evolution = item && item.workflow_summary && item.workflow_summary.skill_evolution
+        ? item.workflow_summary.skill_evolution
+        : null;
+      if (!evolution || !evolution.latest_status) return '';
+      const proposalCount = typeof evolution.proposal_count === 'number'
+        ? ' Proposals: ' + evolution.proposal_count + '.'
+        : '';
+      const changeSummary = evolution.latest_change_summary ? ' ' + String(evolution.latest_change_summary) : '';
+      const rationaleSummary = evolution.latest_rationale_summary ? ' Why: ' + String(evolution.latest_rationale_summary) : '';
+      const patchSummary = !changeSummary && evolution.latest_patch_summary ? ' ' + String(evolution.latest_patch_summary) : '';
+      const validation = evolution.latest_validation_summary || null;
+      const replaySummary = validation && validation.isolated_replay
+        ? ' Replay: ' + String(validation.same_input_readiness || 'unknown')
+          + ', ' + String(validation.candidate_replay && validation.candidate_replay.terminal_event_type
+            ? validation.candidate_replay.terminal_event_type
+            : 'no_terminal_event')
+          + ', ' + String(validation.candidate_replay && typeof validation.candidate_replay.event_count === 'number'
+            ? validation.candidate_replay.event_count
+            : 0) + ' events.'
+        : '';
+      const decisionSummary = validation && validation.reason_code
+        ? ' Decision: ' + String(validation.reason_code) + '.'
+        : '';
+      const ops = evolution.latest_ops_summary || null;
+      const opsSummary = ops && ops.queue_state
+        ? ' Ops: ' + String(ops.queue_state) + ', ' + String(ops.funnel_stage || 'unknown_stage') + ', ' + String(ops.age_bucket || 'unknown_age') + '.'
+        : '';
+      const eligibilitySummary = ops && ops.auto_accept_eligible === false && Array.isArray(ops.eligibility_reasons) && ops.eligibility_reasons.length > 0
+        ? ' Eligibility: ' + String(ops.eligibility_reasons[0]) + '.'
+        : '';
+      const dynamicRiskSummary = ops && ops.dynamic_risk_tier
+        ? ' Dynamic risk: ' + String(ops.dynamic_risk_tier)
+          + (ops.effective_automation_ceiling ? ', ceiling ' + String(ops.effective_automation_ceiling) : '') + '.'
+        : '';
+      const cooldownSummary = ops && ops.dynamic_risk_cooldown_active
+        ? ' Cooldown: active until ' + String(ops.dynamic_risk_cooldown_until || 'unknown') + '.'
+        : '';
+      const stuckSummary = ops && ops.stuck_state && ops.stuck_state.stuck && Array.isArray(ops.stuck_state.reasons) && ops.stuck_state.reasons.length > 0
+        ? ' Stuck: ' + String(ops.stuck_state.reasons[0]) + '.'
+        : '';
+      const blockSummary = ops && ops.blocked_stage
+        ? ' Blocked: ' + String(ops.blocked_stage) + '.'
+        : '';
+      return String(evolution.latest_status) + '.' + proposalCount + changeSummary + patchSummary + rationaleSummary + decisionSummary + replaySummary + opsSummary + eligibilitySummary + dynamicRiskSummary + cooldownSummary + stuckSummary + blockSummary;
     }
 
     function renderActions(actions, item) {
@@ -599,25 +890,6 @@ export function renderJobsDashboardHtml(
       }).join('') + '</div>';
     }
 
-    function countByStatus(items) {
-      const counts = new Map();
-      for (const item of items) {
-        counts.set(item.status, (counts.get(item.status) || 0) + 1);
-      }
-      return counts;
-    }
-
-    function getFilteredJobs() {
-      const query = (searchInput.value || '').trim().toLowerCase();
-      const selectedStatus = statusFilter.value || activeStatusTab || '';
-      return jobs.filter((item) => {
-        if (selectedStatus && item.status !== selectedStatus) return false;
-        if (!query) return true;
-        return String(item.id || '').toLowerCase().includes(query)
-          || String(item.goal || '').toLowerCase().includes(query);
-      });
-    }
-
     function ensureSelectedJob(items) {
       if (!items.length) {
         selectedJobId = '';
@@ -629,29 +901,58 @@ export function renderJobsDashboardHtml(
       return items[0];
     }
 
-    function renderSummary(items) {
-      const counts = countByStatus(items);
+    function readCount(map, key) {
+      if (!map) return 0;
+      return Number(map[key] || 0);
+    }
+
+    function sumCounts(map) {
+      if (!map) return 0;
+      return Object.values(map).reduce((total, value) => total + Number(value || 0), 0);
+    }
+
+    function renderSummary() {
       const cards = [
-        ['Visible Jobs', items.length],
-        ['Running', counts.get('running') || 0],
-        ['Blocked', counts.get('blocked') || 0],
-        ['Needs Approval', counts.get('awaiting_approval') || 0],
-        ['Failed', counts.get('failed') || 0],
+        ['Visible Jobs', totalJobs],
+        ['Running', readCount(statusCounts, 'running')],
+        ['Blocked', readCount(statusCounts, 'blocked')],
+        ['Needs Approval', readCount(statusCounts, 'awaiting_approval')],
+        ['Failed', readCount(statusCounts, 'failed')],
       ];
       summary.innerHTML = cards.map(([label, value]) =>
         '<div class="summary-card"><div class="summary-label">' + escapeHtml(String(label)) + '</div><div class="summary-value">' + escapeHtml(String(value)) + '</div></div>'
       ).join('');
     }
 
-    function renderTabs(allItems) {
-      const counts = countByStatus(allItems);
+    function renderRouteSummary() {
+      const cards = [
+        ['direct_answer', 'Direct Answer', readCount(routeCounts, 'direct_answer')],
+        ['research', 'Research', readCount(routeCounts, 'research')],
+        ['goal', 'Goal', readCount(routeCounts, 'goal')],
+        ['coding', 'Coding', readCount(routeCounts, 'coding')],
+      ];
+      routeSummary.innerHTML = cards.map(([kind, label, value]) =>
+        '<button type="button" class="route-card' + ((activeRouteFilter || '') === kind ? ' active' : '') + '" data-route-card="' + escapeHtml(String(kind)) + '"><div class="route-card-label">' + escapeHtml(String(label)) + '</div><div class="route-card-value">' + escapeHtml(String(value)) + '</div></button>'
+      ).join('');
+      routeSummary.querySelectorAll('[data-route-card]').forEach((card) => {
+        card.addEventListener('click', () => {
+          const nextRoute = card.getAttribute('data-route-card') || '';
+          activeRouteFilter = activeRouteFilter === nextRoute ? '' : nextRoute;
+          routeFilter.value = activeRouteFilter;
+          page = 1;
+          void refreshJobs();
+        });
+      });
+    }
+
+    function renderTabs() {
       const tabs = [
-        { value: '', label: 'All', count: allItems.length },
-        { value: 'running', label: 'Running', count: counts.get('running') || 0 },
-        { value: 'blocked', label: 'Blocked', count: counts.get('blocked') || 0 },
-        { value: 'awaiting_approval', label: 'Needs Approval', count: counts.get('awaiting_approval') || 0 },
-        { value: 'failed', label: 'Failed', count: counts.get('failed') || 0 },
-        { value: 'completed', label: 'Completed', count: counts.get('completed') || 0 },
+        { value: '', label: 'All', count: sumCounts(statusCounts) },
+        { value: 'running', label: 'Running', count: readCount(statusCounts, 'running') },
+        { value: 'blocked', label: 'Blocked', count: readCount(statusCounts, 'blocked') },
+        { value: 'awaiting_approval', label: 'Needs Approval', count: readCount(statusCounts, 'awaiting_approval') },
+        { value: 'failed', label: 'Failed', count: readCount(statusCounts, 'failed') },
+        { value: 'completed', label: 'Completed', count: readCount(statusCounts, 'completed') },
       ];
       statusTabs.innerHTML = tabs.map((tab) => {
         const active = (activeStatusTab || '') === tab.value ? ' active' : '';
@@ -659,18 +960,25 @@ export function renderJobsDashboardHtml(
       }).join('');
       statusTabs.querySelectorAll('[data-status-tab]').forEach((button) => {
         button.addEventListener('click', () => {
-          activeStatusTab = button.getAttribute('data-status-tab') || '';
+          const nextStatus = button.getAttribute('data-status-tab') || '';
+          activeStatusTab = nextStatus;
           statusFilter.value = activeStatusTab;
-          renderDashboard();
+          page = 1;
+          void refreshJobs();
         });
       });
     }
 
     function renderJobList(items) {
-      listMeta.textContent = items.length + ' visible';
-      emptyState.hidden = items.length > 0;
-      jobList.style.display = items.length > 0 ? 'grid' : 'none';
-      jobList.innerHTML = items.map((item) => {
+      loadingBanner.hidden = !loading;
+      listMeta.textContent = loading
+        ? 'Loading jobs...'
+        : 'Page ' + page + ' of ' + totalPages + ' - ' + items.length + ' shown of ' + totalJobs;
+      emptyState.hidden = items.length > 0 || loading;
+      jobList.style.display = items.length > 0 ? 'grid' : (loading ? 'grid' : 'none');
+      jobList.innerHTML = loading && items.length === 0
+        ? '<div class="empty">Loading jobs...</div>'
+        : items.map((item) => {
         const active = item.id === selectedJobId ? ' active' : '';
         const recovery = formatRecovery(item);
         const saved = formatRelativeTime(item.saved_at) || formatTime(item.saved_at);
@@ -678,10 +986,13 @@ export function renderJobsDashboardHtml(
           + '<div class="job-card-top"><div><h3 class="job-goal">' + escapeHtml(truncate(item.goal || 'Untitled job', 120)) + '</h3><div class="job-id">' + escapeHtml(item.id) + '</div></div><span class="' + statusClass(item.status) + '">' + escapeHtml(formatStatus(item.status)) + '</span></div>'
           + '<div class="job-strip">'
           + '<span class="chip">' + escapeHtml(formatStatus(item.mode || 'task')) + '</span>'
+          + (item.intent_route && item.intent_route.kind ? '<span class="chip route-chip">Route: ' + escapeHtml(formatIntentRouteLabel(item.intent_route.kind)) + '</span>' : '')
+          + (item.selected_skill && item.selected_skill.skill_id ? '<span class="chip route-chip">Skill: ' + escapeHtml(formatSelectedSkill(item)) + '</span>' : '')
           + '<span class="chip">' + escapeHtml(String(item.step_count || 0)) + ' steps</span>'
           + '<span class="chip">' + escapeHtml(String(item.artifact_count || 0)) + ' artifacts</span>'
           + '<span class="chip">' + escapeHtml(item.verified === true ? 'Verified' : item.verified === false ? 'Needs verification' : 'Verification n/a') + '</span>'
           + '</div>'
+          + (item.intent_route && item.intent_route.reason ? '<div class="route-subtle">' + escapeHtml(item.intent_route.reason) + '</div>' : '')
           + '<div class="job-recovery">' + escapeHtml(recovery) + '</div>'
           + '<div class="job-footer"><span>' + escapeHtml(latestSummary(item)) + '</span><span>' + escapeHtml(saved) + '</span></div>'
           + '</article>';
@@ -689,7 +1000,10 @@ export function renderJobsDashboardHtml(
       jobList.querySelectorAll('[data-job-id]').forEach((card) => {
         card.addEventListener('click', () => {
           selectedJobId = card.getAttribute('data-job-id') || '';
-          renderDashboard();
+          renderDetail(jobs.find((item) => item.id === selectedJobId) || null);
+          jobList.querySelectorAll('[data-job-id]').forEach((itemCard) => {
+            itemCard.classList.toggle('active', itemCard.getAttribute('data-job-id') === selectedJobId);
+          });
         });
       });
     }
@@ -712,32 +1026,88 @@ export function renderJobsDashboardHtml(
         + '<section class="section"><h3>Recovery</h3><p>' + escapeHtml(formatRecovery(item)) + '</p></section>'
         + '<section class="section"><h3>Current Readout</h3><div class="kv">'
         +   '<div class="kv-key">Mode</div><div class="kv-value">' + escapeHtml(formatStatus(item.mode || 'task')) + '</div>'
+        +   '<div class="kv-key">Intent route</div><div class="kv-value">' + escapeHtml(item.intent_route && item.intent_route.kind ? formatIntentRouteLabel(item.intent_route.kind) : 'Unknown') + (item.intent_route && item.intent_route.source ? ' - ' + escapeHtml(item.intent_route.source) : '') + '</div>'
+        +   '<div class="kv-key">Route reason</div><div class="kv-value">' + escapeHtml(item.intent_route && item.intent_route.reason ? item.intent_route.reason : 'Not recorded') + '</div>'
+        +   '<div class="kv-key">Selected skill</div><div class="kv-value">' + escapeHtml(formatSelectedSkill(item) || 'Not recorded') + '</div>'
+        +   '<div class="kv-key">Skill candidates</div><div class="kv-value">' + escapeHtml(formatCandidateSkills(item) || 'Not recorded') + '</div>'
+        +   '<div class="kv-key">Skill verification</div><div class="kv-value">' + escapeHtml(formatSkillVerification(item) || 'Not recorded') + '</div>'
+        +   '<div class="kv-key">Skill evolution</div><div class="kv-value">' + escapeHtml(formatSkillEvolution(item) || 'Not recorded') + '</div>'
         +   '<div class="kv-key">Latest step</div><div class="kv-value">' + escapeHtml(latestSummary(item)) + '</div>'
         +   '<div class="kv-key">Saved</div><div class="kv-value">' + escapeHtml(formatTime(item.saved_at)) + '</div>'
-        +   '<div class="kv-key">Resumed to</div><div class="kv-value">' + escapeHtml(resumedTo || (item.follow && item.follow.job_id) || '—') + '</div>'
+        +   '<div class="kv-key">Resumed to</div><div class="kv-value">' + escapeHtml(resumedTo || (item.follow && item.follow.job_id) || '-') + '</div>'
         + '</div></section>'
+        + (item.selected_skill && item.selected_skill.skill_reason ? '<section class="section"><h3>Skill Selection</h3><p>' + escapeHtml(item.selected_skill.skill_reason) + '</p></section>' : '')
         + '<section class="section"><h3>Actions</h3>' + renderActions(item.actions, item) + '</section>';
       bindApiActions();
     }
 
+    function renderPagination() {
+      pagination.innerHTML = ''
+        + '<div class="pagination-meta">Page ' + page + ' of ' + totalPages + ' - ' + totalJobs + ' total</div>'
+        + '<div class="pagination-actions">'
+        + '<button type="button" class="pagination-button" data-page-prev' + (page <= 1 ? ' disabled' : '') + '>Prev</button>'
+        + '<button type="button" class="pagination-button" data-page-next' + (page >= totalPages ? ' disabled' : '') + '>Next</button>'
+        + '</div>';
+      pagination.querySelector('[data-page-prev]').addEventListener('click', () => {
+        if (page <= 1) return;
+        page -= 1;
+        void refreshJobs();
+      });
+      pagination.querySelector('[data-page-next]').addEventListener('click', () => {
+        if (page >= totalPages) return;
+        page += 1;
+        void refreshJobs();
+      });
+    }
+
     function renderDashboard() {
-      renderSummary(getFilteredJobs());
-      renderTabs(jobs);
-      const filtered = getFilteredJobs();
-      const selected = ensureSelectedJob(filtered);
-      renderJobList(filtered);
+      renderSummary();
+      renderRouteSummary();
+      renderTabs();
+      renderJobList(jobs);
+      renderPagination();
+      const selected = ensureSelectedJob(jobs);
       renderDetail(selected);
     }
 
+    function buildDataUrl() {
+      const url = new URL('${dataUrl}', window.location.origin);
+      url.searchParams.set('page', String(page));
+      url.searchParams.set('page_size', String(pageSize));
+      if (activeStatusTab) url.searchParams.set('status', activeStatusTab);
+      if (activeRouteFilter) url.searchParams.set('route', activeRouteFilter);
+      const query = (searchInput.value || '').trim();
+      if (query) url.searchParams.set('q', query);
+      return url.toString();
+    }
+
     async function refreshJobs() {
+      loading = true;
+      renderDashboard();
       try {
-        const response = await fetch('${dataUrl}');
+        const response = await fetch(buildDataUrl());
         if (!response.ok) return;
         const payload = await response.json();
         jobs = Array.isArray(payload.data) ? payload.data : [];
+        const paginationData = payload.pagination || {};
+        page = typeof paginationData.page === 'number' ? paginationData.page : page;
+        pageSize = typeof paginationData.page_size === 'number' ? paginationData.page_size : pageSize;
+        totalJobs = typeof paginationData.total === 'number' ? paginationData.total : jobs.length;
+        totalPages = typeof paginationData.total_pages === 'number' ? paginationData.total_pages : Math.max(1, Math.ceil(totalJobs / Math.max(pageSize, 1)));
+        statusCounts = payload.counts && payload.counts.by_status ? payload.counts.by_status : {};
+        routeCounts = payload.counts && payload.counts.by_route ? payload.counts.by_route : {};
+        loading = false;
+        if (jobs.length > 0) {
+          selectedJobId = jobs.some((item) => item.id === selectedJobId) ? selectedJobId : jobs[0].id;
+        } else {
+          selectedJobId = '';
+        }
         renderDashboard();
       } catch {
         // Ignore polling failures.
+      } finally {
+        loading = false;
+        renderDashboard();
       }
     }
 
@@ -763,15 +1133,34 @@ export function renderJobsDashboardHtml(
       });
     }
 
-    searchInput.addEventListener('input', renderDashboard);
+    searchInput.value = '';
+    statusFilter.value = '';
+    routeFilter.value = '';
+
+    searchInput.addEventListener('input', () => {
+      if (searchDebounce) {
+        clearTimeout(searchDebounce);
+      }
+      page = 1;
+      searchDebounce = setTimeout(() => {
+        void refreshJobs();
+      }, 250);
+    });
     statusFilter.addEventListener('change', () => {
-      activeStatusTab = statusFilter.value || '';
-      renderDashboard();
+      activeStatusTab = normalizeStatus(statusFilter.value || '');
+      statusFilter.value = activeStatusTab;
+      page = 1;
+      void refreshJobs();
+    });
+    routeFilter.addEventListener('change', () => {
+      activeRouteFilter = routeFilter.value || '';
+      page = 1;
+      void refreshJobs();
     });
 
     renderDashboard();
     void refreshJobs();
-    setInterval(refreshJobs, 5000);
+    refreshTimer = setInterval(refreshJobs, 5000);
   </script>
 </body>
 </html>`;

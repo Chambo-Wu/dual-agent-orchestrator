@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { listStoredJobs, persistJobRecord, readJobRecord, updateJobControlState, updateStoredJobRecord } from "../../src/job-store.js";
@@ -334,9 +335,10 @@ test("jobs dashboard endpoint renders persisted job overview html", async () => 
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
   assert.equal(res.body.includes("Job Dashboard"), true);
-  assert.equal(res.body.includes("Visible in dashboard HTML"), true);
-  assert.equal(res.body.includes("/jobs/job_dashboard_html/timeline"), true);
-  assert.equal(res.body.includes("fetch('/jobs/data')"), true);
+  assert.equal(res.body.includes("Visible in dashboard HTML"), false);
+  assert.equal(res.body.includes("/jobs/job_dashboard_html/timeline"), false);
+  assert.equal(res.body.includes("new URL('/jobs/data', window.location.origin)"), true);
+  assert.equal(res.body.includes("page_size"), true);
 });
 
 test("browser dashboard wrapper renders without auth and polls browser data route", async () => {
@@ -350,7 +352,75 @@ test("browser dashboard wrapper renders without auth and polls browser data rout
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
   assert.equal(res.body.includes("Job Dashboard"), true);
-  assert.equal(res.body.includes("fetch('/jobs/data')"), true);
+  assert.equal(res.body.includes("new URL('/jobs/data', window.location.origin)"), true);
+  assert.equal(res.body.includes("let jobs = []"), true);
+});
+
+test("browser jobs data route pages dashboard items", async () => {
+  const suffix = randomUUID().slice(0, 8);
+  for (let index = 0; index < 3; index += 1) {
+    const taskRun = createTaskRunRecord({
+      id: `taskrun_dashboard_page_${index}_${suffix}`,
+      title: `Dashboard page task ${index}`,
+      description: "Paged dashboard fixture",
+      status: index === 1 ? "failed" : "completed",
+      verified: index !== 1,
+      output: "done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: `plan_dashboard_page_${index}_${suffix}`,
+      goal: `Paged dashboard job ${index} ${suffix}`,
+      mode: "task",
+      taskRunIds: [taskRun.id],
+    });
+    const job = createJobRecord({
+      id: `job_dashboard_page_${index}_${suffix}`,
+      goal: `Paged dashboard job ${index} ${suffix}`,
+      mode: "task",
+      status: index === 1 ? "failed" : "completed",
+      verified: index !== 1,
+      output: "done",
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    });
+    persistJobRecord({ job, plan, taskRuns: [taskRun], artifacts: [] });
+  }
+
+  const firstPageRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest(`/jobs/data?q=${suffix}&page=1&page_size=2`), firstPageRes);
+  const firstPageBody = JSON.parse(firstPageRes.body) as {
+    object: string;
+    data: Array<{ id: string; status: string }>;
+    pagination: { page: number; page_size: number; total: number; total_pages: number; has_next: boolean };
+    counts: { by_status: Record<string, number> };
+  };
+
+  assert.equal(firstPageRes.statusCode, 200);
+  assert.equal(firstPageBody.object, "list");
+  assert.equal(firstPageBody.data.length, 2);
+  assert.equal(firstPageBody.pagination.page, 1);
+  assert.equal(firstPageBody.pagination.page_size, 2);
+  assert.equal(firstPageBody.pagination.total, 3);
+  assert.equal(firstPageBody.pagination.total_pages, 2);
+  assert.equal(firstPageBody.pagination.has_next, true);
+  assert.equal(firstPageBody.counts.by_status.completed, 2);
+  assert.equal(firstPageBody.counts.by_status.failed, 1);
+
+  const secondPageRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest(`/jobs/data?q=${suffix}&page=2&page_size=2`), secondPageRes);
+  const secondPageBody = JSON.parse(secondPageRes.body) as {
+    data: Array<{ id: string }>;
+    pagination: { page: number; has_next: boolean; has_prev: boolean };
+  };
+
+  assert.equal(secondPageRes.statusCode, 200);
+  assert.equal(secondPageBody.data.length, 1);
+  assert.equal(secondPageBody.pagination.page, 2);
+  assert.equal(secondPageBody.pagination.has_prev, true);
+  assert.equal(secondPageBody.pagination.has_next, false);
 });
 
 test("browser timeline wrapper streams through non-v1 route", async () => {
@@ -668,6 +738,91 @@ test("job create endpoint supports async start for realtime clients", async () =
     assert.equal(eventsBody.events.some((event) => event.type === "planner.start"), true);
     assert.equal(eventsBody.events.some((event) => event.type === "planner.decision"), true);
   } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
+
+test("job create endpoint persists a running record before slow task execution finishes", async () => {
+  let unblock!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    unblock = resolve;
+  });
+  __testables.setTaskExecutorForTests(async (goal, _model, _requirePlannerCircuit, context) => {
+    await gate;
+    const taskRun = createTaskRunRecord({
+      id: context?.taskRunId,
+      title: "Slow Job Task",
+      description: goal,
+      status: "completed",
+      verified: true,
+      output: "slow job done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "task",
+      taskRunIds: [taskRun.id],
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "task",
+      status: "completed",
+      verified: true,
+      output: "slow job done",
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    });
+    return {
+      content: "slow job done",
+      logPath: "runtime/logs/create-job-running-dashboard.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const createRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: "Create a dashboard-visible running job",
+      mode: "task",
+      model_route: "dual-agent-orchestrator",
+      policy: {
+        async: true,
+      },
+    }), createRes);
+    const createBody = JSON.parse(createRes.body) as { job_id: string };
+    const runningRecord = readJobRecord(createBody.job_id);
+    assert.equal(createRes.statusCode, 202);
+    assert.equal(runningRecord?.job.status, "running");
+
+    const listRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs"), listRes);
+    const listBody = JSON.parse(listRes.body) as { data: Array<{ id: string; status: string }> };
+    assert.equal(listBody.data.some((item) => item.id === createBody.job_id && item.status === "running"), true);
+
+    const dashboardRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/dashboard"), dashboardRes);
+    assert.equal(dashboardRes.statusCode, 200);
+    assert.equal(dashboardRes.body.includes("new URL('/jobs/data', window.location.origin)"), true);
+    assert.equal(dashboardRes.body.includes(createBody.job_id), false);
+
+    const dashboardDataRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest(`/jobs/data?q=${createBody.job_id}&page=1&page_size=50`), dashboardDataRes);
+    const dashboardDataBody = JSON.parse(dashboardDataRes.body) as { data: Array<{ id: string; status: string; goal: string }> };
+    assert.equal(dashboardDataBody.data.some((item) =>
+      item.id === createBody.job_id
+      && item.status === "running"
+      && item.goal === "Create a dashboard-visible running job"), true);
+  } finally {
+    unblock();
+    await new Promise((resolve) => setTimeout(resolve, 20));
     __testables.setTaskExecutorForTests(null);
   }
 });
@@ -1049,6 +1204,92 @@ test("job events endpoint reconstructs job timeline from persisted state", async
   assert.equal(missingBody.error?.type, "not_found_error");
 });
 
+test("job events endpoint keeps snapshot replay cursor global when using since_seq", async () => {
+  const allEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), allEventsRes);
+  const allEventsBody = JSON.parse(allEventsRes.body) as {
+    snapshot: {
+      seq: number;
+      event_count: number;
+      replay?: { next_seq?: number; can_resume_from?: number };
+    } | null;
+    events: Array<{ seq: number; type: string }>;
+  };
+  const cursor = allEventsBody.events.find((event) => event.type === "plan.created")?.seq ?? 0;
+
+  const filteredRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/job_steps_test/events?since_seq=${cursor}`), filteredRes);
+  const filteredBody = JSON.parse(filteredRes.body) as {
+    count: number;
+    snapshot: {
+      seq: number;
+      event_count: number;
+      replay?: { next_seq?: number; can_resume_from?: number };
+    } | null;
+    events: Array<{ seq: number; type: string }>;
+  };
+
+  assert.equal(filteredRes.statusCode, 200);
+  assert.equal(filteredBody.events.every((event) => event.seq > cursor), true);
+  assert.equal((filteredBody.snapshot?.seq ?? 0) >= (filteredBody.events.at(-1)?.seq ?? 0), true);
+  assert.equal(filteredBody.snapshot?.seq, allEventsBody.snapshot?.seq);
+  assert.equal(filteredBody.snapshot?.event_count, allEventsBody.snapshot?.event_count);
+  assert.equal(filteredBody.snapshot?.replay?.next_seq, allEventsBody.snapshot?.replay?.next_seq);
+  assert.equal(filteredBody.snapshot?.replay?.can_resume_from, allEventsBody.snapshot?.replay?.can_resume_from);
+});
+
+test("job events endpoint keeps snapshot replay cursor global when limit truncates the window", async () => {
+  const allEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), allEventsRes);
+  const allEventsBody = JSON.parse(allEventsRes.body) as {
+    snapshot: {
+      seq: number;
+      event_count: number;
+      replay?: { next_seq?: number; can_resume_from?: number };
+    } | null;
+    events: Array<{ seq: number }>;
+  };
+
+  const limitedRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events?limit=2"), limitedRes);
+  const limitedBody = JSON.parse(limitedRes.body) as {
+    count: number;
+    snapshot: {
+      seq: number;
+      event_count: number;
+      replay?: { next_seq?: number; can_resume_from?: number };
+    } | null;
+    events: Array<{ seq: number }>;
+  };
+
+  assert.equal(limitedRes.statusCode, 200);
+  assert.equal(limitedBody.count, 2);
+  assert.equal(limitedBody.events.length, 2);
+  assert.equal((limitedBody.snapshot?.seq ?? 0) > (limitedBody.events.at(-1)?.seq ?? 0), true);
+  assert.equal(limitedBody.snapshot?.seq, allEventsBody.snapshot?.seq);
+  assert.equal(limitedBody.snapshot?.event_count, allEventsBody.snapshot?.event_count);
+  assert.equal(limitedBody.snapshot?.replay?.next_seq, allEventsBody.snapshot?.replay?.next_seq);
+  assert.equal(limitedBody.snapshot?.replay?.can_resume_from, allEventsBody.snapshot?.replay?.can_resume_from);
+});
+
+test("job events endpoint rejects invalid replay query parameters", async () => {
+  const invalidSinceSeqRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events?since_seq=abc"), invalidSinceSeqRes);
+  const invalidSinceSeqBody = JSON.parse(invalidSinceSeqRes.body) as { error?: { type?: string; message?: string } };
+
+  assert.equal(invalidSinceSeqRes.statusCode, 400);
+  assert.equal(invalidSinceSeqBody.error?.type, "invalid_request_error");
+  assert.equal(invalidSinceSeqBody.error?.message, "since_seq must be a non-negative integer.");
+
+  const invalidLimitRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events?limit=-1"), invalidLimitRes);
+  const invalidLimitBody = JSON.parse(invalidLimitRes.body) as { error?: { type?: string; message?: string } };
+
+  assert.equal(invalidLimitRes.statusCode, 400);
+  assert.equal(invalidLimitBody.error?.type, "invalid_request_error");
+  assert.equal(invalidLimitBody.error?.message, "limit must be a non-negative integer.");
+});
+
 test("job stream endpoint replays standardized timeline events and snapshot", async () => {
   const res = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/stream"), res);
@@ -1149,6 +1390,30 @@ test("job stream supports since_seq replay and Last-Event-ID resume", async () =
   assert.equal(lastEventIdRes.body.includes('"type":"job.created"'), false);
 
   lastEventIdRes.end();
+});
+
+test("job stream rejects invalid replay cursors", async () => {
+  const invalidSinceSeqRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/stream?since_seq=-1"), invalidSinceSeqRes);
+  const invalidSinceSeqBody = JSON.parse(invalidSinceSeqRes.body) as { error?: { type?: string; message?: string } };
+
+  assert.equal(invalidSinceSeqRes.statusCode, 400);
+  assert.equal(invalidSinceSeqBody.error?.type, "invalid_request_error");
+  assert.equal(invalidSinceSeqBody.error?.message, "since_seq must be a non-negative integer.");
+
+  const invalidLastEventIdRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest({
+    ...buildAuthorizedRequest("/v1/jobs/job_steps_test/stream"),
+    headers: {
+      authorization: "Bearer dual-agent-local",
+      "last-event-id": "oops",
+    },
+  } as IncomingMessage, invalidLastEventIdRes);
+  const invalidLastEventIdBody = JSON.parse(invalidLastEventIdRes.body) as { error?: { type?: string; message?: string } };
+
+  assert.equal(invalidLastEventIdRes.statusCode, 400);
+  assert.equal(invalidLastEventIdBody.error?.type, "invalid_request_error");
+  assert.equal(invalidLastEventIdBody.error?.message, "Last-Event-ID must be a non-negative integer.");
 });
 
 test("job stream replays verification check events", async () => {
@@ -1828,8 +2093,15 @@ test("job events snapshot summarizes failure categories for diagnostics", async 
 });
 
 test("restart recovery auto-resumes interrupted running jobs and preserves approval jobs", async () => {
+  const suffix = randomUUID().slice(0, 8);
+  const runningTaskId = `taskrun_restart_running_${suffix}`;
+  const runningPlanId = `plan_restart_running_${suffix}`;
+  const runningJobId = `job_restart_running_${suffix}`;
+  const approvalTaskId = `taskrun_restart_approval_${suffix}`;
+  const approvalPlanId = `plan_restart_approval_${suffix}`;
+  const approvalJobId = `job_restart_approval_${suffix}`;
   const runningTask = createTaskRunRecord({
-    id: "taskrun_restart_running",
+    id: runningTaskId,
     title: "Interrupted Task",
     description: "Was running before restart",
     status: "pending",
@@ -1839,13 +2111,13 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     artifacts: [],
   });
   const runningPlan = createPlanRecord({
-    id: "plan_restart_running",
+    id: runningPlanId,
     goal: "Recover me after restart",
     mode: "task",
     taskRunIds: [runningTask.id],
   });
   const runningJob = createJobRecord({
-    id: "job_restart_running",
+    id: runningJobId,
     goal: "Recover me after restart",
     mode: "task",
     status: "running",
@@ -1863,7 +2135,7 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
   });
 
   const approvalTask = createTaskRunRecord({
-    id: "taskrun_restart_approval",
+    id: approvalTaskId,
     title: "Approval Task",
     description: "Still waiting for approval",
     status: "awaiting_approval",
@@ -1873,13 +2145,13 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     artifacts: [],
   });
   const approvalPlan = createPlanRecord({
-    id: "plan_restart_approval",
+    id: approvalPlanId,
     goal: "Wait for approval across restart",
     mode: "task",
     taskRunIds: [approvalTask.id],
   });
   const approvalJob = createJobRecord({
-    id: "job_restart_approval",
+    id: approvalJobId,
     goal: "Wait for approval across restart",
     mode: "task",
     status: "awaiting_approval",
@@ -1937,11 +2209,13 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
   });
 
   try {
-    const recoveredIds = await __testables.recoverInterruptedJobs();
-    assert.equal(recoveredIds.includes("job_restart_running"), true);
-    assert.equal(recoveredIds.includes("job_restart_approval"), false);
+    const recoveredIds = await __testables.recoverInterruptedJobs(undefined, {
+      jobIds: [runningJobId, approvalJobId],
+    });
+    assert.equal(recoveredIds.includes(runningJobId), true);
+    assert.equal(recoveredIds.includes(approvalJobId), false);
 
-    const recoveredRecord = readJobRecord("job_restart_running");
+    const recoveredRecord = readJobRecord(runningJobId);
     assert.equal(recoveredRecord?.job.status, "blocked");
     assert.equal(recoveredRecord?.job.output.includes("service restart"), true);
     assert.equal(recoveredRecord?.control?.recoveryReason, "service_restart");
@@ -1954,15 +2228,15 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     assert.equal(typeof resumedJobId, "string");
 
     const resumedRecord = resumedJobId ? readJobRecord(resumedJobId) : null;
-    assert.equal(resumedRecord?.control?.resumeOf, "job_restart_running");
+    assert.equal(resumedRecord?.control?.resumeOf, runningJobId);
     assert.equal(resumedRecord?.job.status, "completed");
 
-    const approvalRecord = readJobRecord("job_restart_approval");
+    const approvalRecord = readJobRecord(approvalJobId);
     assert.equal(approvalRecord?.job.status, "awaiting_approval");
     assert.equal(approvalRecord?.taskRuns[0]?.status, "awaiting_approval");
 
     const recoveredJobRes = new MockResponse() as unknown as ServerResponse & MockResponse;
-    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_running"), recoveredJobRes);
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${runningJobId}`), recoveredJobRes);
     const recoveredJobBody = JSON.parse(recoveredJobRes.body) as {
       job: { status: string };
       control: { recoveryReason?: string; recoveredAt?: string; resumedToJobId?: string };
@@ -1974,7 +2248,7 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     assert.equal(recoveredJobBody.control.resumedToJobId, resumedJobId);
 
     const recoveredEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
-    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_running/events"), recoveredEventsRes);
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${runningJobId}/events`), recoveredEventsRes);
     const recoveredEventsBody = JSON.parse(recoveredEventsRes.body) as {
       snapshot?: {
         recovery?: {
@@ -1993,7 +2267,7 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     assert.equal(recoveredEvent?.meta?.recovery_reason, "service_restart");
     assert.equal(recoveredEvent?.meta?.recoverable, false);
     assert.equal(recoveredEvent?.meta?.resumed_to_job_id, resumedJobId);
-    assert.deepEqual(recoveredEvent?.meta?.affected_task_run_ids, ["taskrun_restart_running"]);
+    assert.deepEqual(recoveredEvent?.meta?.affected_task_run_ids, [runningTaskId]);
     assert.equal(Boolean(resumedEvent), true);
     assert.equal(resumedEvent?.meta?.resumed_to_job_id, resumedJobId);
     assert.equal(resumedEvent?.meta?.resumed_automatically, true);
@@ -2001,15 +2275,19 @@ test("restart recovery auto-resumes interrupted running jobs and preserves appro
     assert.equal(recoveredEventsBody.snapshot?.recovery?.reason, "service_restart");
     assert.equal(recoveredEventsBody.snapshot?.recovery?.recoverable, false);
     assert.equal(recoveredEventsBody.snapshot?.recovery?.resumed_to_job_id, resumedJobId);
-    assert.deepEqual(recoveredEventsBody.snapshot?.recovery?.affected_task_run_ids, ["taskrun_restart_running"]);
+    assert.deepEqual(recoveredEventsBody.snapshot?.recovery?.affected_task_run_ids, [runningTaskId]);
   } finally {
     __testables.setTaskExecutorForTests(null);
   }
 });
 
 test("restart recovery records structured auto-resume failure state", async () => {
+  const suffix = randomUUID().slice(0, 8);
+  const runningTaskId = `taskrun_restart_failure_${suffix}`;
+  const runningPlanId = `plan_restart_failure_${suffix}`;
+  const runningJobId = `job_restart_failure_${suffix}`;
   const runningTask = createTaskRunRecord({
-    id: "taskrun_restart_failure",
+    id: runningTaskId,
     title: "Interrupted Task",
     description: "Was running before restart",
     status: "pending",
@@ -2019,13 +2297,13 @@ test("restart recovery records structured auto-resume failure state", async () =
     artifacts: [],
   });
   const runningPlan = createPlanRecord({
-    id: "plan_restart_failure",
+    id: runningPlanId,
     goal: "Recover me after restart but fail",
     mode: "task",
     taskRunIds: [runningTask.id],
   });
   const runningJob = createJobRecord({
-    id: "job_restart_failure",
+    id: runningJobId,
     goal: "Recover me after restart but fail",
     mode: "task",
     status: "running",
@@ -2047,10 +2325,12 @@ test("restart recovery records structured auto-resume failure state", async () =
   });
 
   try {
-    const recoveredIds = await __testables.recoverInterruptedJobs();
-    assert.equal(recoveredIds.includes("job_restart_failure"), true);
+    const recoveredIds = await __testables.recoverInterruptedJobs(undefined, {
+      jobIds: [runningJobId],
+    });
+    assert.equal(recoveredIds.includes(runningJobId), true);
 
-    const recoveredRecord = readJobRecord("job_restart_failure");
+    const recoveredRecord = readJobRecord(runningJobId);
     assert.equal(recoveredRecord?.job.status, "blocked");
     assert.equal(typeof recoveredRecord?.control?.autoResumeAttemptedAt, "string");
     assert.equal(typeof recoveredRecord?.control?.autoResumeFailedAt, "string");
@@ -2058,7 +2338,7 @@ test("restart recovery records structured auto-resume failure state", async () =
     assert.equal(recoveredRecord?.control?.resumedToJobId, undefined);
 
     const recoveredJobRes = new MockResponse() as unknown as ServerResponse & MockResponse;
-    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_failure"), recoveredJobRes);
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${runningJobId}`), recoveredJobRes);
     const recoveredJobBody = JSON.parse(recoveredJobRes.body) as {
       control: {
         autoResumeAttemptedAt?: string;
@@ -2073,7 +2353,7 @@ test("restart recovery records structured auto-resume failure state", async () =
     assert.equal(recoveredJobBody.control.resumedToJobId, undefined);
 
     const recoveredEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
-    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_restart_failure/events"), recoveredEventsRes);
+    await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/${runningJobId}/events`), recoveredEventsRes);
     const recoveredEventsBody = JSON.parse(recoveredEventsRes.body) as {
       snapshot?: {
         recovery?: {
@@ -2100,12 +2380,14 @@ test("restart recovery records structured auto-resume failure state", async () =
 });
 
 test("restart recovery limits batch auto-resume concurrency and records queue metadata", async () => {
+  const suffix = randomUUID().slice(0, 8);
   let currentConcurrent = 0;
   let maxConcurrent = 0;
+  const jobIds = Array.from({ length: 5 }, (_, index) => `job_restart_batch_${index}_${suffix}`);
 
   for (let index = 0; index < 5; index += 1) {
     const taskRun = createTaskRunRecord({
-      id: `taskrun_restart_batch_${index}`,
+      id: `taskrun_restart_batch_${index}_${suffix}`,
       title: `Interrupted Task ${index}`,
       description: "Was running before restart",
       status: "pending",
@@ -2115,13 +2397,13 @@ test("restart recovery limits batch auto-resume concurrency and records queue me
       artifacts: [],
     });
     const plan = createPlanRecord({
-      id: `plan_restart_batch_${index}`,
+      id: `plan_restart_batch_${index}_${suffix}`,
       goal: `Recover batch job ${index}`,
       mode: "task",
       taskRunIds: [taskRun.id],
     });
     const job = createJobRecord({
-      id: `job_restart_batch_${index}`,
+      id: jobIds[index]!,
       goal: `Recover batch job ${index}`,
       mode: "task",
       status: "running",
@@ -2185,12 +2467,14 @@ test("restart recovery limits batch auto-resume concurrency and records queue me
   });
 
   try {
-    const recoveredIds = await __testables.recoverInterruptedJobs();
-    assert.equal(recoveredIds.filter((id) => id.startsWith("job_restart_batch_")).length, 5);
+    const recoveredIds = await __testables.recoverInterruptedJobs(undefined, {
+      jobIds,
+    });
+    assert.equal(recoveredIds.filter((id) => jobIds.includes(id)).length, 5);
     assert.equal(maxConcurrent <= 3, true);
 
     for (let index = 0; index < 5; index += 1) {
-      const record = readJobRecord(`job_restart_batch_${index}`);
+      const record = readJobRecord(jobIds[index]!);
       assert.equal(record?.control?.autoResumeBatchSize, 5);
       assert.equal(typeof record?.control?.autoResumeQueuePosition, "number");
       assert.equal(record?.control?.autoResumeStatus, "succeeded");
