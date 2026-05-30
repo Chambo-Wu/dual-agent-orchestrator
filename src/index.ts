@@ -1936,6 +1936,82 @@ function parseNonNegativeIntegerParam(
   return { ok: true, value: parsed };
 }
 
+type JobEventQuery = {
+  type?: string;
+  status?: string;
+  agent?: string;
+  phase?: string;
+  taskRunId?: string;
+};
+
+function readJobEventQuery(url: URL): JobEventQuery {
+  const read = (name: string): string | undefined => {
+    const value = url.searchParams.get(name)?.trim();
+    return value ? value : undefined;
+  };
+  return {
+    type: read("type"),
+    status: read("status"),
+    agent: read("agent"),
+    phase: read("phase"),
+    taskRunId: read("task_run_id") ?? read("taskRunId"),
+  };
+}
+
+function eventMatchesQuery(event: WorkflowUiEvent, query: JobEventQuery): boolean {
+  return (!query.type || event.type === query.type)
+    && (!query.status || event.status === query.status)
+    && (!query.agent || event.agent === query.agent)
+    && (!query.phase || event.phase === query.phase)
+    && (!query.taskRunId || event.taskRunId === query.taskRunId);
+}
+
+function parseStringSetParam(url: URL, name: string): Set<string> {
+  const values = url.searchParams.getAll(name)
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  return new Set(values);
+}
+
+function filterJobEvents(
+  events: WorkflowUiEvent[],
+  filters: {
+    types?: Set<string>;
+    statuses?: Set<string>;
+    agents?: Set<string>;
+    phases?: Set<string>;
+    taskRunIds?: Set<string>;
+    seq?: number;
+    sinceSeq?: number;
+  },
+): WorkflowUiEvent[] {
+  return events.filter((event) => {
+    if (Number.isFinite(filters.sinceSeq) && event.seq <= (filters.sinceSeq as number)) {
+      return false;
+    }
+    if (Number.isFinite(filters.seq) && event.seq !== filters.seq) {
+      return false;
+    }
+    if (filters.types && filters.types.size > 0 && !filters.types.has(event.type)) {
+      return false;
+    }
+    if (filters.statuses && filters.statuses.size > 0 && !filters.statuses.has(event.status)) {
+      return false;
+    }
+    if (filters.agents && filters.agents.size > 0 && !filters.agents.has(event.agent)) {
+      return false;
+    }
+    if (filters.phases && filters.phases.size > 0 && !filters.phases.has(event.phase)) {
+      return false;
+    }
+    if (filters.taskRunIds && filters.taskRunIds.size > 0 && (!event.taskRunId || !filters.taskRunIds.has(event.taskRunId))) {
+      return false;
+    }
+    return true;
+  });
+}
+
 function secondsUntilCircuitHalfOpen(): number {
   return Math.max(1, Math.ceil((plannerCircuit.openUntil - Date.now()) / 1000));
 }
@@ -6401,10 +6477,20 @@ async function handleGetJobEvents(
   }
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const sinceSeqRaw = url.searchParams.get("since_seq");
+  const seqRaw = url.searchParams.get("seq");
   const limitRaw = url.searchParams.get("limit");
+  const pageRaw = url.searchParams.get("page");
+  const pageSizeRaw = url.searchParams.get("page_size");
   const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
   if (!sinceSeqResult.ok) {
     jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const seqResult = parseNonNegativeIntegerParam(seqRaw, "seq");
+  if (!seqResult.ok) {
+    jsonErrorResponse(res, 400, seqResult.message, "invalid_request_error", {
       status: "failed",
     });
     return;
@@ -6416,20 +6502,67 @@ async function handleGetJobEvents(
     });
     return;
   }
+  const pageResult = parseNonNegativeIntegerParam(pageRaw, "page");
+  if (!pageResult.ok) {
+    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const pageSizeResult = parseNonNegativeIntegerParam(pageSizeRaw, "page_size");
+  if (!pageSizeResult.ok) {
+    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
   const sinceSeq = sinceSeqResult.value;
+  const seq = seqResult.value;
   const limit = limitResult.value;
+  const requestedPage = pageResult.value;
+  const requestedPageSize = pageSizeResult.value;
+  const eventQuery = readJobEventQuery(url);
 
   const fullEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
-  let events = fullEvents;
-  if (Number.isFinite(sinceSeq)) {
-    events = events.filter((event) => event.seq > (sinceSeq as number));
-  }
-  if (Number.isFinite(limit) && (limit as number) >= 0) {
-    events = events.slice(0, limit as number);
-  }
+  const filteredEvents = filterJobEvents(fullEvents, {
+    sinceSeq,
+    seq,
+    types: parseStringSetParam(url, "type"),
+    statuses: parseStringSetParam(url, "status"),
+    agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
+    phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
+    taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
+  });
+  const pageSize = Number.isFinite(requestedPageSize)
+    ? Math.max(1, requestedPageSize as number)
+    : Number.isFinite(limit)
+      ? Math.max(1, limit as number)
+      : filteredEvents.length || 1;
+  const page = Math.max(1, requestedPage ?? 1);
+  const offset = (page - 1) * pageSize;
+  const pageEvents = filteredEvents.slice(offset, offset + pageSize);
+  const events = Number.isFinite(limit) && !Number.isFinite(requestedPage)
+    ? filteredEvents.slice(0, limit as number)
+    : pageEvents;
   jsonResponse(res, 200, {
     job_id: jobId,
     count: events.length,
+    total: filteredEvents.length,
+    filters: {
+      type: [...parseStringSetParam(url, "type")],
+      status: [...parseStringSetParam(url, "status")],
+      agent: eventQuery.agent ?? null,
+      phase: eventQuery.phase ?? null,
+      task_run_id: eventQuery.taskRunId ?? null,
+      seq: seq ?? null,
+      since_seq: sinceSeq ?? null,
+    },
+    pagination: {
+      page,
+      page_size: pageSize,
+      total: filteredEvents.length,
+      total_pages: Math.max(1, Math.ceil(filteredEvents.length / pageSize)),
+    },
     snapshot: buildEventSnapshot(record, fullEvents, routeBasePath),
     events,
   });
@@ -6455,10 +6588,34 @@ async function handleJobStream(
 
   const url = new URL(_req.url ?? "/", "http://127.0.0.1");
   const sinceSeqRaw = url.searchParams.get("since_seq");
+  const seqRaw = url.searchParams.get("seq");
+  const pageRaw = url.searchParams.get("page");
+  const pageSizeRaw = url.searchParams.get("page_size");
   const lastEventIdRaw = getHeaderValue(_req, "last-event-id");
   const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
   if (!sinceSeqResult.ok) {
     jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const seqResult = parseNonNegativeIntegerParam(seqRaw, "seq");
+  if (!seqResult.ok) {
+    jsonErrorResponse(res, 400, seqResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const pageResult = parseNonNegativeIntegerParam(pageRaw, "page");
+  if (!pageResult.ok) {
+    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
+      status: "failed",
+    });
+    return;
+  }
+  const pageSizeResult = parseNonNegativeIntegerParam(pageSizeRaw, "page_size");
+  if (!pageSizeResult.ok) {
+    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
       status: "failed",
     });
     return;
@@ -6477,12 +6634,27 @@ async function handleJobStream(
     : Number.isFinite(requestedLastEventId)
       ? requestedLastEventId as number
       : undefined;
+  const eventQuery = readJobEventQuery(url);
 
   // Load existing events from disk
   const existingEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
-  const replayEvents = replayCursor !== undefined
-    ? existingEvents.filter((event) => event.seq > replayCursor)
+  const replaySource = replayCursor !== undefined
+    ? existingEvents
     : (existingEvents.length > 0 ? existingEvents : getEvents(jobId));
+  const filteredReplayEvents = filterJobEvents(replaySource, {
+    types: parseStringSetParam(url, "type"),
+    statuses: parseStringSetParam(url, "status"),
+    agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
+    phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
+    taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
+    seq: seqResult.value,
+    sinceSeq: replayCursor,
+  });
+  const streamPageSize = Number.isFinite(pageSizeResult.value) ? Math.max(1, pageSizeResult.value as number) : filteredReplayEvents.length || 1;
+  const streamPage = Math.max(1, pageResult.value ?? 1);
+  const replayEvents = Number.isFinite(pageResult.value) || Number.isFinite(pageSizeResult.value)
+    ? filteredReplayEvents.slice((streamPage - 1) * streamPageSize, streamPage * streamPageSize)
+    : filteredReplayEvents;
 
   // Set SSE headers
   res.statusCode = 200;
@@ -6499,6 +6671,18 @@ async function handleJobStream(
         ...(isObjectRecord(snapshot.replay) ? snapshot.replay : {}),
         resumed_from_seq: replayCursor ?? null,
         replayed_count: replayEvents.length,
+        filtered_count: filteredReplayEvents.length,
+        page: streamPage,
+        page_size: streamPageSize,
+        filters: {
+          type: [...parseStringSetParam(url, "type")],
+          status: [...parseStringSetParam(url, "status")],
+          agent: eventQuery.agent ?? null,
+          phase: eventQuery.phase ?? null,
+          task_run_id: eventQuery.taskRunId ?? null,
+          seq: seqResult.value ?? null,
+          since_seq: replayCursor ?? null,
+        },
       },
     }));
     if (isObjectRecord(snapshot.follow) && typeof snapshot.follow.type === "string") {
@@ -6514,6 +6698,16 @@ async function handleJobStream(
   // Subscribe to new events
   const unsubscribe = subscribe(jobId, (event) => {
     try {
+      if (filterJobEvents([event], {
+        types: parseStringSetParam(url, "type"),
+        statuses: parseStringSetParam(url, "status"),
+        agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
+        phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
+        taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
+        seq: seqResult.value,
+      }).length === 0) {
+        return;
+      }
       sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
       if (event.type === "job.resumed" && isObjectRecord(event.meta) && typeof event.meta.resumed_to_job_id === "string") {
         const follow = buildResumeFollowTarget(jobId, event.meta.resumed_to_job_id, routeBasePath);

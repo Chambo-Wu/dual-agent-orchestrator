@@ -1272,6 +1272,36 @@ test("job events endpoint keeps snapshot replay cursor global when limit truncat
   assert.equal(limitedBody.snapshot?.replay?.can_resume_from, allEventsBody.snapshot?.replay?.can_resume_from);
 });
 
+test("job events endpoint filters by type status seq and paginates results", async () => {
+  const allEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), allEventsRes);
+  const allEventsBody = JSON.parse(allEventsRes.body) as {
+    events: Array<{ seq: number; type: string; status: string }>;
+  };
+  const artifactEvent = allEventsBody.events.find((event) => event.type === "artifact.created");
+  assert.equal(Boolean(artifactEvent), true);
+
+  const filteredRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/job_steps_test/events?type=artifact.created&status=${artifactEvent?.status}&seq=${artifactEvent?.seq}&page=1&page_size=1`), filteredRes);
+  const filteredBody = JSON.parse(filteredRes.body) as {
+    count: number;
+    total: number;
+    filters?: { type?: string[]; status?: string[]; seq?: number | null };
+    pagination?: { page?: number; page_size?: number; total?: number; total_pages?: number };
+    events: Array<{ seq: number; type: string; status: string }>;
+  };
+
+  assert.equal(filteredRes.statusCode, 200);
+  assert.equal(filteredBody.count, 1);
+  assert.equal(filteredBody.total, 1);
+  assert.deepEqual(filteredBody.filters?.type, ["artifact.created"]);
+  assert.deepEqual(filteredBody.filters?.status, [artifactEvent?.status]);
+  assert.equal(filteredBody.filters?.seq, artifactEvent?.seq);
+  assert.equal(filteredBody.pagination?.page, 1);
+  assert.equal(filteredBody.pagination?.page_size, 1);
+  assert.equal(filteredBody.events[0]?.seq, artifactEvent?.seq);
+});
+
 test("job events endpoint rejects invalid replay query parameters", async () => {
   const invalidSinceSeqRes = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events?since_seq=abc"), invalidSinceSeqRes);
@@ -1390,6 +1420,28 @@ test("job stream supports since_seq replay and Last-Event-ID resume", async () =
   assert.equal(lastEventIdRes.body.includes('"type":"job.created"'), false);
 
   lastEventIdRes.end();
+});
+
+test("job stream endpoint filters replay events by type status seq and page", async () => {
+  const allEventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_steps_test/events"), allEventsRes);
+  const allEventsBody = JSON.parse(allEventsRes.body) as {
+    events: Array<{ seq: number; type: string; status: string }>;
+  };
+  const artifactEvent = allEventsBody.events.find((event) => event.type === "artifact.created");
+  assert.equal(Boolean(artifactEvent), true);
+
+  const streamRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest(`/v1/jobs/job_steps_test/stream?type=artifact.created&status=${artifactEvent?.status}&seq=${artifactEvent?.seq}&page=1&page_size=1`), streamRes);
+
+  assert.equal(streamRes.statusCode, 200);
+  assert.equal(streamRes.body.includes("event: job.snapshot"), true);
+  assert.equal(streamRes.body.includes('"filtered_count":1'), true);
+  assert.equal(streamRes.body.includes('"page":1'), true);
+  assert.equal(streamRes.body.includes('"page_size":1'), true);
+  assert.equal(streamRes.body.includes('"type":"artifact.created"'), true);
+  assert.equal(streamRes.body.includes('"type":"job.created"'), false);
+  streamRes.end();
 });
 
 test("job stream rejects invalid replay cursors", async () => {

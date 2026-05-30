@@ -5,6 +5,7 @@ export type TimelineSelectionState =
   | { kind: "task"; taskId: string }
   | { kind: "artifact"; artifactId: string }
   | { kind: "verification_check"; checkKey: string; taskId?: string }
+  | { kind: "edge"; fromTaskId: string; toTaskId: string; workflowId?: string }
   | { kind: "skill_install"; eventId: string };
 
 export interface TimelineUiState {
@@ -17,6 +18,7 @@ export type TimelineUiAction =
   | { type: "select_task"; taskId: string }
   | { type: "select_artifact"; artifactId: string }
   | { type: "select_verification_check"; checkKey: string; taskId?: string }
+  | { type: "select_edge"; fromTaskId: string; toTaskId: string; workflowId?: string }
   | { type: "select_skill_install"; eventId: string }
   | { type: "apply_analysis_filter"; kind: string; value: string }
   | { type: "clear_analysis_filter" }
@@ -41,6 +43,11 @@ export function reduceTimelineUiState(state: TimelineUiState, action: TimelineUi
         ...state,
         analysisFilter: { kind: "verification_check", value: action.checkKey },
         selection: { kind: "verification_check", checkKey: action.checkKey, taskId: action.taskId },
+      };
+    case "select_edge":
+      return {
+        ...state,
+        selection: { kind: "edge", fromTaskId: action.fromTaskId, toTaskId: action.toTaskId, workflowId: action.workflowId },
       };
     case "select_skill_install":
       return {
@@ -94,6 +101,11 @@ export function readTimelineUiStateFromUrl(urlText: string): TimelineUiState {
     selection = { kind: "artifact", artifactId: selectionValue };
   } else if (selectionKind === "verification_check" && selectionValue) {
     selection = { kind: "verification_check", checkKey: selectionValue };
+  } else if (selectionKind === "edge" && selectionValue) {
+    const [fromTaskId, toTaskId, workflowId] = selectionValue.split("->").map((item) => item.trim());
+    if (fromTaskId && toTaskId) {
+      selection = { kind: "edge", fromTaskId, toTaskId, workflowId: workflowId || undefined };
+    }
   } else if (selectionKind === "skill_install" && selectionValue) {
     selection = { kind: "skill_install", eventId: selectionValue };
   }
@@ -128,6 +140,9 @@ export function writeTimelineUiStateToUrl(urlText: string, state: TimelineUiStat
   } else if (state.selection?.kind === "verification_check") {
     url.searchParams.set("selectionKind", "verification_check");
     url.searchParams.set("selectionValue", state.selection.checkKey);
+  } else if (state.selection?.kind === "edge") {
+    url.searchParams.set("selectionKind", "edge");
+    url.searchParams.set("selectionValue", [state.selection.fromTaskId, state.selection.toTaskId, state.selection.workflowId].filter(Boolean).join("->"));
   } else if (state.selection?.kind === "skill_install") {
     url.searchParams.set("selectionKind", "skill_install");
     url.searchParams.set("selectionValue", state.selection.eventId);
@@ -545,13 +560,14 @@ export function renderTimelineHtml(
       width: 100%;
       height: 100%;
       overflow: visible;
-      pointer-events: none;
       z-index: 0;
     }
     .graph-edge {
       fill: none;
       stroke: rgba(88, 166, 255, 0.34);
       stroke-width: 2;
+      pointer-events: stroke;
+      cursor: pointer;
       transition: stroke 0.18s ease, stroke-width 0.18s ease, opacity 0.18s ease;
     }
     .graph-edge.superseded {
@@ -567,6 +583,11 @@ export function renderTimelineHtml(
     }
     .graph-edge.is-dimmed {
       opacity: 0.18;
+    }
+    .graph-edge.is-selected {
+      stroke: rgba(163, 113, 247, 0.95);
+      stroke-width: 4;
+      opacity: 1;
     }
     .task-card {
       border: 1px solid #30363d;
@@ -1069,7 +1090,7 @@ export function renderTimelineHtml(
       </section>
       <section class="panel">
         <h2>Workflow Analysis</h2>
-        ${renderWorkflowAnalysisPanel(replanHistory, runtimeAnalysis)}
+        ${renderWorkflowAnalysisPanel(replanHistory, workflowSummary?.dag, runtimeAnalysis)}
       </section>
     </div>` : ""}
 
@@ -1335,6 +1356,7 @@ export function renderTimelineHtml(
       const analysisClearButtons = Array.from(document.querySelectorAll('[data-clear-analysis-filter]'));
       const eventCards = Array.from(document.querySelectorAll('.event-card'));
       const analysisTaskCards = Array.from(document.querySelectorAll('.task-card[data-task-id]'));
+      const graphEdges = Array.from(document.querySelectorAll('.graph-edge[data-from][data-to]'));
       const detailContent = document.getElementById('detail-content');
       let focusedWorkflowId = null;
       let activeAnalysisFilter = null;
@@ -1424,6 +1446,7 @@ export function renderTimelineHtml(
             if (selection.kind === 'task') value = selection.taskId || null;
             if (selection.kind === 'artifact') value = selection.artifactId || null;
             if (selection.kind === 'verification_check') value = selection.checkKey || null;
+            if (selection.kind === 'edge') value = [selection.fromTaskId, selection.toTaskId, selection.workflowId].filter(Boolean).join('->') || null;
             if (selection.kind === 'skill_install') value = selection.eventId || null;
             if (value) {
               url.searchParams.set(selectionKindParamName, selection.kind);
@@ -1562,6 +1585,16 @@ export function renderTimelineHtml(
             ? { kind: 'skill_install', eventId: selection.eventId }
             : null;
         }
+        if (selection.kind === 'edge') {
+          const edge = graphEdges.find((candidate) =>
+            candidate.getAttribute('data-from') === selection.fromTaskId
+            && candidate.getAttribute('data-to') === selection.toTaskId
+            && (!selection.workflowId || candidate.getAttribute('data-workflow-id') === selection.workflowId),
+          );
+          return edge
+            ? { kind: 'edge', fromTaskId: selection.fromTaskId, toTaskId: selection.toTaskId, workflowId: selection.workflowId || edge.getAttribute('data-workflow-id') || undefined }
+            : null;
+        }
         return null;
       };
       const selectionFromUrlState = (urlSelection) => {
@@ -1569,6 +1602,10 @@ export function renderTimelineHtml(
         if (urlSelection.kind === 'task') return normalizeSelection({ kind: 'task', taskId: urlSelection.value });
         if (urlSelection.kind === 'artifact') return normalizeSelection({ kind: 'artifact', artifactId: urlSelection.value });
         if (urlSelection.kind === 'verification_check') return normalizeSelection({ kind: 'verification_check', checkKey: urlSelection.value });
+        if (urlSelection.kind === 'edge') {
+          const parts = urlSelection.value.split('->').map((item) => item.trim());
+          return normalizeSelection({ kind: 'edge', fromTaskId: parts[0], toTaskId: parts[1], workflowId: parts[2] || undefined });
+        }
         if (urlSelection.kind === 'skill_install') return normalizeSelection({ kind: 'skill_install', eventId: urlSelection.value });
         return null;
       };
@@ -1777,9 +1814,37 @@ export function renderTimelineHtml(
           + '</div>';
       };
 
+      const renderEdgeDetail = (fromTaskId, toTaskId, workflowId) => {
+        if (!detailContent) return;
+        const fromTask = findTaskCard(fromTaskId);
+        const toTask = findTaskCard(toTaskId);
+        const relatedEvents = eventCards.filter((card) =>
+          card.getAttribute('data-task-run-id') === fromTaskId
+          || card.getAttribute('data-related-task-run-id') === fromTaskId
+          || card.getAttribute('data-task-run-id') === toTaskId
+          || card.getAttribute('data-related-task-run-id') === toTaskId,
+        );
+        detailContent.innerHTML =
+          '<div class="detail-kv">'
+            + '<div><span>Edge</span>' + escapeDetail(fromTaskId + ' -> ' + toTaskId) + '</div>'
+            + '<div><span>Workflow</span>' + (escapeDetail(workflowId || '') || 'n/a') + '</div>'
+            + '<div><span>From Status</span>' + (escapeDetail(fromTask?.getAttribute('data-task-status') || '') || 'n/a') + '</div>'
+            + '<div><span>To Status</span>' + (escapeDetail(toTask?.getAttribute('data-task-status') || '') || 'n/a') + '</div>'
+          + '</div>'
+          + '<div class="detail-section">'
+            + '<h3>Dependency</h3>'
+            + '<div class="detail-preview">' + escapeDetail((fromTask?.querySelector('.task-card-title')?.textContent || fromTaskId) + ' must complete before ' + (toTask?.querySelector('.task-card-title')?.textContent || toTaskId)) + '</div>'
+          + '</div>'
+          + '<div class="detail-section">'
+            + '<h3>Related Events</h3>'
+            + '<div class="detail-list">' + (relatedEventMarkup(relatedEvents) || '<div class="detail-item">No related events.</div>') + '</div>'
+          + '</div>';
+      };
+
       const applySelectionStyling = () => {
         eventCards.forEach((card) => card.classList.remove('is-selected'));
         analysisTaskCards.forEach((card) => card.classList.remove('is-selected'));
+        graphEdges.forEach((edge) => edge.classList.remove('is-selected'));
         if (!activeSelection) return;
         if (activeSelection.kind === 'task') {
           const taskCard = findTaskCard(activeSelection.taskId);
@@ -1815,6 +1880,18 @@ export function renderTimelineHtml(
           const skillInstallCard = findSkillInstallCard(activeSelection.eventId);
           if (skillInstallCard) skillInstallCard.classList.add('is-selected');
         }
+        if (activeSelection.kind === 'edge') {
+          graphEdges.forEach((edge) => {
+            const matches = edge.getAttribute('data-from') === activeSelection.fromTaskId
+              && edge.getAttribute('data-to') === activeSelection.toTaskId
+              && (!activeSelection.workflowId || edge.getAttribute('data-workflow-id') === activeSelection.workflowId);
+            edge.classList.toggle('is-selected', matches);
+          });
+          const fromTask = findTaskCard(activeSelection.fromTaskId);
+          const toTask = findTaskCard(activeSelection.toTaskId);
+          if (fromTask) fromTask.classList.add('is-selected');
+          if (toTask) toTask.classList.add('is-selected');
+        }
       };
 
       const renderSelectionDetail = () => {
@@ -1836,6 +1913,10 @@ export function renderTimelineHtml(
         }
         if (activeSelection.kind === 'skill_install') {
           renderSkillInstallDetail(activeSelection.eventId);
+          return;
+        }
+        if (activeSelection.kind === 'edge') {
+          renderEdgeDetail(activeSelection.fromTaskId, activeSelection.toTaskId, activeSelection.workflowId);
           return;
         }
         renderEmptyDetail();
@@ -2126,6 +2207,16 @@ export function renderTimelineHtml(
           selectEntity({ kind: 'task', taskId }, { historyMode: 'push' });
         });
       });
+      graphEdges.forEach((edge) => {
+        edge.addEventListener('click', (event) => {
+          event.stopPropagation();
+          const fromTaskId = edge.getAttribute('data-from');
+          const toTaskId = edge.getAttribute('data-to');
+          const workflowId = edge.getAttribute('data-workflow-id') || undefined;
+          if (!fromTaskId || !toTaskId) return;
+          selectEntity({ kind: 'edge', fromTaskId, toTaskId, workflowId }, { historyMode: 'push' });
+        });
+      });
 
       eventCards.forEach((card) => {
         card.addEventListener('click', () => {
@@ -2371,9 +2462,11 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     created: number;
     items: Array<{ id: string; label: string; count: number }>;
   };
+  failureTypes: Array<{ label: string; count: number }>;
 } {
   const toolCounts = new Map<string, number>();
   const blockerCounts = new Map<string, number>();
+  const failureTypeCounts = new Map<string, number>();
   const verificationCheckCounts = new Map<string, { name: string; status: string; count: number }>();
   const skillInstallCounts = new Map<string, number>();
   const artifactCounts = new Map<string, { id: string; label: string; count: number }>();
@@ -2447,6 +2540,7 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
         : "";
       const label = failureCategory || event.title || event.type;
       blockerCounts.set(label, (blockerCounts.get(label) ?? 0) + 1);
+      failureTypeCounts.set(label, (failureTypeCounts.get(label) ?? 0) + 1);
     }
   }
 
@@ -2462,6 +2556,9 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
     .map(([status, count]) => ({ status, count }))
     .sort((a, b) => b.count - a.count || a.status.localeCompare(b.status));
   const artifactItems = [...artifactCounts.values()]
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  const failureTypes = [...failureTypeCounts.entries()]
+    .map(([label, count]) => ({ label, count }))
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
   return {
@@ -2484,6 +2581,7 @@ function summarizeRuntimeAnalysis(events: WorkflowUiEvent[]): {
       created: artifactCreated,
       items: artifactItems,
     },
+    failureTypes,
   };
 }
 
@@ -2617,9 +2715,59 @@ function renderReplanHistoryPanel(replanHistory: NonNullable<Parameters<typeof r
         ? `<div><strong>#${entry.index ?? "?"}</strong> ${escapeHtml(entry.superseded_workflow_id)} -> ${escapeHtml(entry.replacement_workflow_id)}</div>
            ${entry.failed_task_id ? `<div class="subtle">Failed task: ${escapeHtml(entry.failed_task_id)}</div>` : ""}
            <div class="history-focus-state" data-focus-state hidden></div>
-           <div class="history-focus-hint" data-focus-hint>Click to focus superseded lane</div>`
+           <div class="history-focus-hint" data-focus-hint>Click to focus superseded lane</div>
+           <div class="subtle">Open the diff below to compare before/after task shape.</div>`
         : `<div>${escapeHtml(entry.summary ?? `Replan #${entry.index ?? "?"}`)}</div>`}
     </div>`).join("")}</div>`;
+}
+
+function renderReplanDiffPanel(
+  replanHistory: NonNullable<Parameters<typeof renderTimelineHtml>[4]>["replan_history"],
+  dag: NonNullable<Parameters<typeof renderTimelineHtml>[4]>["dag"],
+): string {
+  const workflows = dag?.workflows ?? [];
+  if (!replanHistory || replanHistory.length === 0 || workflows.length === 0) {
+    return "";
+  }
+  const workflowById = new Map(workflows.map((workflow) => [workflow.workflow_id ?? "", workflow]));
+  const rows = replanHistory.flatMap((entry) => {
+    const before = entry.superseded_workflow_id ? workflowById.get(entry.superseded_workflow_id) : undefined;
+    const after = entry.replacement_workflow_id ? workflowById.get(entry.replacement_workflow_id) : undefined;
+    if (!before && !after) {
+      return [];
+    }
+    const beforeTasks = new Map((before?.tasks ?? []).map((task) => [task.task_id ?? task.id ?? "", task]));
+    const afterTasks = new Map((after?.tasks ?? []).map((task) => [task.task_id ?? task.id ?? "", task]));
+    const taskIds = [...new Set([...beforeTasks.keys(), ...afterTasks.keys()])].sort();
+    const changed = taskIds.map((taskId) => {
+      const oldTask = beforeTasks.get(taskId);
+      const newTask = afterTasks.get(taskId);
+      const oldDeps = (oldTask?.depends_on ?? []).join(", ");
+      const newDeps = (newTask?.depends_on ?? []).join(", ");
+      const state = !oldTask ? "added" : !newTask ? "removed" : oldTask.status !== newTask.status || oldTask.title !== newTask.title || oldDeps !== newDeps ? "changed" : "unchanged";
+      return { taskId, oldTask, newTask, oldDeps, newDeps, state };
+    }).filter((row) => row.state !== "unchanged");
+    return [{
+      entry,
+      before,
+      after,
+      changed,
+    }];
+  });
+  if (rows.length === 0) {
+    return "";
+  }
+  return `<div style="margin-top:12px"><div class="subtle">Replan before/after diff</div><div class="history-list">${rows.map((row) => `
+    <div class="history-item">
+      <div><strong>#${row.entry.index ?? "?"}</strong> ${escapeHtml(row.entry.superseded_workflow_id ?? "before")} -> ${escapeHtml(row.entry.replacement_workflow_id ?? "after")}</div>
+      <div class="subtle">${row.changed.length} task change(s)</div>
+      ${row.changed.length === 0 ? `<div class="subtle">No task-level differences detected.</div>` : row.changed.slice(0, 8).map((change) => `
+        <div class="detail-item" style="margin-top:8px">
+          <strong>${escapeHtml(change.state)}: ${escapeHtml(change.taskId)}</strong><br>
+          before: ${escapeHtml(change.oldTask?.title ?? "n/a")} / ${escapeHtml(change.oldTask?.status ?? "n/a")} / deps ${escapeHtml(change.oldDeps || "none")}<br>
+          after: ${escapeHtml(change.newTask?.title ?? "n/a")} / ${escapeHtml(change.newTask?.status ?? "n/a")} / deps ${escapeHtml(change.newDeps || "none")}
+        </div>`).join("")}
+    </div>`).join("")}</div></div>`;
 }
 
 function renderWorkflowDependencyGraph(
@@ -2695,9 +2843,10 @@ function renderWorkflowDependencyGraph(
 
 function renderWorkflowAnalysisPanel(
   replanHistory: NonNullable<Parameters<typeof renderTimelineHtml>[4]>["replan_history"],
+  dag: NonNullable<Parameters<typeof renderTimelineHtml>[4]>["dag"],
   runtimeAnalysis: ReturnType<typeof summarizeRuntimeAnalysis>,
 ): string {
-  const replanSection = `<h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Replan History</h3>${renderReplanHistoryPanel(replanHistory)}`;
+  const replanSection = `<h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Replan History</h3>${renderReplanHistoryPanel(replanHistory)}${renderReplanDiffPanel(replanHistory, dag)}`;
   const verificationSection = `<div class="subtle">Verification: ${runtimeAnalysis.verificationSignals.passed} passed, ${runtimeAnalysis.verificationSignals.failed} failed</div>`;
   const analysisActions = `<div class="analysis-actions"><button type="button" class="analysis-clear" data-clear-analysis-filter>Show all events</button></div>`;
   const verificationFilterSection = (runtimeAnalysis.verificationSignals.passed > 0 || runtimeAnalysis.verificationSignals.failed > 0)
@@ -2728,16 +2877,21 @@ function renderWorkflowAnalysisPanel(
       </div>`
     : "";
   const toolSection = runtimeAnalysis.toolUsage.length > 0
-    ? `<div class="subtle">Tool activity</div><div class="history-list">${runtimeAnalysis.toolUsage.slice(0, 6).map((entry) => `
+    ? `<div class="subtle">Tool usage distribution</div><div class="history-list">${runtimeAnalysis.toolUsage.slice(0, 6).map((entry) => `
         <button type="button" class="analysis-chip" data-analysis-filter="tool" data-analysis-value="${escapeHtmlAttribute(entry.name)}"><strong>${escapeHtml(entry.name)}</strong> · ${entry.count}</button>
       `).join("")}</div>`
-    : `<div class="subtle">Tool activity will appear once tool events are recorded.</div>`;
-  const blockerSection = runtimeAnalysis.blockerPoints.length > 0
-    ? `<div class="subtle" style="margin-top:12px">Common issues</div><div class="history-list">${runtimeAnalysis.blockerPoints.slice(0, 6).map((entry) => `
+    : `<div class="subtle">Tool usage distribution will appear once tool events are recorded.</div>`;
+  const failureTypeSection = runtimeAnalysis.failureTypes.length > 0
+    ? `<div class="subtle" style="margin-top:12px">Failure types</div><div class="history-list">${runtimeAnalysis.failureTypes.slice(0, 6).map((entry) => `
         <button type="button" class="analysis-chip" data-analysis-filter="failure_category" data-analysis-value="${escapeHtmlAttribute(entry.label)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
       `).join("")}</div>`
-    : `<div class="subtle" style="margin-top:12px">No issue signals recorded.</div>`;
-  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${verificationCheckSection}${skillInstallSection}${artifactSection}${toolSection}${blockerSection}</div>`;
+    : `<div class="subtle" style="margin-top:12px">No failure types recorded.</div>`;
+  const blockerSection = runtimeAnalysis.blockerPoints.length > 0
+    ? `<div class="subtle" style="margin-top:12px">Blockers</div><div class="history-list">${runtimeAnalysis.blockerPoints.slice(0, 6).map((entry) => `
+        <button type="button" class="analysis-chip" data-analysis-filter="failure_category" data-analysis-value="${escapeHtmlAttribute(entry.label)}"><strong>${escapeHtml(entry.label)}</strong> · ${entry.count}</button>
+      `).join("")}</div>`
+    : `<div class="subtle" style="margin-top:12px">No blocker signals recorded.</div>`;
+  return `${replanSection}<div style="margin-top:16px"><h3 style="font-size:13px;margin:0 0 10px 0;color:#f0f6fc;">Runtime Analysis</h3>${verificationSection}${analysisActions}${verificationFilterSection}${verificationCheckSection}${skillInstallSection}${artifactSection}${toolSection}${failureTypeSection}${blockerSection}</div>`;
 }
 
 function assignTaskLevels(

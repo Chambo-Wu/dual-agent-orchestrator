@@ -1453,9 +1453,10 @@ test("timeline html renders runtime analysis summaries", () => {
   assert.equal(html.includes("Verification failed"), true);
   assert.equal(html.includes("Verification checks"), true);
   assert.equal(html.includes("artifact_presence"), true);
-  assert.equal(html.includes("Tool activity"), true);
+  assert.equal(html.includes("Tool usage distribution"), true);
   assert.equal(html.includes("web_search"), true);
-  assert.equal(html.includes("Common issues"), true);
+  assert.equal(html.includes("Failure types"), true);
+  assert.equal(html.includes("Blockers"), true);
   assert.equal(html.includes('id="detail-pane"'), true);
   assert.equal(html.includes('id="detail-content"'), true);
   assert.equal(html.includes("Select a task, artifact, or verification check to inspect its details."), true);
@@ -1578,6 +1579,10 @@ test("timeline html renders dependency graph lanes with SVG edges", () => {
   assert.equal(html.includes('data-task-id="t3"'), true);
   assert.equal(html.includes('data-from="t1"'), true);
   assert.equal(html.includes('data-to="t2"'), true);
+  assert.equal(html.includes("renderEdgeDetail"), true);
+  assert.equal(html.includes("kind: 'edge'"), true);
+  assert.equal(html.includes("graphEdges.forEach"), true);
+  assert.equal(html.includes("Dependency"), true);
   assert.equal(html.includes("is-current-task"), true);
   assert.equal(html.includes("initializeWorkflowInteractions"), true);
 });
@@ -1602,7 +1607,7 @@ test("timeline html renders replan history focus hooks", () => {
             workflow_id: "wf_old",
             status: "superseded",
             superseded_by: "wf_new",
-            task_count: 1,
+            task_count: 2,
             completed_count: 0,
             tasks: [
               {
@@ -1617,12 +1622,24 @@ test("timeline html renders replan history focus hooks", () => {
                 superseded: true,
                 superseded_by: "wf_new",
               },
+              {
+                id: "t_removed",
+                task_id: "t_removed",
+                title: "Removed task",
+                status: "pending",
+                assignee: "worker",
+                depends_on: ["t1"],
+                verified: false,
+                attempts: 0,
+                superseded: true,
+                superseded_by: "wf_new",
+              },
             ],
           },
           {
             workflow_id: "wf_new",
             status: "active",
-            task_count: 1,
+            task_count: 2,
             completed_count: 0,
             tasks: [
               {
@@ -1632,6 +1649,18 @@ test("timeline html renders replan history focus hooks", () => {
                 status: "in_progress",
                 assignee: "worker",
                 depends_on: [],
+                verified: false,
+                attempts: 0,
+                superseded: false,
+                superseded_by: null,
+              },
+              {
+                id: "t_added",
+                task_id: "t_added",
+                title: "Added task",
+                status: "pending",
+                assignee: "worker",
+                depends_on: ["t2"],
                 verified: false,
                 attempts: 0,
                 superseded: false,
@@ -1667,6 +1696,10 @@ test("timeline html renders replan history focus hooks", () => {
   assert.equal(html.includes('Focused: superseded lane'), true);
   assert.equal(html.includes('Focused: replacement lane'), true);
   assert.equal(html.includes('Click again to switch to replacement lane'), true);
+  assert.equal(html.includes("Replan before/after diff"), true);
+  assert.equal(html.includes("added: t_added"), true);
+  assert.equal(html.includes("removed: t_removed"), true);
+  assert.equal(html.includes("Open the diff below to compare before/after task shape."), true);
 });
 
 test("timeline UI state keeps task selection while clearing analysis filter", () => {
@@ -1727,6 +1760,23 @@ test("timeline UI state keeps skill install selection and URL round-trip", () =>
   const url = writeTimelineUiStateToUrl(baseUrl, state);
   assert.equal(url.includes("selectionKind=skill_install"), true);
   assert.equal(url.includes("selectionValue=evt_install_1"), true);
+  assert.deepEqual(readTimelineUiStateFromUrl(url), state);
+});
+
+test("timeline UI state keeps edge selection in URL round-trip", () => {
+  const baseUrl = "https://example.test/v1/jobs/job_1/timeline";
+  const state = reduceTimelineUiState(
+    {
+      workflowFocus: null,
+      analysisFilter: null,
+      selection: null,
+    },
+    { type: "select_edge", fromTaskId: "t1", toTaskId: "t2", workflowId: "wf_graph" },
+  );
+
+  const url = writeTimelineUiStateToUrl(baseUrl, state);
+  assert.equal(url.includes("selectionKind=edge"), true);
+  assert.equal(url.includes("selectionValue=t1-%3Et2-%3Ewf_graph"), true);
   assert.deepEqual(readTimelineUiStateFromUrl(url), state);
 });
 
