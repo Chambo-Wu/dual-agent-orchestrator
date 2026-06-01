@@ -11,6 +11,11 @@ let mainWindow = null;
 let serverProcess = null;
 let serverLog = [];
 
+function sendToRenderer(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+  mainWindow.webContents.send(channel, payload);
+}
+
 function dataDir() {
   const dir = path.join(app.getPath("userData"), "desktop");
   mkdirSync(dir, { recursive: true });
@@ -23,6 +28,58 @@ function statePath() {
 
 function activeConfigPath() {
   return WORKSPACE_CONFIG;
+}
+
+function readWorkspaceDotEnv() {
+  const envPath = path.join(PROJECT_ROOT, ".env");
+  const values = {};
+  if (!existsSync(envPath)) return values;
+
+  try {
+    const raw = readFileSync(envPath, "utf8");
+    for (const rawLine of raw.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const match = line.match(/^\uFEFF?([A-Z0-9_]+)\s*=\s*(.*)$/i);
+      if (!match) continue;
+      let value = match[2].trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      values[match[1].trim()] = value;
+    }
+  } catch {
+    return {};
+  }
+
+  return values;
+}
+
+function buildServerEnv(state) {
+  const env = { ...process.env };
+  for (const [key, value] of Object.entries(readWorkspaceDotEnv())) {
+    if (!env[key]) env[key] = value;
+  }
+  const routes = exposedRoutes(state).map((route) => ({
+    ...route,
+    planner_api_key: resolveEnvReference(route.planner_api_key, env),
+    executor_api_key: resolveEnvReference(route.executor_api_key, env),
+  }));
+  return {
+    ...env,
+    DUAL_AGENT_CONFIG: activeConfigPath(),
+    DUAL_AGENT_MODELS: JSON.stringify(routes),
+    DUAL_AGENT_API_KEY: state.apiKey,
+  };
+}
+
+function resolveEnvReference(value, env) {
+  if (typeof value !== "string") return value;
+  const envMatch = value.trim().match(/^env:([A-Z0-9_]+)$/i);
+  if (envMatch) return env[envMatch[1]] || "";
+  const braceMatch = value.trim().match(/^\$\{([A-Z0-9_]+)\}$/i);
+  if (braceMatch) return env[braceMatch[1]] || "";
+  return value;
 }
 
 function defaultState() {
@@ -436,7 +493,7 @@ function exposedRoutes(state) {
 function appendLog(line) {
   serverLog.push(line);
   if (serverLog.length > 300) serverLog = serverLog.slice(-300);
-  mainWindow?.webContents.send("server-log", line);
+  sendToRenderer("server-log", line);
 }
 
 function startServer() {
@@ -446,30 +503,30 @@ function startServer() {
     return { ok: false, running: false, error: "dist/index.js is missing. Run npm run build before launching the Electron shell." };
   }
   serverLog = [];
-  serverProcess = spawn(process.execPath, [DIST_ENTRY, "serve", String(state.port)], {
+  const child = spawn(process.execPath, [DIST_ENTRY, "serve", String(state.port)], {
     cwd: PROJECT_ROOT,
-    env: {
-      ...process.env,
-      DUAL_AGENT_CONFIG: activeConfigPath(),
-      DUAL_AGENT_MODELS: JSON.stringify(exposedRoutes(state)),
-      DUAL_AGENT_API_KEY: state.apiKey,
-    },
+    env: buildServerEnv(state),
     stdio: ["ignore", "pipe", "pipe"],
   });
+  serverProcess = child;
   appendLog(`server starting on http://127.0.0.1:${state.port}`);
-  serverProcess.stdout.on("data", (chunk) => appendLog(String(chunk).trim()));
-  serverProcess.stderr.on("data", (chunk) => appendLog(String(chunk).trim()));
-  serverProcess.on("exit", (code, signal) => {
+  child.stdout.on("data", (chunk) => appendLog(String(chunk).trim()));
+  child.stderr.on("data", (chunk) => appendLog(String(chunk).trim()));
+  child.on("exit", (code, signal) => {
     appendLog(`server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    serverProcess = null;
-    mainWindow?.webContents.send("server-status", getServerStatus());
+    if (serverProcess === child) serverProcess = null;
+    sendToRenderer("server-status", getServerStatus());
   });
-  return { ok: true, running: true, pid: serverProcess.pid };
+  return { ok: true, running: true, pid: child.pid };
 }
 
 function stopServer() {
   if (!serverProcess) return { ok: true, running: false };
-  serverProcess.kill();
+  try {
+    serverProcess.kill();
+  } catch (error) {
+    appendLog(`server stop failed: ${error.message}`);
+  }
   serverProcess = null;
   return { ok: true, running: false };
 }
@@ -520,6 +577,9 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
   mainWindow.loadFile(path.join(__dirname, "renderer.html"));
 }

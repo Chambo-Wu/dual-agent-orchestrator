@@ -159,11 +159,31 @@ function appendEventLine(line) {
   log.textContent = `${line}\n${log.textContent}`.slice(0, 12000);
 }
 
+function renderJobSummary(goal, output, status) {
+  const parts = [];
+  if (goal) parts.push(`Goal\n${goal}`);
+  if (output) {
+    parts.push(`${status === "failed" ? "Failure" : "Final Answer"}\n${output}`);
+  } else if (status && status !== "running") {
+    parts.push(`Status\n${status}`);
+  }
+  $("#job-summary").textContent = parts.join("\n\n").trim();
+}
+
 function renderJobLinks(jobId) {
   currentJob = jobId;
   $("#open-job").disabled = !jobId;
   $("#open-timeline").disabled = !jobId;
   $("#open-events").disabled = !jobId;
+}
+
+async function refreshJobResult(jobId) {
+  if (!jobId || currentJob !== jobId) return;
+  const result = await window.desktop.apiRequest(`/v1/jobs/${encodeURIComponent(jobId)}`);
+  if (!result.ok) return;
+  const job = result.body?.job || {};
+  $("#job-status").textContent = job.status || $("#job-status").textContent || "completed";
+  renderJobSummary(job.goal || "", job.output || "", job.status || "");
 }
 
 function connectJobStream(jobId) {
@@ -172,13 +192,14 @@ function connectJobStream(jobId) {
   eventSource.addEventListener("job.snapshot", (event) => {
     const data = JSON.parse(event.data);
     $("#job-status").textContent = data.status || "running";
-    $("#job-summary").textContent = `${data.goal || ""}\n${data.output_preview || ""}`.trim();
+    renderJobSummary(data.goal || "", data.output_preview || "", data.status || "running");
   });
   eventSource.addEventListener("job.event", (event) => {
     const data = JSON.parse(event.data);
     appendEventLine(`[${data.status}] ${data.type} · ${data.title || data.summary || ""}`);
     if (data.type === "job.completed" || data.type === "job.failed" || data.type === "job.cancelled") {
       $("#job-status").textContent = data.status;
+      refreshJobResult(jobId).catch(() => {});
     }
   });
   eventSource.onerror = () => appendEventLine("stream disconnected");
@@ -192,7 +213,7 @@ async function submitTask(event) {
   appState.activeRouteId = routeId;
   $("#route-pill").textContent = routeId;
   $("#job-status").textContent = "running";
-  $("#job-summary").textContent = goal;
+  renderJobSummary(goal, "", "running");
   $("#event-log").textContent = "";
   const body = {
     goal,
