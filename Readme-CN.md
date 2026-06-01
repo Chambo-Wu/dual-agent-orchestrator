@@ -358,8 +358,152 @@ Goal 控制面：
 - `POST /v1/jobs` 现在更偏向运行时惰性 executor 准入，而不是一律先做完整探测
 - CLI `task` / `team` 入口仍然保留显式 preflight probe
 
+## 流式模式
+
+当前有两类不同的流式体验：
+
+1. 标准模型流
+
+- 使用 `/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`
+- 保持与常规 OpenAI / Anthropic 客户端的协议兼容
+- 默认不会直接注入原始 `workflow.*` SSE 事件
+- 可以把 planner / executor 进度镜像为普通文本增量，方便 Cherry Studio 等通用客户端显示
+
+2. Workflow 流
+
+- 使用 `/v1/jobs/:id/stream`
+- 面向前端 UI 输出归一化 workflow 事件
+- 适合 dashboard、timeline 与协作视图
+- 支持通过 `Last-Event-ID` 恢复 SSE 连接
+- 支持从 `since_seq` 回放
+- 在 `job.event` 条目中输出 SSE `id:` 字段
+
+回放契约：
+
+- `GET /v1/jobs/:id/events?since_seq=N` 返回 `seq > N` 的事件
+- `GET /v1/jobs/:id/stream?since_seq=N` 会先回放 `seq > N` 的事件，再进入实时订阅
+- `GET /v1/jobs/:id/stream` 携带请求头 `Last-Event-ID: N` 时，会从 `seq > N` 继续
+- `job.snapshot` 包含 `replay.next_seq`、`replay.can_resume_from`、`replay.resumed_from_seq` 与 `replay.replayed_count`
+- 具备恢复语义的 `job.snapshot` 还会包含 `follow`、`actions` 与 `snapshot.recovery`
+
+兼容路由可以显式开启原始 workflow SSE 事件：
+
+- `include_workflow_events: true`
+- 或请求头 `x-dual-agent-workflow-events: true`
+
+## 异步 Jobs
+
+`POST /v1/jobs` 支持为前端客户端创建异步 job。
+
+典型行为：
+
+- `policy.async = true` 返回 `202`
+- 响应包含 `job_id`、`stream_url`、`events_url` 与 `timeline_url`
+- job 会在后台继续执行
+- 客户端可以订阅 `/v1/jobs/:id/stream` 获取实时进度
+
+## 前端进度体验
+
+当前进度系统同时服务于自定义前端与通用聊天客户端：
+
+- `/v1/jobs/:id/events` 与 `/stream` 提供归一化 workflow UI 事件
+- 阶段式进度状态包括 `planning`、`research`、`evidence`、`filtering`、`synthesis` 与 `writing`
+- 聚合工具摘要，避免重复 `web_search` 或 `url_fetch` 调用刷屏
+- 标准聊天流中提供卡片式文本进度
+- 内置 DAG lanes，展示真实依赖图，而不是简单任务列表
+- `/v1/jobs/:id/timeline` 支持 superseded workflow lanes 与 replan history 聚焦交互
+- 内置 runtime analysis 面板，用于查看验证结果、artifact 活动、工具活动与常见阻塞点
+- analysis chips 支持点击筛选，并跳转到匹配事件与关联 workflow lanes
+- timeline URL 可保留 `workflowFocus`、`analysisFilter` 与 `analysisValue`
+- 支持 `job.redirect`、`snapshot.follow`、`snapshot.actions` 与 `snapshot.recovery` 等恢复感知前端信号
+- `/jobs/dashboard` 可在浏览器中查看持久化 jobs，无需手动设置认证头
+- `/goals/dashboard` 可在浏览器中查看持久化 goals，并暴露 goal-mode 续跑控制
+
+聊天流中的镜像进度示例：
+
+```text
+[Step 2 | Research]
+Completed 3 search rounds, gathered 30 candidate results, and is filtering trustworthy sources.
+
+[Step 3 | Evidence]
+Read 5 saved artifacts and is extracting the key details.
+```
+
+## 报告 / 文件输出校验
+
+运行时会防止本地交付物的“假完成”。
+
+如果任务包含类似要求：
+
+- "write a markdown report to local"
+- "save `report.md`"
+- "write `D:\...\report.md`"
+
+那么仅有 planner 的 `final` 答复已经不够。只有满足以下条件，任务才会完成：
+
+- executor 实际执行了 `write_file`
+- 写入目标与请求的输出路径匹配
+
+## 日志与持久化
+
+每次运行都会产生：
+
+- `runtime/logs/` 下的 JSONL trace 日志
+- `runtime/jobs/` 下的持久化 job 记录
+- `runtime/command-results/` 下的工具产物
+
+日志包含：
+
+- planner 请求与解析后的决策
+- executor 请求与解析后的结果
+- 原生工具调用的开始 / 完成事件
+- 协议修正、恢复与循环检测事件
+
+## 测试
+
+```powershell
+npm run test
+```
+
+定向测试：
+
+```powershell
+npm run test:unit
+npm run test:integration
+npm run test:e2e-lite
+```
+
 ## 已知边界
 
+- 浏览器 dashboard 当前仍以一次列表响应加载数据；极大的 job 历史后续适合增加分页
 - 目前只有 executor 候选池接入了健康筛选；planner 候选池还没有同级别准入逻辑
 - `npm run doctor` 不做实时逐模型探测；要看主动 probe 结果请用 `/health`
 - `/health` 里的 `runtime_lazy_selection` 目前是说明性字段，不是服务器持久缓存
+- planner 仍依赖上游模型自身可靠性
+- web search 质量高度依赖 provider 质量与查询质量
+- 部分网页仍可能因为 JS 渲染或 `403/401/429` 受限，因此证据综合有时会降级
+- 通用聊天客户端对流式换行的处理不同，文本进度显示可能仍有差异
+
+## 推荐客户端模式
+
+通用客户端：
+
+- 使用 `/v1/chat/completions`
+- 开启 `stream: true`
+- 依赖镜像文本进度
+
+自定义应用：
+
+- 通过 `POST /v1/jobs` 创建 job
+- 订阅 `/v1/jobs/:id/stream`
+- 通过 `/v1/jobs/:id/events` 做回放或刷新
+- 存储最后看到的 SSE `id`，并用 `Last-Event-ID` 重连
+- 打开 `/v1/jobs/:id/timeline` 查看内置可视化
+- 使用 `/jobs/dashboard` 查看零配置浏览器 job 视图
+- 使用 `/goals/dashboard` 查看零配置浏览器 goal 视图
+- 打开 `/v1/goals/:id/timeline` 查看 goal-mode 执行可视化
+
+## 致谢
+
+- [Linux.do](https://linux.do/)
+- [Xiaomi MiMo Orbit](https://100t.xiaomimimo.com/)
