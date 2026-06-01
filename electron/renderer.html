@@ -118,6 +118,35 @@
             </section>
             <section class="panel">
               <div class="panel-head">
+                <h2>本地配置</h2>
+                <span class="pill muted">workspace</span>
+              </div>
+              <div class="path-list">
+                <div><span>config.yml</span><strong id="config-path">config/config.yml</strong></div>
+                <div><span>.env</span><strong id="env-path">.env</strong></div>
+              </div>
+              <div class="env-grid">
+                <label>
+                  <span>PLANNER_API_KEY</span>
+                  <input id="env-planner-key" type="password" autocomplete="off">
+                </label>
+                <label>
+                  <span>EXECUTOR_API_KEY</span>
+                  <input id="env-executor-key" type="password" autocomplete="off">
+                </label>
+                <label>
+                  <span>SEARCH_API_KEY</span>
+                  <input id="env-search-key" type="password" autocomplete="off">
+                </label>
+                <label>
+                  <span>EXECUTOR_REMOTE_API_KEY</span>
+                  <input id="env-remote-key" type="password" autocomplete="off">
+                </label>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
                 <h2>路由</h2>
                 <button id="add-route">新增路由</button>
               </div>

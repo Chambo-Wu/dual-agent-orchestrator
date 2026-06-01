@@ -112,6 +112,12 @@ function renderModels() {
   $("#routes-list").innerHTML = appState.routes.map(routeTemplate).join("");
   $("#server-api-key").value = appState.apiKey;
   $("#server-port").value = appState.port;
+  $("#config-path").textContent = appState.paths?.config || serverStatus?.configPath || "config/config.yml";
+  $("#env-path").textContent = appState.paths?.env || serverStatus?.envPath || ".env";
+  $("#env-planner-key").value = appState.env?.PLANNER_API_KEY || "";
+  $("#env-executor-key").value = appState.env?.EXECUTOR_API_KEY || "";
+  $("#env-search-key").value = appState.env?.SEARCH_API_KEY || "";
+  $("#env-remote-key").value = appState.env?.EXECUTOR_REMOTE_API_KEY || "";
 }
 
 function collectModelsState() {
@@ -151,6 +157,12 @@ function collectModelsState() {
     activeRouteId: routes.some((route) => route.id === appState.activeRouteId) ? appState.activeRouteId : routes[0]?.id,
     models,
     routes,
+    env: {
+      PLANNER_API_KEY: $("#env-planner-key").value.trim(),
+      EXECUTOR_API_KEY: $("#env-executor-key").value.trim(),
+      SEARCH_API_KEY: $("#env-search-key").value.trim(),
+      EXECUTOR_REMOTE_API_KEY: $("#env-remote-key").value.trim(),
+    },
   };
 }
 

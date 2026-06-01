@@ -6,6 +6,7 @@ const path = require("node:path");
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const DIST_ENTRY = path.join(PROJECT_ROOT, "dist", "index.js");
 const WORKSPACE_CONFIG = path.join(PROJECT_ROOT, "config", "config.yml");
+const WORKSPACE_ENV = path.join(PROJECT_ROOT, ".env");
 
 let mainWindow = null;
 let serverProcess = null;
@@ -30,8 +31,12 @@ function activeConfigPath() {
   return WORKSPACE_CONFIG;
 }
 
+function activeEnvPath() {
+  return WORKSPACE_ENV;
+}
+
 function readWorkspaceDotEnv() {
-  const envPath = path.join(PROJECT_ROOT, ".env");
+  const envPath = activeEnvPath();
   const values = {};
   if (!existsSync(envPath)) return values;
 
@@ -53,6 +58,38 @@ function readWorkspaceDotEnv() {
   }
 
   return values;
+}
+
+function writeWorkspaceDotEnv(nextValues = {}) {
+  const envPath = activeEnvPath();
+  const knownKeys = ["PLANNER_API_KEY", "EXECUTOR_API_KEY", "SEARCH_API_KEY", "EXECUTOR_REMOTE_API_KEY"];
+  const existing = existsSync(envPath) ? readFileSync(envPath, "utf8").split(/\r?\n/) : [];
+  const seen = new Set();
+  const lines = existing.map((line) => {
+    const match = line.match(/^\uFEFF?([A-Z0-9_]+)\s*=/i);
+    if (!match || !knownKeys.includes(match[1])) return line;
+    const key = match[1];
+    seen.add(key);
+    return `${key}=${sanitizeEnvValue(nextValues[key] ?? "")}`;
+  });
+
+  for (const key of knownKeys) {
+    if (!seen.has(key) && Object.prototype.hasOwnProperty.call(nextValues, key)) {
+      lines.push(`${key}=${sanitizeEnvValue(nextValues[key] ?? "")}`);
+    }
+  }
+
+  writeFileSync(envPath, `${trimTrailingEmptyLines(lines).join("\n")}\n`, "utf8");
+}
+
+function sanitizeEnvValue(value) {
+  return String(value ?? "").replace(/[\r\n]/g, "").trim();
+}
+
+function trimTrailingEmptyLines(lines) {
+  const copy = [...lines];
+  while (copy.length > 0 && copy[copy.length - 1] === "") copy.pop();
+  return copy;
 }
 
 function buildServerEnv(state) {
@@ -150,7 +187,21 @@ function writeState(state) {
   const normalized = normalizeState(state);
   writeFileSync(statePath(), JSON.stringify(normalized, null, 2), "utf8");
   writeGeneratedConfig(normalized);
-  return normalized;
+  if (state && typeof state === "object" && state.env && typeof state.env === "object") {
+    writeWorkspaceDotEnv(state.env);
+  }
+  return withDesktopMetadata(normalized);
+}
+
+function withDesktopMetadata(state) {
+  return {
+    ...state,
+    env: readWorkspaceDotEnv(),
+    paths: {
+      config: activeConfigPath(),
+      env: activeEnvPath(),
+    },
+  };
 }
 
 function readStoredState() {
@@ -543,6 +594,7 @@ function getServerStatus() {
     pid: serverProcess?.pid ?? null,
     apiBase: `http://127.0.0.1:${state.port}`,
     configPath: activeConfigPath(),
+    envPath: activeEnvPath(),
     log: serverLog,
   };
 }
@@ -602,7 +654,7 @@ app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
-ipcMain.handle("state:get", () => ({ state: readState(), server: getServerStatus() }));
+ipcMain.handle("state:get", () => ({ state: withDesktopMetadata(readState()), server: getServerStatus() }));
 ipcMain.handle("state:save", (_event, nextState) => {
   const state = writeState(nextState);
   const server = restartServer();

@@ -222,6 +222,10 @@ h2 {
   gap: 16px;
 }
 
+.models-layout > .panel:nth-child(2) {
+  align-self: start;
+}
+
 .panel {
   border: 1px solid #d9dee7;
   border-radius: 8px;
@@ -404,6 +408,41 @@ textarea {
 
 .list {
   display: grid;
+  gap: 10px;
+}
+
+.path-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.path-list div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 1px solid #e2e6ec;
+  border-radius: 6px;
+  background: #fafbfc;
+  padding: 8px;
+}
+
+.path-list span {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.path-list strong {
+  color: #171a1f;
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.env-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
