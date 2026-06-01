@@ -1,9 +1,4 @@
-# 【历史归档】特定说明：deepseek-v4
-
-> 文档状态：特定集成说明
->
-> 本文面向特定模型接入与一次性项目说明，不是面向读者的主入口文档。
-> 若需了解当前推荐用法、默认端口、控制面接口与兼容行为，请优先阅读 [README](../README.md) 和 [Readme-CN](../Readme-CN.md)。
+# 【历史归档】项目说明：deepseek-v4
 
 ● 这是 Dual Agent Orchestrator，一个将 Planner（规划器）+ Executor（执行器）模式实现为可运行骨架的 TypeScript 项目。
 
@@ -51,7 +46,7 @@
 
   特色功能
 
-  - 本地 API 服务：npm run serve 启动 http://127.0.0.1:9898，对外暴露标准 OpenAI/Anthropic 兼容接口
+  - 本地 API 服务：npm run serve 启动 http://127.0.0.1:8787，对外暴露标准 OpenAI/Anthropic 兼容接口
   - Circuit breaker：Planner 上游连续失败 3 次后自动熔断 60 秒，返回 503
   - 自定义模型映射：通过 DUAL_AGENT_MODELS 环境变量暴露多个模型 ID
   - JSONL 日志：每次运行在 runtime/logs/ 下记录 Planner、Executor 和工具执行的完整 trace

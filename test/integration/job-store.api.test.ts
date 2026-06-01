@@ -6,6 +6,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { listStoredJobs, persistJobRecord, readJobRecord, updateJobControlState, updateStoredJobRecord } from "../../src/job-store.js";
 import { __testables } from "../../src/index.js";
 import { registerActiveJobSession, unregisterActiveJobSession, resolvePendingApproval } from "../../src/job-runtime.js";
+import { appendEvent } from "../../src/job-event-bus.js";
+import { createUiEvent } from "../../src/workflow-ui-events.js";
 import { NoHealthyExecutorError } from "../../src/model-health.js";
 import { buildMinimalConfig } from "../helpers/fake-runtime.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord } from "../../src/workflow-contract.js";
@@ -1537,6 +1539,90 @@ test("job stream replays verification check events", async () => {
   assert.equal(replayRes.body.includes(`"resumed_from_seq":${replayCursor}`), true);
   assert.equal(replayRes.body.includes("system.verification_check_"), true);
   replayRes.end();
+});
+
+test("job events and stream expose team agent registry and verifier fallback", async () => {
+  const taskRun = createTaskRunRecord({
+    id: "taskrun_team_observability",
+    title: "Inspect",
+    description: "Inspect files",
+    status: "completed",
+    assignee: "researcher",
+    verified: true,
+    output: "done",
+    attempts: 1,
+    artifacts: [],
+  });
+  const plan = createPlanRecord({
+    id: "plan_team_observability",
+    goal: "Team observability",
+    mode: "team",
+    taskRunIds: [taskRun.id],
+  });
+  const job = createJobRecord({
+    id: "job_team_observability",
+    goal: "Team observability",
+    mode: "team",
+    status: "completed",
+    verified: true,
+    output: "done",
+    plan,
+    taskRuns: [taskRun],
+    artifacts: [],
+  });
+  persistJobRecord({ job, plan, taskRuns: [taskRun], artifacts: [] });
+  appendEvent(createUiEvent({
+    jobId: job.id,
+    seq: 1,
+    agent: "system",
+    phase: "start",
+    type: "system.team_agent_registry_snapshot",
+    title: "Team agent registry captured",
+    summary: "Runtime team agent role status was captured for this run.",
+    status: "running",
+    meta: {
+      roles: [
+        { role: "verifier", status: "fallback", fallback_to: "system_verifiers" },
+      ],
+    },
+  }));
+  appendEvent(createUiEvent({
+    jobId: job.id,
+    seq: 2,
+    agent: "verifier",
+    phase: "result",
+    type: "system.team_verifier_fallback",
+    title: "Verifier fallback active",
+    summary: "No registered verifier agent was found; using deterministic system checks.",
+    status: "partial_success",
+    taskRunId: taskRun.id,
+    meta: {
+      role: "verifier",
+      task_id: taskRun.id,
+      fallback: "system_verifiers",
+      reason: "No registered verifier agent was found; using deterministic system checks.",
+    },
+  }));
+
+  const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_team_observability/events?type=system.team_verifier_fallback"), eventsRes);
+  const eventsBody = JSON.parse(eventsRes.body) as {
+    events: Array<{ type: string; meta?: Record<string, unknown> }>;
+  };
+  assert.equal(eventsBody.events.some((event) => event.type === "system.team_verifier_fallback"), true);
+  assert.equal(eventsBody.events[0]?.meta?.fallback, "system_verifiers");
+
+  const jobRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_team_observability"), jobRes);
+  const jobBody = JSON.parse(jobRes.body) as { team_agent_registry?: { roles?: Array<{ role?: string; status?: string }> } };
+  assert.equal(jobBody.team_agent_registry?.roles?.some((entry) => entry.role === "verifier" && entry.status === "fallback"), true);
+
+  const streamRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+  await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_team_observability/stream"), streamRes);
+  assert.equal(streamRes.statusCode, 200);
+  assert.equal(streamRes.body.includes("system.team_verifier_fallback"), true);
+  assert.equal(streamRes.body.includes("system.team_agent_registry_snapshot"), true);
+  streamRes.end();
 });
 
 test("job cancel endpoint updates control metadata", async () => {

@@ -804,6 +804,9 @@ test("skill evolution auto pipeline can opt into deterministic runtime replay va
         validation_summary?: {
           auto_accept_ready?: boolean;
           same_input_readiness?: string;
+          replay_stability_score?: number | null;
+          replay_stability_level?: string | null;
+          runtime_replay_task_payloads?: Array<Record<string, unknown>>;
           runtime_boundary?: {
             stage?: string;
             contract?: string;
@@ -820,6 +823,9 @@ test("skill evolution auto pipeline can opt into deterministic runtime replay va
     assert.equal(autoProposal?.validation_summary?.runtime_boundary?.stage, "executed");
     assert.equal(autoProposal?.validation_summary?.runtime_boundary?.contract, "true_candidate_runtime_replay");
     assert.equal(autoProposal?.validation_summary?.runtime_boundary?.trueRuntimeReplayReady, true);
+    assert.equal(autoProposal?.validation_summary?.replay_stability_score, 100);
+    assert.equal(autoProposal?.validation_summary?.replay_stability_level, "stable");
+    assert.equal((autoProposal?.validation_summary?.runtime_replay_task_payloads?.length ?? 0) > 0, true);
 
     const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
     await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_observability_auto_runtime_replay/events"), eventsRes);
@@ -854,6 +860,8 @@ test("skill evolution auto-accept helper blocks low-risk flaky validated proposa
       replayInstabilityDetected: true,
       candidateFlakySignal: true,
       autoAcceptBlocked: true,
+      replayStabilityScore: 0,
+      replayStabilityLevel: "unstable",
       reasons: [
         "Baseline replay provenance is incomplete, so repeated validation may be unstable.",
         "Candidate improvement currently relies on lightweight heuristic signals and may be flaky before isolated replay exists.",
@@ -1920,6 +1928,8 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
       replayInstabilityDetected: true,
       candidateFlakySignal: true,
       autoAcceptBlocked: true,
+      replayStabilityScore: 0,
+      replayStabilityLevel: "unstable",
       reasons: ["prior validation failed"],
     },
     contract: {
@@ -2029,6 +2039,8 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
       replayInstabilityDetected: false,
       candidateFlakySignal: false,
       autoAcceptBlocked: false,
+      replayStabilityScore: 60,
+      replayStabilityLevel: "watch",
       reasons: [],
     },
     contract: {
@@ -2138,8 +2150,13 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
     dynamic_risk?: {
       tier?: string;
       auto_accept_blocked?: boolean;
+      automation_ceiling?: string;
       validation_failure_count?: number;
       replay_instability_count?: number;
+      failure_rate?: number;
+      failure_rate_sample_count?: number;
+      failure_rate_failure_count?: number;
+      failure_rate_downgrade?: boolean;
       cooldown_active?: boolean;
       cooldown_until?: string | null;
       window_hours?: number;
@@ -2156,7 +2173,15 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
       dynamic_risk_cooldown_until?: string | null;
       stuck_state?: {
         stuck?: boolean;
+        primary_category?: string | null;
+        severity?: string | null;
+        action_hint?: string | null;
         reasons?: string[];
+        categories?: Array<{
+          category?: string;
+          severity?: string;
+          action_hint?: string;
+        }>;
       };
     };
   };
@@ -2168,14 +2193,20 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
       dynamic_risk?: Record<string, number>;
       eligibility?: Record<string, number>;
       stuck_count?: number;
+      stuck_categories?: Record<string, number>;
     };
   };
 
   assert.equal(getRes.statusCode, 200);
   assert.equal(getBody.dynamic_risk?.tier, "high");
+  assert.equal(getBody.dynamic_risk?.automation_ceiling, "auto_audit");
   assert.equal(getBody.dynamic_risk?.auto_accept_blocked, true);
   assert.equal((getBody.dynamic_risk?.validation_failure_count ?? 0) >= 1, true);
   assert.equal((getBody.dynamic_risk?.replay_instability_count ?? 0) >= 1, true);
+  assert.equal((getBody.dynamic_risk?.failure_rate ?? 0) >= 0.5, true);
+  assert.equal((getBody.dynamic_risk?.failure_rate_sample_count ?? 0) >= 2, true);
+  assert.equal((getBody.dynamic_risk?.failure_rate_failure_count ?? 0) >= 1, true);
+  assert.equal(getBody.dynamic_risk?.failure_rate_downgrade, true);
   assert.equal(getBody.dynamic_risk?.cooldown_active, true);
   assert.equal(typeof getBody.dynamic_risk?.cooldown_until, "string");
   assert.equal(getBody.dynamic_risk?.window_hours, 24);
@@ -2186,10 +2217,15 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
   assert.equal(getBody.ops_summary?.dynamic_risk_cooldown_active, true);
   assert.equal(typeof getBody.ops_summary?.dynamic_risk_cooldown_until, "string");
   assert.equal(getBody.ops_summary?.stuck_state?.stuck, true);
+  assert.equal(getBody.ops_summary?.stuck_state?.primary_category, "dynamic_risk_blocked");
+  assert.equal(getBody.ops_summary?.stuck_state?.severity, "critical");
+  assert.equal(typeof getBody.ops_summary?.stuck_state?.action_hint, "string");
+  assert.equal(getBody.ops_summary?.stuck_state?.categories?.some((item) => item.category === "manual_accept_required"), true);
   assert.equal(opsRes.statusCode, 200);
   assert.equal((opsBody.summary?.dynamic_risk?.high ?? 0) >= 1, true);
   assert.equal((opsBody.summary?.eligibility?.blocked ?? 0) >= 1, true);
   assert.equal((opsBody.summary?.stuck_count ?? 0) >= 1, true);
+  assert.equal((opsBody.summary?.stuck_categories?.dynamic_risk_blocked ?? 0) >= 1, true);
 });
 
 test("skill evolution proposal audit endpoint validates a safe draft proposal", async () => {
@@ -2715,6 +2751,8 @@ test("skill evolution proposal validate endpoint passes an improving validated p
   assert.equal(proposalDetailBody.validation_summary?.candidate_replay?.verification_status, "verified");
   assert.equal(proposalDetailBody.validation_summary?.candidate_replay?.terminal_event_type, "replay_job_completed");
   assert.equal((proposalDetailBody.validation_summary?.candidate_replay?.event_count ?? 0) >= 6, true);
+  assert.equal(typeof proposalDetailBody.validation_summary?.replay_stability_score, "number");
+  assert.equal(typeof proposalDetailBody.validation_summary?.replay_stability_level, "string");
   assert.equal(typeof proposalDetailBody.validation_summary?.replay_headline, "string");
   assert.equal(validatedJob?.workflow_summary?.skill_evolution?.latest_validation_summary?.passed, true);
   assert.equal(validatedJob?.workflow_summary?.skill_evolution?.latest_validation_summary?.reason_code, "passed");

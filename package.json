@@ -9,6 +9,7 @@
     "start": "node --enable-source-maps dist/index.js",
     "dev": "npm run build && node --enable-source-maps dist/index.js",
     "serve": "npm run build && node --enable-source-maps dist/index.js serve",
+    "desktop": "npm run build && node electron/launch.cjs",
     "serve:restart:9898": "powershell -ExecutionPolicy Bypass -File scripts/restart-serve-9898.ps1",
     "config:validate": "npm run build && node --enable-source-maps dist/index.js config validate",
     "doctor": "npm run build && node --enable-source-maps dist/index.js doctor",
@@ -22,6 +23,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.21",
+    "electron": "^42.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.8.3"
   }

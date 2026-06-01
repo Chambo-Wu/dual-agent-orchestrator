@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { runTeam } from "../../src/team.js";
 import { buildMinimalConfig, createFakeRuntimeDeps, fakeRunTaskResult } from "../helpers/fake-runtime.js";
+import type { OrchestratorEvent } from "../../src/types.js";
 
 test("runTeam short-circuit path delegates subtask execution through injected runTask", async () => {
   const config = buildMinimalConfig();
@@ -139,6 +140,87 @@ test("runTeam routes final synthesis through agent whose role contains synthesiz
   );
 
   assert.deepEqual(synthesisModels, ["role-synth-model"]);
+});
+
+test("runTeam applies registered verifier agent to completed subtasks", async () => {
+  const config = buildMinimalConfig();
+  config.agents = {
+    verifier: {
+      id: "verifier",
+      role: "team verifier",
+      model: {
+        ...config.executor,
+        model: "verifier-model",
+      },
+    },
+  };
+  const verifierModels: string[] = [];
+
+  const result = await runTeam(
+    config,
+    "First inspect the code and then write a summary",
+    [{ name: "researcher", role: "inspect code" }],
+    undefined,
+    undefined,
+    { maxConcurrency: 1, maxRounds: 1 },
+    createFakeRuntimeDeps({
+      runTeamDecomposition: async () => JSON.stringify([
+        { title: "Inspect", description: "Inspect files", assignee: "researcher" },
+      ]),
+      runTask: async () => fakeRunTaskResult({ output: "inspection result", verified: true }),
+      runChatCompletionDetailed: async (model) => {
+        verifierModels.push(model.model);
+        return {
+          content: JSON.stringify({ passed: false, summary: "Verifier rejected the subtask." }),
+          reasoning: "",
+          toolCalls: [],
+          raw: {},
+        };
+      },
+      runTeamSynthesis: async () => "final synthesis",
+    }),
+  );
+
+  assert.deepEqual(verifierModels, ["verifier-model"]);
+  assert.equal(result.taskRuns[0]?.verified, false);
+  assert.equal(result.taskRuns[0]?.verificationResult?.checks.some((check) => check.name === "model_verifier" && !check.passed), true);
+  assert.equal(result.job.verified, false);
+});
+
+test("runTeam emits agent registry snapshot and verifier fallback warning", async () => {
+  const config = buildMinimalConfig();
+  const events: OrchestratorEvent[] = [];
+
+  const result = await runTeam(
+    config,
+    "First inspect the code and then write a summary",
+    [{ name: "researcher", role: "inspect code" }],
+    undefined,
+    undefined,
+    { maxConcurrency: 1, maxRounds: 1 },
+    createFakeRuntimeDeps({
+      runTeamDecomposition: async () => JSON.stringify([
+        { title: "Inspect", description: "Inspect files", assignee: "researcher" },
+      ]),
+      runTask: async () => fakeRunTaskResult({ output: "inspection result", verified: true }),
+      runTeamSynthesis: async () => "final synthesis",
+    }),
+    {
+      onEvent: (event) => events.push(event),
+    },
+  );
+
+  const registryEvent = events.find((event) => event.type === "system.team_agent_registry_snapshot");
+  assert.ok(registryEvent);
+  assert.equal(Array.isArray(registryEvent.data.roles), true);
+  assert.equal((registryEvent.data.roles as Array<{ role: string }>).some((entry) => entry.role === "verifier"), true);
+
+  const fallbackEvent = events.find((event) => event.type === "system.team_verifier_fallback");
+  assert.ok(fallbackEvent);
+  assert.equal(fallbackEvent.data.role, "verifier");
+  assert.equal(fallbackEvent.data.fallback, "system_verifiers");
+  assert.equal(result.taskRuns[0]?.verificationResult?.checks.some((check) => check.name === "model_verifier"), false);
+  assert.equal(result.agentRegistry.roles.some((entry) => entry.role === "verifier" && entry.status === "fallback"), true);
 });
 
 test("runTeam planOnly returns a validated plan without executing tasks", async () => {

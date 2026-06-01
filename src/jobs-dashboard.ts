@@ -54,6 +54,17 @@ type JobDashboardItem = {
     skill_install_status?: string;
     skill_reason?: string;
   } | null;
+  team_agent_registry?: {
+    roles?: Array<{
+      role?: string;
+      status?: string;
+      agent_id?: string | null;
+      agent_role?: string | null;
+      model?: string | null;
+      fallback_to?: string | null;
+      summary?: string;
+    }>;
+  } | null;
   workflow_summary?: {
     skill_verification?: {
       title?: string;
@@ -197,7 +208,7 @@ export function renderJobsDashboardHtml(
       min-width: 320px;
       justify-content: flex-end;
     }
-    .toolbar input, .toolbar select {
+    .toolbar input, .toolbar select, .toolbar a {
       min-height: 40px;
       min-width: 170px;
       background: #161b22;
@@ -206,6 +217,12 @@ export function renderJobsDashboardHtml(
       border-radius: 8px;
       padding: 8px 12px;
       font-size: 13px;
+    }
+    .toolbar a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
     }
     .summary {
       display: grid;
@@ -632,6 +649,7 @@ export function renderJobsDashboardHtml(
           <option value="goal">Goal</option>
           <option value="coding">Coding</option>
         </select>
+        <a href="/skill-evolution/ops">Skill Ops</a>
       </div>
     </div>
 
@@ -857,6 +875,19 @@ export function renderJobsDashboardHtml(
       return String(evolution.latest_status) + '.' + proposalCount + changeSummary + patchSummary + rationaleSummary + decisionSummary + replaySummary + opsSummary + eligibilitySummary + dynamicRiskSummary + cooldownSummary + stuckSummary + blockSummary;
     }
 
+    function formatTeamAgentRegistry(item) {
+      const registry = item && item.team_agent_registry ? item.team_agent_registry : null;
+      const roles = registry && Array.isArray(registry.roles) ? registry.roles : [];
+      if (roles.length === 0) return '';
+      return roles.map((entry) => {
+        const role = entry && entry.role ? String(entry.role) : 'unknown';
+        const status = entry && entry.status ? String(entry.status) : 'unknown';
+        const agentId = entry && entry.agent_id ? ' via ' + String(entry.agent_id) : '';
+        const fallback = entry && entry.fallback_to ? ' -> ' + String(entry.fallback_to) : '';
+        return role + ': ' + status + agentId + fallback;
+      }).join('; ');
+    }
+
     function renderActions(actions, item) {
       const merged = Array.isArray(actions) ? [...actions] : [];
       if (item && item.timeline_url) {
@@ -991,6 +1022,7 @@ export function renderJobsDashboardHtml(
           + '<span class="chip">' + escapeHtml(String(item.step_count || 0)) + ' steps</span>'
           + '<span class="chip">' + escapeHtml(String(item.artifact_count || 0)) + ' artifacts</span>'
           + '<span class="chip">' + escapeHtml(item.verified === true ? 'Verified' : item.verified === false ? 'Needs verification' : 'Verification n/a') + '</span>'
+          + (item.team_agent_registry ? '<span class="chip route-chip">Team agents</span>' : '')
           + '</div>'
           + (item.intent_route && item.intent_route.reason ? '<div class="route-subtle">' + escapeHtml(item.intent_route.reason) + '</div>' : '')
           + '<div class="job-recovery">' + escapeHtml(recovery) + '</div>'
@@ -1032,6 +1064,7 @@ export function renderJobsDashboardHtml(
         +   '<div class="kv-key">Skill candidates</div><div class="kv-value">' + escapeHtml(formatCandidateSkills(item) || 'Not recorded') + '</div>'
         +   '<div class="kv-key">Skill verification</div><div class="kv-value">' + escapeHtml(formatSkillVerification(item) || 'Not recorded') + '</div>'
         +   '<div class="kv-key">Skill evolution</div><div class="kv-value">' + escapeHtml(formatSkillEvolution(item) || 'Not recorded') + '</div>'
+        +   '<div class="kv-key">Team agents</div><div class="kv-value">' + escapeHtml(formatTeamAgentRegistry(item) || 'Not recorded') + '</div>'
         +   '<div class="kv-key">Latest step</div><div class="kv-value">' + escapeHtml(latestSummary(item)) + '</div>'
         +   '<div class="kv-key">Saved</div><div class="kv-value">' + escapeHtml(formatTime(item.saved_at)) + '</div>'
         +   '<div class="kv-key">Resumed to</div><div class="kv-value">' + escapeHtml(resumedTo || (item.follow && item.follow.job_id) || '-') + '</div>'

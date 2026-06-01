@@ -170,6 +170,9 @@ test("runCandidateRuntimeWorkflowReplay executes candidate workflow with determi
     assert.equal(replay.verified, true);
     assert.equal(replay.taskRunCount, replay.workflowTaskCount);
     assert.equal(replay.artifactCount > 0, true);
+    assert.equal(replay.taskPayloads.length, replay.taskRunCount);
+    assert.equal(replay.taskPayloads.every((payload) => typeof payload.taskRunId === "string" && payload.taskRunId.length > 0), true);
+    assert.equal(replay.taskPayloads.some((payload) => payload.verified === true && payload.artifactCount > 0), true);
   } finally {
     rmSync(resolve(process.cwd(), "runtime/skill-evolution/proposals/proposal_runtime_test"), { recursive: true, force: true });
   }

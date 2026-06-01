@@ -1,4 +1,4 @@
-# 专项路线：Auditor Gate
+# 【部分完成】专项路线：Auditor Gate
 
 - 日期：2026-05-29
 - 主题：Skill 自进化中的 `Auditor Gate`

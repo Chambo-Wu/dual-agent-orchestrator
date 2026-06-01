@@ -4,6 +4,7 @@ import { renderDashboardHtml, type DashboardData } from "../../src/dashboard.js"
 import { renderJobsDashboardHtml } from "../../src/jobs-dashboard.js";
 import { renderGoalsDashboardHtml } from "../../src/goals-dashboard.js";
 import { renderGoalTimelineHtml } from "../../src/goal-timeline.js";
+import { renderSkillEvolutionOpsDashboardHtml } from "../../src/skill-evolution-ops-dashboard.js";
 
 test("run dashboard html renders intent route callout", () => {
   const html = renderDashboardHtml({
@@ -81,6 +82,16 @@ test("jobs dashboard html renders intent route and status toggle wiring", () => 
         },
       },
     },
+    team_agent_registry: {
+      roles: [
+        {
+          role: "verifier",
+          status: "fallback",
+          fallback_to: "system_verifiers",
+          summary: "Verifier subtasks fall back to deterministic system checks.",
+        },
+      ],
+    },
   }]);
 
   assert.equal(html.includes("formatIntentRouteLabel(item.intent_route.kind)"), true);
@@ -104,7 +115,9 @@ test("jobs dashboard html renders intent route and status toggle wiring", () => 
   assert.equal(html.includes("statusFilter.value = activeStatusTab"), true);
   assert.equal(html.includes("url.searchParams.set('page_size', String(pageSize));"), true);
   assert.equal(html.includes("formatSkillEvolution(item)"), true);
+  assert.equal(html.includes("formatTeamAgentRegistry(item)"), true);
   assert.equal(html.includes("Skill evolution"), true);
+  assert.equal(html.includes("Team agents"), true);
   assert.equal(html.includes("Ops: "), true);
   assert.equal(html.includes("Eligibility: "), true);
   assert.equal(html.includes("Dynamic risk: "), true);
@@ -253,4 +266,68 @@ test("goal timeline html renders controls and events", () => {
   assert.equal(html.includes("/v1/goals/goal_123/run-next"), true);
   assert.equal(html.includes("goal.run_next_started"), true);
   assert.equal(html.includes("Build route"), true);
+});
+
+test("skill evolution ops dashboard renders queue, rollback, stuck, and replay stability controls", () => {
+  const html = renderSkillEvolutionOpsDashboardHtml({
+    summary: {
+      queue_count: 1,
+      accepted_count: 1,
+      rollback_available_count: 1,
+      stuck_count: 1,
+      dynamic_risk: { low: 1, medium: 0, high: 1 },
+      aging_buckets: { under_1h: 1, over_1h: 1, over_24h: 0 },
+      funnel: { proposal_created: 1, accepted: 1 },
+      stuck_categories: { dynamic_risk_blocked: 1, manual_accept_required: 1 },
+    },
+    proposal_queue: [{
+      id: "proposal_ops_1",
+      skill_id: "find.code_symbol",
+      status: "validated",
+      validation_summary: {
+        replay_stability_score: 85,
+        replay_stability_level: "stable",
+        runtime_replay_task_payloads: [{
+          taskRunId: "task_ops_1",
+          title: "Replay task",
+          status: "completed",
+          verified: true,
+          artifactCount: 1,
+          attempts: 1,
+          dependsOn: [],
+          outputPreview: "ok",
+        }],
+      },
+      ops_summary: {
+        funnel_stage: "validation_passed",
+        age_bucket: "under_1h",
+        stuck_state: {
+          stuck: true,
+          primary_category: "dynamic_risk_blocked",
+          severity: "critical",
+          reasons: ["dynamic risk is high", "validated but not auto-accept eligible"],
+          categories: [{
+            category: "dynamic_risk_blocked",
+            severity: "critical",
+            reason: "dynamic risk is high",
+            action_hint: "Wait for cooldown or manually review recent failures before accepting.",
+          }],
+        },
+      },
+    }],
+    accepted_history: [],
+    rollback_guides: [],
+  }, {
+    dataUrl: "/skill-evolution/ops/data",
+  });
+
+  assert.equal(html.includes("Skill Evolution Ops"), true);
+  assert.equal(html.includes("Proposal Queue"), true);
+  assert.equal(html.includes("Accepted History"), true);
+  assert.equal(html.includes("Rollback Guides"), true);
+  assert.equal(html.includes("Replay Stability"), true);
+  assert.equal(html.includes("Replay Tasks"), true);
+  assert.equal(html.includes("Stuck Categories"), true);
+  assert.equal(html.includes("/skill-evolution/ops/data"), true);
+  assert.equal(html.includes("proposal_ops_1"), true);
 });

@@ -288,6 +288,14 @@ Recommended first browser checks:
 - goals dashboard: `http://127.0.0.1:9898/goals/dashboard`
 - health: `http://127.0.0.1:9898/health`
 
+Start the Electron desktop shell:
+
+```powershell
+npm run desktop
+```
+
+The desktop shell reads `config/config.yml`, starts the local API with `DUAL_AGENT_CONFIG` pointing at that file, and embeds the existing jobs, goals, Skill Ops, health, timeline, events, and task execution surfaces. Model/role edits made in the desktop shell are saved back to `config/config.yml`.
+
 Quick health/config self-check:
 
 ```powershell

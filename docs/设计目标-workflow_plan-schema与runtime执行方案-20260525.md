@@ -3,7 +3,7 @@
 > 本文描述 `workflow_plan` 的目标 schema、运行时执行模型与渐进式落地方案。
 > 它面向当前 `dual-agent-orchestrator` 代码库，尽量复用现有 `runTask`、`runTeam`、`TaskQueue`、`Scheduler`、`job/events` 基础设施，而不是另起炉灶。
 
-# workflow_plan schema 与 runtime 执行方案
+# 【部分完成】workflow_plan schema 与 runtime 执行方案
 
 - 日期：2026-05-25
 - 目标：让 `planner` 从“下一步调度器”升级为“工作流设计者”，在 runtime 约束内拥有更大的编排自由度

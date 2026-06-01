@@ -131,6 +131,8 @@ export interface SkillDeploymentValidationReport {
     replayInstabilityDetected: boolean;
     candidateFlakySignal: boolean;
     autoAcceptBlocked: boolean;
+    replayStabilityScore: number;
+    replayStabilityLevel: "stable" | "watch" | "unstable";
     reasons: string[];
   };
   contract: {
@@ -227,6 +229,7 @@ export interface SkillDeploymentValidationReport {
         replayVerified?: boolean;
         replayArtifactCount?: number;
         replayTaskRunCount?: number;
+        replayTaskPayloads?: SkillRuntimeReplayTaskPayload[];
       };
     };
     baseline: {
@@ -292,6 +295,18 @@ export interface SkillDeploymentValidationReport {
   };
   summary: string;
   createdAt: string;
+}
+
+export interface SkillRuntimeReplayTaskPayload {
+  taskRunId: string;
+  title: string;
+  status: string;
+  verified: boolean;
+  artifactCount: number;
+  attempts: number;
+  assignee?: string | null;
+  dependsOn: string[];
+  outputPreview: string;
 }
 
 export interface SkillIsolatedReplayStepSummary {

@@ -1,4 +1,4 @@
-# 规则矩阵：PG-1 Reflection-to-Patch
+# 【已完成】规则矩阵：PG-1 Reflection-to-Patch
 
 - 日期：2026-05-29
 - 范围：Proposal Generator 的 `PG-1`

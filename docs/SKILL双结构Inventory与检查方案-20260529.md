@@ -1,4 +1,4 @@
-# SKILL 双结构 Inventory 与检查方案
+# 【部分完成】SKILL 双结构 Inventory 与检查方案
 
 - 日期：2026-05-29
 - 范围：Subagent C / S3-2 `SKILL.md` 双结构治理设计

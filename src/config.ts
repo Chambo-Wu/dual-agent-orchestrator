@@ -659,7 +659,7 @@ function validateGoalModeSection(root: Record<string, unknown>, issues: Validati
   };
 }
 
-export function loadConfig(configPath = "config/config.yml"): OrchestratorConfig {
+export function loadConfig(configPath = process.env.DUAL_AGENT_CONFIG?.trim() || "config/config.yml"): OrchestratorConfig {
   loadDotEnvFile();
   const absPath = resolve(configPath);
   const raw = readFileSync(absPath, "utf8");

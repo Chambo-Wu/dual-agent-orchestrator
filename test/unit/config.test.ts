@@ -38,6 +38,37 @@ policy:
   }
 });
 
+test("loadConfig uses DUAL_AGENT_CONFIG when no explicit path is provided", () => {
+  const path = writeConfigFile(`
+planner:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "literal-planner"
+  model: "env-planner-model"
+executor:
+  base_url: "http://127.0.0.1:1234/v1"
+  api_key: "literal-executor"
+  model: "env-executor-model"
+policy:
+  auto_resume_concurrency: 4
+`);
+  const previous = process.env.DUAL_AGENT_CONFIG;
+  process.env.DUAL_AGENT_CONFIG = path;
+
+  try {
+    const config = loadConfig();
+    assert.equal(config.planner.model, "env-planner-model");
+    assert.equal(config.executor.model, "env-executor-model");
+    assert.equal(config.policy.autoResumeConcurrency, 4);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.DUAL_AGENT_CONFIG;
+    } else {
+      process.env.DUAL_AGENT_CONFIG = previous;
+    }
+    rmSync(dirname(path), { recursive: true, force: true });
+  }
+});
+
 test("loadConfig rejects invalid policy.auto_resume_concurrency", () => {
   const path = writeConfigFile(`
 planner:
@@ -82,6 +113,44 @@ policy:
       runtime?: { auto_resume_concurrency?: number };
     };
     assert.equal(health.runtime?.auto_resume_concurrency, 7);
+  } finally {
+    rmSync(dirname(path), { recursive: true, force: true });
+  }
+});
+
+test("health response exposes team agent registry snapshot", () => {
+  const path = writeConfigFile(`
+planner:
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "literal-planner"
+  model: "planner-model"
+executor:
+  base_url: "http://127.0.0.1:1234/v1"
+  api_key: "literal-executor"
+  model: "executor-model"
+policy:
+  auto_resume_concurrency: 3
+agents:
+  verifier:
+    role: "team verifier"
+    model:
+      base_url: "http://127.0.0.1:1235/v1"
+      api_key: "literal-verifier"
+      model: "verifier-model"
+`);
+
+  try {
+    const config = loadConfig(path);
+    const health = __testables.buildHealthResponse(config) as {
+      runtime?: {
+        team_agents?: {
+          roles?: Array<{ role?: string; status?: string; model?: string | null }>;
+        };
+      };
+    };
+    const verifier = health.runtime?.team_agents?.roles?.find((entry) => entry.role === "verifier");
+    assert.equal(verifier?.status, "active");
+    assert.equal(verifier?.model, "verifier-model");
   } finally {
     rmSync(dirname(path), { recursive: true, force: true });
   }

@@ -624,6 +624,45 @@ export function normalizeWorkflowEvent(
       });
     }
 
+    case "system.team_agent_registry_snapshot":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId,
+        agent: "system",
+        phase: "start",
+        type: "system.team_agent_registry_snapshot",
+        title: "Team agent registry captured",
+        summary: "Runtime team agent role status was captured for this run.",
+        status: "running",
+        step: internal.step,
+        meta: internal.data,
+      });
+
+    case "system.team_verifier_fallback":
+      return createUiEvent({
+        jobId,
+        seq,
+        time,
+        taskRunId: asString(internal.data.task_id) || taskRunId,
+        agent: "verifier",
+        phase: "result",
+        type: "system.team_verifier_fallback",
+        title: "Verifier fallback active",
+        summary: asString(internal.data.reason) || "Verifier agent was unavailable; system checks were used.",
+        status: "partial_success",
+        step: internal.step,
+        meta: {
+          role: asString(internal.data.role) || "verifier",
+          task_id: asString(internal.data.task_id),
+          title: asString(internal.data.title),
+          requested_agent_id: asString(internal.data.requested_agent_id),
+          fallback: asString(internal.data.fallback) || "system_verifiers",
+          reason: asString(internal.data.reason),
+        },
+      });
+
     case "workflow.complexity.assessed": {
       const mode = asString(internal.data.execution_mode) || "orchestrated";
       const score = typeof internal.data.complexity_score === "number" ? internal.data.complexity_score : 0;

@@ -1,4 +1,4 @@
-# 执行清单：Proposal Generator 开发任务
+# 【已完成】执行清单：Proposal Generator 开发任务
 
 - 日期：2026-05-29
 - 范围：把 `Proposal Generator` 从专项路线下钻成可直接开发、验证、回归的任务清单

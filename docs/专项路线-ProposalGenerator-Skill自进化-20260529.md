@@ -1,4 +1,4 @@
-# 专项路线：Proposal Generator
+# 【部分完成】专项路线：Proposal Generator
 
 - 日期：2026-05-29
 - 主题：Skill 自进化中的 `Proposal Generator`

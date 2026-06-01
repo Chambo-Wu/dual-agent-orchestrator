@@ -1,4 +1,6 @@
-背景
+# 【参考资料】技能自进化工作流（Skill Evolve Workflow）让 Agent 在真实使用中持续改进 Skill
+
+## 背景
 清华团队同在 5 月 11 日发表了两篇关于 Agent 技能自进化的论文：
 
 EmbodiSkill (arXiv:2605.10332) — 技能感知反思机制，区分执行失误与技能缺陷，用 (S_body, S_appendix) 双结构管理技能

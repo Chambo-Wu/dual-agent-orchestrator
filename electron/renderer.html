@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' http://127.0.0.1:*; script-src 'self'; style-src 'self'; img-src 'self' data: http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:*; frame-src http://127.0.0.1:*;">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dual Agent Orchestrator</title>
+    <link rel="stylesheet" href="./renderer.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <div class="mark">DA</div>
+          <div>
+            <strong>Dual Agent</strong>
+            <span>Desktop Console</span>
+          </div>
+        </div>
+        <nav class="nav" aria-label="Primary">
+          <button class="nav-item active" data-view="run" title="Run">▶<span>执行</span></button>
+          <button class="nav-item" data-view="models" title="Models">◧<span>模型</span></button>
+          <button class="nav-item" data-view="jobs" title="Jobs">≡<span>Jobs</span></button>
+          <button class="nav-item" data-view="goals" title="Goals">◎<span>Goals</span></button>
+          <button class="nav-item" data-view="skills" title="Skill Ops">◇<span>Skill Ops</span></button>
+          <button class="nav-item" data-view="health" title="Health">◌<span>健康</span></button>
+        </nav>
+        <div class="server-card">
+          <div class="server-row">
+            <span id="server-dot" class="dot"></span>
+            <span id="server-label">starting</span>
+          </div>
+          <small id="api-base">http://127.0.0.1:9898</small>
+          <div class="server-actions">
+            <button id="start-server" title="Start">▶</button>
+            <button id="restart-server" title="Restart">↻</button>
+            <button id="stop-server" title="Stop">■</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1 id="view-title">执行模型任务</h1>
+            <p id="view-subtitle">选择模型路由、执行模式与审批策略。</p>
+          </div>
+          <div class="top-actions">
+            <button id="refresh-view">刷新</button>
+            <button id="open-browser">浏览器打开</button>
+          </div>
+        </header>
+
+        <section id="view-run" class="view active">
+          <div class="workspace-grid">
+            <form id="task-form" class="panel">
+              <div class="panel-head">
+                <h2>任务</h2>
+                <span id="route-pill" class="pill">desktop-default</span>
+              </div>
+              <label>
+                <span>模型路由</span>
+                <select id="task-route"></select>
+              </label>
+              <div class="split">
+                <label>
+                  <span>执行模式</span>
+                  <select id="task-mode">
+                    <option value="task">task</option>
+                    <option value="team">team</option>
+                  </select>
+                </label>
+                <label>
+                  <span>审批</span>
+                  <select id="approval-mode">
+                    <option value="none">none</option>
+                    <option value="always">always</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>目标</span>
+                <textarea id="task-goal" rows="9" placeholder="输入要执行的模型任务"></textarea>
+              </label>
+              <div class="form-actions">
+                <label class="check">
+                  <input id="task-async" type="checkbox" checked>
+                  <span>异步执行</span>
+                </label>
+                <button type="submit">执行</button>
+              </div>
+            </form>
+
+            <section class="panel result-panel">
+              <div class="panel-head">
+                <h2>运行状态</h2>
+                <span id="job-status" class="pill muted">idle</span>
+              </div>
+              <div id="job-summary" class="job-summary"></div>
+              <div class="link-row">
+                <button id="open-job" disabled>Job</button>
+                <button id="open-timeline" disabled>Timeline</button>
+                <button id="open-events" disabled>Events</button>
+              </div>
+              <pre id="event-log" class="event-log"></pre>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-models" class="view">
+          <div class="models-layout">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>模型配置</h2>
+                <button id="add-model">新增模型</button>
+              </div>
+              <div id="models-list" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>路由</h2>
+                <button id="add-route">新增路由</button>
+              </div>
+              <div id="routes-list" class="list"></div>
+              <div class="form-actions">
+                <label>
+                  <span>API Key</span>
+                  <input id="server-api-key" type="password">
+                </label>
+                <label>
+                  <span>端口</span>
+                  <input id="server-port" type="number" min="1">
+                </label>
+                <button id="save-models">保存并重启</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-jobs" class="view frame-view">
+          <iframe id="jobs-frame" title="Jobs dashboard"></iframe>
+        </section>
+
+        <section id="view-goals" class="view frame-view">
+          <iframe id="goals-frame" title="Goals dashboard"></iframe>
+        </section>
+
+        <section id="view-skills" class="view frame-view">
+          <iframe id="skills-frame" title="Skill evolution ops"></iframe>
+        </section>
+
+        <section id="view-health" class="view">
+          <div class="workspace-grid">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>健康</h2>
+                <button id="reload-health">刷新</button>
+              </div>
+              <div id="agent-registry" class="agent-registry"></div>
+              <pre id="health-json" class="json-view"></pre>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <h2>服务日志</h2>
+              </div>
+              <pre id="server-log" class="event-log"></pre>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

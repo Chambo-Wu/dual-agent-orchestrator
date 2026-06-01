@@ -1,4 +1,4 @@
-# 专项路线：Automation Risk Tiering
+# 【部分完成】专项路线：Automation Risk Tiering
 
 - 日期：2026-05-29
 - 主题：Skill 自进化中的 `Automation Risk Tiering`

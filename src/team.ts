@@ -14,6 +14,7 @@ import { createJobRecord, createPlanRecord, createTaskRunRecord } from "./workfl
 import { buildWorkflowGraph } from "./workflow-graph.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import { buildControlledFallbackTask, parseTeamTaskSpecs } from "./team-schema.js";
+import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed } from "./verification.js";
 
 const COMPLEXITY_SIGNALS = [
   /\bfirst\b.*\bthen\b/i,
@@ -54,6 +55,28 @@ export interface TeamAgent {
   role?: string;
 }
 
+export type TeamAgentRuntimeRole = "planner" | "executor" | "worker" | "verifier" | "synthesizer" | "planner_proxy";
+export type TeamAgentRuntimeStatus = "active" | "configured" | "fallback" | "missing";
+
+export interface TeamAgentRuntimeEntry {
+  role: TeamAgentRuntimeRole;
+  status: TeamAgentRuntimeStatus;
+  agent_id: string | null;
+  agent_role: string | null;
+  model: string | null;
+  fallback_to: string | null;
+  summary: string;
+}
+
+export interface TeamAgentRegistrySnapshot {
+  roles: TeamAgentRuntimeEntry[];
+  registered_agents: Array<{
+    id: string;
+    role: string;
+    model: string;
+  }>;
+}
+
 export interface TeamRunResult {
   goal: string;
   finalAnswer: string;
@@ -64,6 +87,7 @@ export interface TeamRunResult {
   plan: Plan;
   taskRuns: TaskRun[];
   artifacts: Artifact[];
+  agentRegistry: TeamAgentRegistrySnapshot;
 }
 
 function buildSubtaskConfig(config: OrchestratorConfig): OrchestratorConfig {
@@ -103,6 +127,105 @@ function resolveRoleAgent(config: OrchestratorConfig, roleName: string): Registe
     const role = agent.role.toLowerCase();
     return id === normalizedRole || role === normalizedRole || role.includes(normalizedRole);
   });
+}
+
+function roleEntry(
+  role: TeamAgentRuntimeRole,
+  status: TeamAgentRuntimeStatus,
+  agent: RegisteredAgent | undefined,
+  fallbackTo: string | null,
+  summary: string,
+): TeamAgentRuntimeEntry {
+  return {
+    role,
+    status,
+    agent_id: agent?.id ?? null,
+    agent_role: agent?.role ?? null,
+    model: agent?.model.model ?? null,
+    fallback_to: fallbackTo,
+    summary,
+  };
+}
+
+export function buildTeamAgentRegistrySnapshot(
+  config: OrchestratorConfig,
+  teamAgents: readonly TeamAgent[] = [],
+): TeamAgentRegistrySnapshot {
+  const workerAgents = teamAgents
+    .map((agent) => resolveExecutorAgent(config, agent.name))
+    .filter((agent): agent is RegisteredAgent => Boolean(agent));
+  const firstWorker = workerAgents[0] ?? (config.defaultExecutorAgent ? config.agents?.[config.defaultExecutorAgent] : undefined);
+  const verifierAgent = resolveRoleAgent(config, "verifier");
+  const synthesizerAgent = resolveRoleAgent(config, "synthesizer");
+  const plannerProxyAgent = resolveRoleAgent(config, "planner_proxy");
+
+  return {
+    roles: [
+      {
+        role: "planner",
+        status: "active",
+        agent_id: null,
+        agent_role: "planner",
+        model: config.planner.model,
+        fallback_to: null,
+        summary: "Planner uses the active planner model route.",
+      },
+      {
+        role: "executor",
+        status: "active",
+        agent_id: config.defaultExecutorAgent ?? null,
+        agent_role: "executor",
+        model: config.executor.model,
+        fallback_to: null,
+        summary: "Executor uses the active executor model route.",
+      },
+      roleEntry(
+        "worker",
+        firstWorker ? "active" : "fallback",
+        firstWorker,
+        firstWorker ? null : "executor.default",
+        firstWorker
+          ? `Worker tasks can route through ${firstWorker.id}.`
+          : "Worker tasks fall back to the default executor route.",
+      ),
+      roleEntry(
+        "verifier",
+        verifierAgent ? "active" : "fallback",
+        verifierAgent,
+        verifierAgent ? null : "system_verifiers",
+        verifierAgent
+          ? `Verifier subtasks can use ${verifierAgent.id}.`
+          : "Verifier subtasks fall back to deterministic system checks.",
+      ),
+      roleEntry(
+        "synthesizer",
+        synthesizerAgent ? "active" : "fallback",
+        synthesizerAgent,
+        synthesizerAgent ? null : "planner.default",
+        synthesizerAgent
+          ? `Final synthesis can route through ${synthesizerAgent.id}.`
+          : "Final synthesis falls back to the planner route.",
+      ),
+      roleEntry(
+        "planner_proxy",
+        plannerProxyAgent ? "configured" : "missing",
+        plannerProxyAgent,
+        null,
+        plannerProxyAgent
+          ? `Planner proxy is registered as ${plannerProxyAgent.id}.`
+          : "Planner proxy is not registered yet.",
+      ),
+    ],
+    registered_agents: Object.values(config.agents ?? {}).map((agent) => ({
+      id: agent.id,
+      role: agent.role,
+      model: agent.model.model,
+    })),
+  };
+}
+
+function emitTeamEvent(options: RunOptions | undefined, type: string, data: Record<string, unknown>): void {
+  options?.onEvent?.({ type, data });
 }
 
 function applyAgentToolPolicy(requestedTools: string[], policy?: AgentToolPolicy): string[] {
@@ -182,6 +305,52 @@ function buildAgentScopedPlannerConfig(config: OrchestratorConfig, agent: Regist
       plannerCandidates: ["planner.default"],
     },
   });
+}
+
+async function applyTeamVerifier(
+  config: OrchestratorConfig,
+  taskRun: TaskRun,
+  runtimeDeps: RuntimeDeps,
+  options?: RunOptions,
+): Promise<TaskRun> {
+  const verifierAgent = resolveRoleAgent(config, "verifier");
+  if (taskRun.status !== "completed") {
+    return taskRun;
+  }
+  if (!verifierAgent) {
+    emitTeamEvent(options, "system.team_verifier_fallback", {
+      role: "verifier",
+      task_id: taskRun.id,
+      title: taskRun.title,
+      requested_agent_id: null,
+      fallback: "system_verifiers",
+      reason: "No registered verifier agent was found; using deterministic system checks.",
+    });
+  }
+
+  const verificationResult = await runVerifiers({
+    jobId: `team:${taskRun.id}`,
+    goal: taskRun.description,
+    executorHistory: [...(taskRun.executorHistory ?? [])],
+    artifacts: taskRun.artifacts,
+    taskRuns: [taskRun],
+    workspaceRoot: process.cwd(),
+    runtimeRoot: process.cwd(),
+  }, verifierAgent
+    ? [
+        ...DEFAULT_VERIFIERS,
+        createModelVerifier(verifierAgent.model, {
+          runChat: runtimeDeps.runChatCompletionDetailed,
+          runOptions: options,
+        }),
+      ]
+    : DEFAULT_VERIFIERS);
+
+  return {
+    ...taskRun,
+    verified: taskRun.verified && verificationPassed(verificationResult),
+    verificationResult,
+  };
 }
 
 function getAgentConcurrencyLimit(agent: RegisteredAgent | undefined, fallback: number): number {
@@ -283,8 +452,13 @@ export async function runTeam(
   const trace = tracer ?? new Tracer(logger);
   const maxConcurrency = teamConfig?.maxConcurrency ?? 5;
   const maxRounds = teamConfig?.maxRounds ?? 20;
+  const agentRegistry = buildTeamAgentRegistrySnapshot(config, teamAgents);
 
   logger?.log("team.start", { goal, agents: agentNames, maxConcurrency });
+  emitTeamEvent(options, "system.team_agent_registry_snapshot", {
+    roles: agentRegistry.roles,
+    registered_agents: agentRegistry.registered_agents,
+  });
 
   if (isSimpleGoal(goal) && teamAgents.length > 0) {
     const best = selectBestAgent(goal, teamAgents);
@@ -337,6 +511,7 @@ export async function runTeam(
       plan,
       taskRuns: [taskRun],
       artifacts: result.artifacts,
+      agentRegistry,
     };
   }
 
@@ -453,6 +628,7 @@ export async function runTeam(
       plan,
       taskRuns,
       artifacts: [],
+      agentRegistry,
     };
   }
 
@@ -503,40 +679,41 @@ export async function runTeam(
 
       const output = result.output;
       const success = result.status === "completed";
-      const verified = result.verified;
-
-      if (result.status === "completed") {
-        queue.complete(task.id, output, verified);
-      } else if (result.status === "failed") {
-        queue.fail(task.id, output);
-      } else {
-        queue.complete(task.id, output, false);
-      }
-      taskResults.set(task.id, { success, output });
-      taskRunsById.set(task.id, createTaskRunRecord({
+      const baseTaskRun = createTaskRunRecord({
         id: task.id,
         title: task.title,
         description: task.description,
         status: result.status === "completed" ? "completed" : result.status,
         assignee: agentName,
         dependsOn: task.dependsOn ?? [],
-        verified,
+        verified: result.verified,
         output,
         artifacts: result.artifacts,
         attempts: result.executorHistory.length,
         executorHistory: result.executorHistory,
-      }));
+      });
+      const verifiedTaskRun = await applyTeamVerifier(config, baseTaskRun, runtimeDeps, options);
+
+      if (result.status === "completed") {
+        queue.complete(task.id, output, verifiedTaskRun.verified);
+      } else if (result.status === "failed") {
+        queue.fail(task.id, output);
+      } else {
+        queue.complete(task.id, output, false);
+      }
+      taskResults.set(task.id, { success, output });
+      taskRunsById.set(task.id, verifiedTaskRun);
 
       await sharedMem.write(agentName, `task:${task.id}:result`, output);
       await sharedMem.writeScoped("task", agentName, "result", output, task.id, {
         title: task.title,
         status: result.status,
-        verified,
+        verified: verifiedTaskRun.verified,
       });
       sharedMem.advanceTurn();
 
-      trace.emit(verified ? "task.completed" : "task.blocked", { taskId: task.id, agent: agentName, verified });
-      logger?.log("team.task.complete", { taskId: task.id, success, verified, output: output.slice(0, 200) });
+      trace.emit(verifiedTaskRun.verified ? "task.completed" : "task.blocked", { taskId: task.id, agent: agentName, verified: verifiedTaskRun.verified });
+      logger?.log("team.task.complete", { taskId: task.id, success, verified: verifiedTaskRun.verified, output: output.slice(0, 200) });
     } catch (err) {
       const cancelled = err instanceof RunCancelledError || options?.abortSignal?.aborted;
       const errMsg = cancelled ? "Run cancelled." : err instanceof Error ? err.message : String(err);
@@ -767,5 +944,5 @@ export async function runTeam(
     workflowGraph,
   });
 
-  return { goal, finalAnswer, taskResults, memorySummary, tasks: queue.list(), job, plan, taskRuns, artifacts };
+  return { goal, finalAnswer, taskResults, memorySummary, tasks: queue.list(), job, plan, taskRuns, artifacts, agentRegistry };
 }

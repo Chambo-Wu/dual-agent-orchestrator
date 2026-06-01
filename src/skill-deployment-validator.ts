@@ -107,6 +107,9 @@ function buildStabilitySignals(input: {
   candidateSelected: boolean;
   silentBypassSignal: boolean;
   risk: SkillDeploymentValidationReport["risk"];
+  trueRuntimeReplayReady: boolean;
+  sameInputReadiness: SkillDeploymentValidationReport["replay"]["sameInputComparison"]["readiness"];
+  executionEvidenceLevel: SkillDeploymentValidationReport["replay"]["provenance"]["executionEvidence"]["level"];
 }): SkillDeploymentValidationReport["stability"] {
   const reasons: string[] = [];
   const replayInstabilityDetected = input.baselineSource !== "source_reflection_job";
@@ -123,10 +126,25 @@ function buildStabilitySignals(input: {
     reasons.push("Candidate improvement currently relies on lightweight heuristic signals and may be flaky before isolated replay exists.");
   }
 
+  let replayStabilityScore = 100;
+  if (replayInstabilityDetected) replayStabilityScore -= 30;
+  if (candidateFlakySignal) replayStabilityScore -= 25;
+  if (!input.trueRuntimeReplayReady) replayStabilityScore -= 25;
+  if (input.sameInputReadiness !== "ready") replayStabilityScore -= input.sameInputReadiness === "needs_replay" ? 15 : 30;
+  if (input.executionEvidenceLevel !== "direct") replayStabilityScore -= input.executionEvidenceLevel === "partial" ? 15 : 30;
+  replayStabilityScore = Math.max(0, Math.min(100, replayStabilityScore));
+  const replayStabilityLevel: SkillDeploymentValidationReport["stability"]["replayStabilityLevel"] = replayStabilityScore >= 80
+    ? "stable"
+    : replayStabilityScore >= 50
+      ? "watch"
+      : "unstable";
+
   return {
     replayInstabilityDetected,
     candidateFlakySignal,
     autoAcceptBlocked: replayInstabilityDetected || candidateFlakySignal,
+    replayStabilityScore,
+    replayStabilityLevel,
     reasons,
   };
 }
@@ -513,14 +531,6 @@ export function validateSkillEvolutionProposal(input: {
     ? candidateSelected && !silentBypassSignal && isolatedReplay.candidate.verificationResult.status === "verified"
     : candidateSelected && !silentBypassSignal && (baselineVerified || improving);
   const baselineSelection = buildBaselineSelectionContract(proposal, reflection, baselineRecord);
-  const stability = buildStabilitySignals({
-    baselineSource: baselineSelection.source,
-    baselineVerified,
-    improving,
-    candidateSelected,
-    silentBypassSignal,
-    risk,
-  });
   const inputEquivalence = {
     mode: "same_recorded_input" as const,
     satisfied: baselineSelection.source !== "none",
@@ -671,6 +681,17 @@ export function validateSkillEvolutionProposal(input: {
     candidateBindingReady: candidateBinding.bindingReady,
     silentBypassSignal,
   });
+  const stability = buildStabilitySignals({
+    baselineSource: baselineSelection.source,
+    baselineVerified,
+    improving,
+    candidateSelected,
+    silentBypassSignal,
+    risk,
+    trueRuntimeReplayReady: runtimeBoundary.trueRuntimeReplayReady,
+    sameInputReadiness: sameInputComparison.readiness,
+    executionEvidenceLevel: executionEvidence.level,
+  });
   const executionEvidenceReady = executionEvidence.level === "direct";
   const decisionDetails = [
     baselineSelection.reason,
@@ -767,6 +788,7 @@ export function validateSkillEvolutionProposal(input: {
           replayVerified: candidateRuntimeReplay?.verified,
           replayArtifactCount: candidateRuntimeReplay?.artifactCount,
           replayTaskRunCount: candidateRuntimeReplay?.taskRunCount,
+          replayTaskPayloads: candidateRuntimeReplay?.taskPayloads,
         } : undefined,
       },
       baseline: {

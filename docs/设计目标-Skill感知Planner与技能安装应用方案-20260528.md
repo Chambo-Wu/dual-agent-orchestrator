@@ -1,4 +1,4 @@
-# Skill 感知 Planner 与技能安装应用方案
+# 【部分完成】Skill 感知 Planner 与技能安装应用方案
 
 - 日期：2026-05-28
 - 范围：在现有 `intent router + route policy + workflow plan` 基础上，引入可安装、可选择、可观测的 `skill` 层

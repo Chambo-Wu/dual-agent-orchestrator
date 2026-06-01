@@ -2,7 +2,7 @@ import { dirname, relative, resolve } from "node:path";
 import { PROJECT_ROOT } from "./paths.js";
 import { getSkillEvolutionProposalCandidateRoot } from "./skill-evolution-store.js";
 import type { StoredJobRecord } from "./job-store.js";
-import type { SkillEvolutionProposal, SkillIsolatedReplayEvent, SkillIsolatedReplayStepSummary } from "./skill-evolution-types.js";
+import type { SkillEvolutionProposal, SkillIsolatedReplayEvent, SkillIsolatedReplayStepSummary, SkillRuntimeReplayTaskPayload } from "./skill-evolution-types.js";
 import type { SkillManifest } from "./skill-types.js";
 import type { Artifact, OrchestratorConfig, RoutePolicy, RunTaskResult } from "./types.js";
 import type { VerificationCheck, VerificationResult } from "./types.js";
@@ -240,6 +240,7 @@ export async function runCandidateRuntimeWorkflowReplay(input: {
   verified?: boolean;
   artifactCount: number;
   taskRunCount: number;
+  taskPayloads: SkillRuntimeReplayTaskPayload[];
   workflowStrategy?: string;
   runtimeSource: ReturnType<typeof buildCandidateReplayConfig>["runtimeSource"];
   reason: string;
@@ -254,6 +255,7 @@ export async function runCandidateRuntimeWorkflowReplay(input: {
       replayReady: false,
       artifactCount: 0,
       taskRunCount: 0,
+      taskPayloads: [],
       runtimeSource: replayRuntime.runtimeSource,
       reason: replayRuntime.runtimeSource.note,
     };
@@ -270,6 +272,7 @@ export async function runCandidateRuntimeWorkflowReplay(input: {
       replayReady: false,
       artifactCount: 0,
       taskRunCount: 0,
+      taskPayloads: [],
       runtimeSource: replayRuntime.runtimeSource,
       reason: "Candidate runtime config was prepared, but the candidate skill workflow could not be materialized.",
     };
@@ -298,6 +301,17 @@ export async function runCandidateRuntimeWorkflowReplay(input: {
     verified: result.verified,
     artifactCount: result.artifacts.length,
     taskRunCount: result.taskRuns.length,
+    taskPayloads: result.taskRuns.map((taskRun) => ({
+      taskRunId: taskRun.id,
+      title: taskRun.title,
+      status: taskRun.status,
+      verified: taskRun.verified,
+      artifactCount: taskRun.artifacts.length,
+      attempts: taskRun.attempts,
+      assignee: taskRun.assignee ?? null,
+      dependsOn: [...taskRun.dependsOn],
+      outputPreview: taskRun.output.slice(0, 240),
+    })),
     workflowStrategy: workflow.strategy,
     runtimeSource: replayRuntime.runtimeSource,
     reason: replayReady

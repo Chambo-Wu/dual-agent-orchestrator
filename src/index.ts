@@ -21,7 +21,7 @@ import type {
   SkillReflectionRecord,
 } from "./skill-evolution-types.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
-import { runTeam, type TeamAgent } from "./team.js";
+import { buildTeamAgentRegistrySnapshot, runTeam, type TeamAgent } from "./team.js";
 import { buildDashboardData, exportDashboardJson, exportDashboardHtml } from "./dashboard.js";
 import { Tracer } from "./trace.js";
 import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext } from "./verification.js";
@@ -33,6 +33,7 @@ import { createUiEvent, normalizeWorkflowEvent, type InternalWorkflowEvent, type
 import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "./job-event-bus.js";
 import { renderTimelineHtml } from "./timeline.js";
 import { renderJobsDashboardHtml } from "./jobs-dashboard.js";
+import { renderSkillEvolutionOpsDashboardHtml } from "./skill-evolution-ops-dashboard.js";
 import { renderGoalsDashboardHtml, type GoalDashboardItem } from "./goals-dashboard.js";
 import { renderGoalTimelineHtml } from "./goal-timeline.js";
 import { buildWorkflowGraph } from "./workflow-graph.js";
@@ -723,28 +724,69 @@ function resolveSkillEvolutionStuckState(
   now = Date.now(),
 ): Record<string, unknown> {
   const ageBucket = classifySkillEvolutionAgeBucket(proposal.createdAt, now);
-  const reasons: string[] = [];
+  const categories: Array<{
+    category: string;
+    severity: "info" | "warning" | "critical";
+    reason: string;
+    action_hint: string;
+  }> = [];
   if (automationBlock) {
-    reasons.push(`automation blocked at ${automationBlock.blockedStage}`);
+    categories.push({
+      category: "automation_blocked",
+      severity: "warning",
+      reason: `automation blocked at ${automationBlock.blockedStage}`,
+      action_hint: "Review the automation ceiling and decide whether this proposal should continue manually.",
+    });
   }
   if (proposal.status === "audit_failed") {
-    reasons.push("audit failed");
+    categories.push({
+      category: "audit_failed",
+      severity: "critical",
+      reason: "audit failed",
+      action_hint: "Inspect the audit report and regenerate or reject the proposal.",
+    });
   }
   if (proposal.status === "validation_failed") {
-    reasons.push("validation failed");
+    categories.push({
+      category: "validation_failed",
+      severity: "critical",
+      reason: "validation failed",
+      action_hint: "Inspect validation failures before retrying or regenerating the proposal.",
+    });
+  }
+  if (dynamicRisk.tier === "high" || dynamicRisk.auto_accept_blocked === true) {
+    categories.push({
+      category: "dynamic_risk_blocked",
+      severity: dynamicRisk.tier === "high" ? "critical" : "warning",
+      reason: dynamicRisk.tier === "high" ? "dynamic risk is high" : "dynamic risk blocks auto-accept",
+      action_hint: "Wait for cooldown or manually review recent failures before accepting.",
+    });
   }
   if (validationSummary && validationSummary.auto_accept_ready !== true && proposal.status === "validated") {
-    reasons.push("validated but not auto-accept eligible");
-  }
-  if (dynamicRisk.tier === "high") {
-    reasons.push("dynamic risk is high");
+    categories.push({
+      category: "manual_accept_required",
+      severity: "warning",
+      reason: "validated but not auto-accept eligible",
+      action_hint: "Review validation summary and accept or reject manually.",
+    });
   }
   if (ageBucket !== "under_1h" && SKILL_EVOLUTION_QUEUE_STATUSES.has(proposal.status)) {
-    reasons.push(`proposal age bucket is ${ageBucket}`);
+    categories.push({
+      category: "aging_queue",
+      severity: ageBucket === "over_24h" ? "critical" : "warning",
+      reason: `proposal age bucket is ${ageBucket}`,
+      action_hint: "Prioritize this proposal or explicitly reject it to keep the queue fresh.",
+    });
   }
+  const reasons = categories.map((item) => item.reason);
+  const primary = categories[0] ?? null;
   return {
     stuck: reasons.length > 0,
-    stage: reasons[0] ?? null,
+    stage: primary?.reason ?? null,
+    primary_category: primary?.category ?? null,
+    severity: primary?.severity ?? null,
+    action_hint: primary?.action_hint ?? null,
+    categories,
     reasons,
     age_bucket: ageBucket,
   };
@@ -843,6 +885,11 @@ function buildSkillEvolutionDynamicRiskSummary(
   const auditFailureCount = auditFailureSignals.length;
   const validationFailureCount = validationFailureSignals.length;
   const replayInstabilityCount = replayInstabilitySignals.length;
+  const recentReports = validationReports.filter((report) => isRecent(report.createdAt));
+  const failureRateSampleCount = recentReports.length;
+  const failureRateFailureCount = recentReports.filter((report) => !report.passed).length;
+  const failureRate = failureRateSampleCount > 0 ? failureRateFailureCount / failureRateSampleCount : 0;
+  const failureRateDowngrade = failureRateSampleCount >= 2 && failureRate >= 0.5;
   const signalTimes = [...auditFailureSignals, ...validationFailureSignals, ...replayInstabilitySignals]
     .map((createdAt) => Date.parse(createdAt))
     .filter((value) => Number.isFinite(value));
@@ -865,6 +912,9 @@ function buildSkillEvolutionDynamicRiskSummary(
   if (replayInstabilityCount > 0) {
     reasons.push(`${replayInstabilityCount} recent replay readiness/stability signal(s)`);
   }
+  if (failureRateDowngrade) {
+    reasons.push(`recent validation failure rate is ${failureRateFailureCount}/${failureRateSampleCount}`);
+  }
   if (validationSummary && !currentAutoAcceptReady) {
     reasons.push("current proposal is not auto-accept ready");
   }
@@ -875,12 +925,12 @@ function buildSkillEvolutionDynamicRiskSummary(
     reasons.push(`dynamic risk cooldown active until ${cooldownUntil}`);
   }
 
-  const tier: "low" | "medium" | "high" = validationFailureCount > 0 || replayInstabilityCount >= 2
+  const tier: "low" | "medium" | "high" = validationFailureCount > 0 || replayInstabilityCount >= 2 || failureRateDowngrade
     ? "high"
     : auditFailureCount > 0 || replayInstabilityCount > 0
       ? "medium"
       : "low";
-  const automationCeiling: SkillEvolutionAutomationStage = validationFailureCount > 0 || replayInstabilityCount >= 2
+  const automationCeiling: SkillEvolutionAutomationStage = validationFailureCount > 0 || replayInstabilityCount >= 2 || failureRateDowngrade
     ? "auto_audit"
     : auditFailureCount > 0
       ? "auto_propose"
@@ -895,6 +945,10 @@ function buildSkillEvolutionDynamicRiskSummary(
     audit_failure_count: auditFailureCount,
     validation_failure_count: validationFailureCount,
     replay_instability_count: replayInstabilityCount,
+    failure_rate: failureRate,
+    failure_rate_sample_count: failureRateSampleCount,
+    failure_rate_failure_count: failureRateFailureCount,
+    failure_rate_downgrade: failureRateDowngrade,
     sampled_proposal_count: skillProposals.length,
     window_hours: SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS,
     newest_signal_at: newestSignalAt,
@@ -1069,6 +1123,19 @@ function buildSkillEvolutionOpsSummary(config: OrchestratorConfig): Record<strin
     const stuckState = record.ops_summary.stuck_state;
     return isObjectRecord(stuckState) && stuckState.stuck === true;
   }).length;
+  const stuckCategories = records.reduce<Record<string, number>>((acc, record) => {
+    const stuckState = record.ops_summary.stuck_state;
+    if (!isObjectRecord(stuckState) || !Array.isArray(stuckState.categories)) {
+      return acc;
+    }
+    for (const category of stuckState.categories) {
+      if (!isObjectRecord(category) || typeof category.category !== "string") {
+        continue;
+      }
+      acc[category.category] = (acc[category.category] ?? 0) + 1;
+    }
+    return acc;
+  }, {});
   return {
     object: "skill_evolution_ops",
     generated_at: new Date().toISOString(),
@@ -1097,6 +1164,7 @@ function buildSkillEvolutionOpsSummary(config: OrchestratorConfig): Record<strin
       dynamic_risk: dynamicRiskCounts,
       eligibility: eligibilityCounts,
       stuck_count: stuckCount,
+      stuck_categories: stuckCategories,
     },
     proposal_queue: proposalQueue,
     accepted_history: acceptedHistory,
@@ -1133,6 +1201,10 @@ function buildSkillEvolutionValidationSummary(validation: {
   risk?: {
     tier?: string;
   };
+  stability?: {
+    replayStabilityScore?: number;
+    replayStabilityLevel?: string;
+  };
   decision?: {
     reasonCode?: string;
     autoAcceptReady?: boolean;
@@ -1147,6 +1219,19 @@ function buildSkillEvolutionValidationSummary(validation: {
     };
     provenance?: {
       isolated?: boolean;
+      runtimeConfig?: {
+        replayTaskPayloads?: Array<{
+          taskRunId?: string;
+          title?: string;
+          status?: string;
+          verified?: boolean;
+          artifactCount?: number;
+          attempts?: number;
+          assignee?: string | null;
+          dependsOn?: string[];
+          outputPreview?: string;
+        }>;
+      };
     };
     sameInputComparison?: {
       readiness?: string;
@@ -1191,9 +1276,12 @@ function buildSkillEvolutionValidationSummary(validation: {
     risk_tier: validation.risk?.tier ?? null,
     reason_code: validation.decision?.reasonCode ?? null,
     auto_accept_ready: validation.decision?.autoAcceptReady ?? false,
+    replay_stability_score: validation.stability?.replayStabilityScore ?? null,
+    replay_stability_level: validation.stability?.replayStabilityLevel ?? null,
     runtime_boundary: validation.replay?.runtimeBoundary ?? null,
     isolated_replay: validation.replay?.provenance?.isolated ?? false,
     same_input_readiness: validation.replay?.sameInputComparison?.readiness ?? null,
+    runtime_replay_task_payloads: validation.replay?.provenance?.runtimeConfig?.replayTaskPayloads ?? [],
     replay_headline: replayHeadline,
     baseline_replay: baselineReplay,
     candidate_replay: candidateReplay,
@@ -2640,6 +2728,7 @@ function buildHealthResponse(
         waiting_review_goals: goalsSummary.waitingReview,
         by_status: goalsSummary.byStatus,
       },
+      team_agents: buildTeamAgentRegistrySnapshot(config, resolveTeamAgents(config)),
     },
     skills: {
       enabled: config.skills.enabled,
@@ -3043,6 +3132,21 @@ async function handleListSkillEvolutionProposals(_req: IncomingMessage, res: Ser
 }
 
 async function handleSkillEvolutionOps(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  jsonResponse(res, 200, buildSkillEvolutionOpsSummary(config));
+}
+
+async function handleSkillEvolutionOpsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const config = getRuntimeConfig();
+  const html = renderSkillEvolutionOpsDashboardHtml(buildSkillEvolutionOpsSummary(config), {
+    dataUrl: "/skill-evolution/ops/data",
+  });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(html);
+}
+
+async function handleBrowserSkillEvolutionOpsData(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   const config = getRuntimeConfig();
   jsonResponse(res, 200, buildSkillEvolutionOpsSummary(config));
 }
@@ -4033,6 +4137,25 @@ function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[], 
   };
 }
 
+function resolveTeamAgentRegistrySummary(
+  record: StoredJobRecord,
+  events: WorkflowUiEvent[],
+): Record<string, unknown> | null {
+  if (record.job.mode !== "team") {
+    return null;
+  }
+  const registryEvent = [...events].reverse().find((event) => event.type === "system.team_agent_registry_snapshot");
+  if (registryEvent && isObjectRecord(registryEvent.meta)) {
+    return registryEvent.meta;
+  }
+  try {
+    const config = loadConfig();
+    return buildTeamAgentRegistrySnapshot(config, resolveTeamAgents(config)) as unknown as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEvent[]): WorkflowUiEvent[] {
   if (persistedEvents.length === 0) {
     return buildJobEvents(record);
@@ -4258,6 +4381,7 @@ function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     record,
     events: persistedEvents,
   });
+  const teamAgentRegistry = resolveTeamAgentRegistrySummary(record, persistedEvents);
   return {
     saved_at: record.savedAt,
     intent_route: record.job.intentRoute ?? record.plan.intentRoute ?? null,
@@ -4265,6 +4389,7 @@ function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     selected_skill: selectedSkill,
     skill_outcome: skillOutcome,
     skill_reflection: skillReflection,
+    team_agent_registry: teamAgentRegistry,
     job: {
       ...record.job,
       status: liveJobStatus,
@@ -4313,6 +4438,7 @@ function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
     intent_route: response.intent_route ?? null,
     candidate_skills: response.candidate_skills ?? [],
     selected_skill: response.selected_skill ?? null,
+    team_agent_registry: response.team_agent_registry ?? null,
     saved_at: response.saved_at,
     step_count: response.step_count,
     artifact_count: response.artifact_count,
@@ -7684,6 +7810,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    if (method === "GET" && url.pathname === "/skill-evolution/ops") {
+      await handleSkillEvolutionOpsDashboard(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/skill-evolution/ops/data") {
+      await handleBrowserSkillEvolutionOpsData(req, res);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/goals/dashboard") {
       await handleGoalsDashboard(req, res, "/goals");
       return;
@@ -7779,6 +7915,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     if (method === "GET" && url.pathname === "/v1/skill-evolution/ops") {
       await handleSkillEvolutionOps(req, res);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/skill-evolution/ops/dashboard") {
+      await handleSkillEvolutionOpsDashboard(req, res);
       return;
     }
 
