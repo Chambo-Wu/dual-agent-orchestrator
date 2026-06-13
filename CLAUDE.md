@@ -60,6 +60,7 @@ Complex Task:
 When a user asks to preserve the original Dual Agent Orchestrator large-flow behavior, use `/dao-run` semantics:
 
 Never answer a `/dao-run` invocation by printing the command definition. Treat `.claude/commands/dao-run.md` as instructions to execute, not as content to return.
+If the Claude Code CLI appears to cache an older `/dao-run` definition, use `/dao-exec` for the same route contract with a shorter prompt surface.
 
 | Route | Use When | Source of Truth |
 | --- | --- | --- |
@@ -69,6 +70,7 @@ Never answer a `/dao-run` invocation by printing the command definition. Treat `
 | `hybrid` | Claude Code should inspect/edit locally while the service owns durable orchestration. | Task note + service job |
 
 Default to `service_job` for complex tasks when `http://127.0.0.1:9898/health` is reachable.
+Use service `mode: "task"` by default; use `mode: "team"` only when the user explicitly asks for team mode or the service-side decomposition is clearly required.
 Do not collapse durable workflow requests into a plain Q&A response.
 
 For every `/dao-run` style task:

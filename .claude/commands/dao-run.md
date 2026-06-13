@@ -36,7 +36,7 @@ If route is `service_job`:
 ```json
 {
   "goal": "$ARGUMENTS",
-  "mode": "team",
+  "mode": "task",
   "policy": {
     "async": true
   }
@@ -56,7 +56,8 @@ Content-Type: application/json
 5. Use the timeline URL as the primary CTA.
 6. If the service is unavailable, record `service_unavailable`, select `native` only if the task remains safe to complete, and tell the user durability/timeline/recovery were unavailable.
 
-Use `mode: "task"` only for clearly single-lane work.
+Use `mode: "team"` only when the user explicitly asks for team-mode execution or the task clearly requires service-side team subtasks.
+If the service returns a workflow-plan validation error, record it and fall back to native execution for the current user answer instead of retrying blindly.
 
 ## Native Procedure
 

@@ -41,6 +41,7 @@ User → Claude Code Kernel → Task Decomposition → Parallel Subagents → Sy
 ### 3. Commands (`.claude/commands/`)
 | Command | 用途 |
 |---------|------|
+| `/dao-exec` | `/dao-run` 的短提示备用入口，适合避开 CLI 命令缓存 |
 | `/dao-run` | 保持原 Dual Agent Orchestrator 大流程语义，自动选择 native / service job / MCP 路由 |
 | `/build-feature` | 构建完整功能（实现+测试+文档） |
 | `/research-and-report` | 深度研究并生成报告 |
@@ -75,6 +76,7 @@ User: "构建一个带测试和文档的新 API 端点"
 ### 使用 Commands
 ```
 /dao-run 构建一个可恢复、可观测的后台任务
+/dao-exec 研究多 agent API 项目并判断本项目创新性
 /build-feature 添加用户资料页面，支持头像上传
 /research-and-report 比较 React 状态管理方案
 /verify-quality src/auth/
