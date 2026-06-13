@@ -17,11 +17,13 @@ yubao*.md
 多模型研究总结*.md
 
 # Local tool / assistant metadata
-CLAUDE.md
 open-multi-agent/
-.claude/
 .cao-tasks/
 .atomcode/
+demo-hello-world/
+
+# Agent runtime notes
+runtime/agentic-os/
 
 # Temporary patches and review notes
 .tmp_patch.txt

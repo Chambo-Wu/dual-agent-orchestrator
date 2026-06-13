@@ -17,6 +17,7 @@ Additional project planning docs:
 - [Current Goal Plan](./docs/Goal任务-待完成路线分步实施计划-20260529.md)
 - [Skill Evolution Implementation Checklist](./docs/执行清单-Skill自进化集成任务拆解-20260529.md)
 - [Frontend Recovery Status And CTA Contract](./docs/%E5%89%8D%E7%AB%AF%E6%81%A2%E5%A4%8D%E7%8A%B6%E6%80%81%E4%B8%8ECTA%E5%AF%B9%E6%8E%A5-20260527.md)
+- [Claude Code Agentic OS Integration](./docs/AgenticOS-ClaudeCode集成说明.md)
 
 ## Overview
 
@@ -40,6 +41,17 @@ The current implementation supports both:
 - direct chat-style use through `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`
 - first-class jobs through `/v1/jobs`
 - multi-agent team execution with role-aware routing, approval gates, verifier participation, and resumable control-plane workflows
+
+### Claude Code Agentic OS Layer
+
+The repository also includes a Claude Code-native orchestration layer for local agent-assisted work:
+
+- `CLAUDE.md`: project-level routing and orchestration guidance
+- `.claude/agents/`: planner, coder, researcher, writer, and verifier subagent definitions
+- `.claude/commands/`: workflow commands such as `/build-feature`, `/research-and-report`, `/verify-quality`, and `/orchestrator-demo`
+- `SHARED_TASK_NOTES.template.md`: template for task notes copied into `runtime/agentic-os/tasks/`
+
+This layer complements the service runtime. Use it for interactive Claude Code workflows; use the HTTP job control plane when you need durable async jobs, dashboard/timeline observability, or API integrations.
 
 ## Current Status
 
