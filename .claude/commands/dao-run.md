@@ -1,83 +1,37 @@
-# /dao-run
+---
+description: Run a task through Dual Agent Orchestrator routing instead of answering as plain Q&A.
+argument-hint: <task>
+---
 
-Run a user task through the Dual Agent Orchestrator route contract.
+# DAO Run
 
-## Usage
+Do not print or summarize this command file.
+Execute the user task in `$ARGUMENTS` through the route contract below.
 
-```text
-/dao-run <task>
-```
-
-## Intent
-
-Use this command when the user wants the original Dual Agent Orchestrator style of work:
-
-- keep the larger route visible
-- decompose work before execution
-- use planner + worker/workers inside each small flow
-- persist progress in a task note
-- use the service job control plane when durability, replay, timeline, recovery, or dashboard visibility matters
-
-## Route Decision
-
-Classify the request before execution:
-
-| Route | Use When | Execution Surface |
-| --- | --- | --- |
-| `native` | The task is short, local, synchronous, and does not need durable replay. | Claude Code subagents from `.claude/agents/` |
-| `service_job` | The task is long-running, multi-step, needs recovery, needs dashboard/timeline visibility, or should survive CLI interruption. | Dual Agent Orchestrator HTTP `/v1/jobs` |
-| `mcp_service_job` | MCP tools for Dual Agent Orchestrator are configured and expose job operations. | MCP workflow tools |
-| `hybrid` | Claude Code should inspect or edit local files, while the service owns durable orchestration. | Claude Code subagents + `/v1/jobs` or MCP |
-
-Default to `service_job` for complex tasks when the local service is reachable.
-Fall back to `native` only when the service/MCP route is unavailable or the task is clearly small.
-
-## Required Task Note
-
-Before executing, create or update a task note using `SHARED_TASK_NOTES.template.md`:
+User task:
 
 ```text
-runtime/agentic-os/tasks/<yyyyMMdd-HHmmss>-<slug>.md
+$ARGUMENTS
 ```
 
-The task note must include:
+## Required Behavior
 
-- `route`: `native`, `service_job`, `mcp_service_job`, or `hybrid`
-- `status`: `planned`, `running`, `blocked`, `verifying`, `completed`, or `failed`
-- `job_id` and `timeline_url` when a service job is created
-- acceptance criteria
-- progress entries
-- artifacts
-- verification result
-- next action / CTA
+1. Treat this as an execution request, not a documentation request.
+2. Create or update a task note under `runtime/agentic-os/tasks/<yyyyMMdd-HHmmss>-<slug>.md` from `SHARED_TASK_NOTES.template.md`.
+3. Choose exactly one route:
+   - `service_job`: default for complex, long-running, research-heavy, resumable, or timeline-worthy tasks when `http://127.0.0.1:9898/health` is reachable.
+   - `mcp_service_job`: use only when Dual Agent Orchestrator MCP job tools are actually configured.
+   - `hybrid`: use when Claude Code should inspect/edit locally while the service owns durable orchestration.
+   - `native`: use only for short local synchronous work or when service/MCP is unavailable.
+4. Do not collapse durable workflow requests into a plain Q&A answer.
+5. Always end with the DAO Run Summary format below.
 
-## Service Job Flow
+## Service Job Procedure
 
-When route is `service_job`:
+If route is `service_job`:
 
-1. Check service health at `http://127.0.0.1:9898/health` unless the user specified another URL.
-2. Create a job with `POST /v1/jobs`.
-3. Use the user's task as the job input.
-4. Prefer async job mode when available.
-5. Record `job_id`, `events_url`, `stream_url`, and `timeline_url` in the task note.
-6. Tell the user the dashboard and timeline URLs.
-7. Follow events when useful, but do not hide that the durable source of truth is the job record.
-8. On failure or interruption, record the recovery CTA: open timeline, resume, retry, cancel, or inspect events.
-
-Default local service:
-
-```text
-base_url: http://127.0.0.1:9898
-dashboard: http://127.0.0.1:9898/jobs/dashboard
-```
-
-Default auth header for local development:
-
-```text
-Authorization: Bearer dual-agent-local
-```
-
-Create request shape:
+1. Check `GET http://127.0.0.1:9898/health`.
+2. Create a job:
 
 ```json
 {
@@ -89,62 +43,48 @@ Create request shape:
 }
 ```
 
-Use `mode: "task"` only when the work is clearly single-lane and does not benefit from team/subtask routing.
+Use:
 
-Expected async response fields:
-
-```json
-{
-  "object": "job",
-  "job_id": "job_...",
-  "status": "running",
-  "accepted": true,
-  "stream_url": "/v1/jobs/job_.../stream",
-  "events_url": "/v1/jobs/job_.../events",
-  "timeline_url": "/v1/jobs/job_.../timeline"
-}
+```text
+POST http://127.0.0.1:9898/v1/jobs
+Authorization: Bearer dual-agent-local
+Content-Type: application/json
 ```
 
-After creation:
+3. Record returned `job_id`, `events_url`, `stream_url`, and `timeline_url` in the task note.
+4. Convert relative URLs to absolute URLs with `http://127.0.0.1:9898`.
+5. Use the timeline URL as the primary CTA.
+6. If the service is unavailable, record `service_unavailable`, select `native` only if the task remains safe to complete, and tell the user durability/timeline/recovery were unavailable.
 
-1. Convert relative response URLs to absolute URLs using the service base URL.
-2. Store all URLs in the task note.
-3. Poll `GET /v1/jobs/:id` for coarse status when SSE is not needed.
-4. Use `GET /v1/jobs/:id/events` for replayable event history.
-5. Use `GET /v1/jobs/:id/timeline` as the primary human-facing CTA.
+Use `mode: "task"` only for clearly single-lane work.
 
-If health check fails:
+## Native Procedure
 
-1. Record `route: native` or `route: hybrid` with degradation reason.
-2. Record `service_unavailable` in `Blockers`.
-3. Continue only if the task can be completed safely without durable job semantics.
-4. Tell the user that dashboard/timeline/recovery were unavailable for this run.
+If route is `native`:
 
-## MCP Flow
+1. Make a compact plan.
+2. Use specialist agents conceptually: planner for decomposition, researcher for evidence, coder/writer for artifacts, verifier for checks.
+3. For external/current research, use web search and cite sources.
+4. Update the task note with route, progress, artifacts, verification, and CTA.
 
-When route is `mcp_service_job`:
+## Task Note Minimum Fields
 
-1. Use the configured Dual Agent Orchestrator MCP workflow tools.
-2. Create the job through MCP instead of raw HTTP.
-3. Record MCP server/tool names in the task note.
-4. Fetch job status/events through MCP.
-5. Include the same CTA fields as the HTTP service job route.
+The task note must include:
 
-If MCP is not configured, do not pretend it is available. Use `service_job` if the HTTP service is reachable.
+- route
+- status
+- service_base_url
+- job_id, events_url, stream_url, timeline_url when available
+- acceptance criteria
+- progress
+- artifacts
+- verification
+- blockers
+- CTA
 
-## Native Flow
+## Final Output
 
-When route is `native`:
-
-1. Ask `@planner` for a compact plan when there is more than one step.
-2. Execute with `@coder`, `@researcher`, and/or `@writer`.
-3. Verify with `@verifier` when code, files, or claims changed.
-4. Update the task note after each phase.
-5. Finish with a clear CTA and verification summary.
-
-## Output Contract
-
-Always end with:
+End every run with:
 
 ```markdown
 ## DAO Run Summary
@@ -157,7 +97,3 @@ Always end with:
 - **Verification**: [what was checked]
 - **CTA**: [open timeline / resume / retry / inspect / next command]
 ```
-
-## User Task
-
-$ARGUMENTS

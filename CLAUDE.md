@@ -59,6 +59,8 @@ Complex Task:
 
 When a user asks to preserve the original Dual Agent Orchestrator large-flow behavior, use `/dao-run` semantics:
 
+Never answer a `/dao-run` invocation by printing the command definition. Treat `.claude/commands/dao-run.md` as instructions to execute, not as content to return.
+
 | Route | Use When | Source of Truth |
 | --- | --- | --- |
 | `native` | Short, local, synchronous tasks that do not need durable replay. | Claude Code conversation + task note |
