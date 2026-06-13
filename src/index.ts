@@ -154,6 +154,39 @@ interface CreateJobRequest {
   };
 }
 
+function extractTaggedValue(input: string, tagName: string): string | undefined {
+  const pattern = new RegExp(`<${tagName}>\\s*([\\s\\S]*?)\\s*<\\/${tagName}>`, "i");
+  const match = input.match(pattern);
+  return typeof match?.[1] === "string" && match[1].trim() ? match[1].trim() : undefined;
+}
+
+function normalizeDaoRunGoal(rawGoal: string): { goal: string; sanitized: boolean; reason?: string } {
+  const trimmed = rawGoal.trim();
+  const commandName = extractTaggedValue(trimmed, "command-name")?.replace(/^\//, "");
+  const commandArgs = extractTaggedValue(trimmed, "command-args");
+  if ((commandName === "dao-run" || commandName === "dao-exec") && commandArgs) {
+    return {
+      goal: commandArgs,
+      sanitized: commandArgs !== trimmed,
+      reason: "claude_command_args",
+    };
+  }
+
+  const flowMatch = trimmed.match(/Execute this exact flow for [`"“]([\s\S]*?)[`"”]\s*:/i);
+  if (flowMatch?.[1]?.trim()) {
+    return {
+      goal: flowMatch[1].trim(),
+      sanitized: flowMatch[1].trim() !== trimmed,
+      reason: "dao_run_command_body",
+    };
+  }
+
+  return {
+    goal: trimmed,
+    sanitized: false,
+  };
+}
+
 interface CreateGoalRequest {
   goal?: string;
   insert_large_checks?: boolean;
@@ -537,8 +570,6 @@ const SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER: Record<SkillEvolutionAutomationSta
   auto_validate: 4,
   auto_accept: 5,
 };
-const SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS = 24;
-
 function isSkillEvolutionAutomationStage(value: unknown): value is SkillEvolutionAutomationStage {
   return value === "auto_reflect"
     || value === "auto_propose"
@@ -575,6 +606,10 @@ function isAutomationStageAllowedForCeiling(
   stage: SkillEvolutionAutomationStage,
 ): boolean {
   return SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[stage] <= SKILL_EVOLUTION_AUTOMATION_STAGE_ORDER[ceiling];
+}
+
+function isLowRiskPilotSkill(skillId: string, riskTier: "low" | "medium" | "high", config: OrchestratorConfig): boolean {
+  return riskTier === "low" && config.skillEvolution.riskTiering.lowRiskPilotSkills.includes(skillId);
 }
 
 function buildAutomationCeilingBlockMeta(
@@ -696,6 +731,24 @@ function buildSkillEvolutionProposalOpsSummary(
   const dynamicCeiling = typeof dynamicRisk.automation_ceiling === "string" ? dynamicRisk.automation_ceiling : null;
   const eligible = eligibility.eligible === true;
   const reasons = Array.isArray(eligibility.reasons) ? eligibility.reasons : [];
+  const stuckState = resolveSkillEvolutionStuckState(proposal, validationSummary, automationBlock, dynamicRisk, now);
+  const nextAction = typeof stuckState.next_action === "string"
+    ? stuckState.next_action
+    : proposal.status === "draft"
+      ? "run_audit"
+      : proposal.status === "auditing"
+        ? "wait_for_audit"
+        : proposal.status === "audit_failed"
+          ? "regenerate_or_reject"
+          : proposal.status === "validation_failed"
+            ? "inspect_validation"
+            : proposal.status === "validated" && eligible
+              ? "accept"
+              : proposal.status === "validated"
+                ? "manual_review"
+                : proposal.status === "accepted"
+                  ? "monitor_or_rollback"
+                  : "none";
   return {
     queue_state: queueState,
     funnel_stage: resolveSkillEvolutionFunnelStage(proposal.status),
@@ -711,7 +764,9 @@ function buildSkillEvolutionProposalOpsSummary(
     dynamic_risk_cooldown_active: dynamicRisk.cooldown_active === true,
     dynamic_risk_cooldown_until: dynamicRisk.cooldown_until ?? null,
     effective_automation_ceiling: dynamicCeiling,
-    stuck_state: resolveSkillEvolutionStuckState(proposal, validationSummary, automationBlock, dynamicRisk, now),
+    next_action: nextAction,
+    queue_category: stuckState.primary_category ?? (queueState === "proposal_queue" ? "ready_for_operator" : queueState),
+    stuck_state: stuckState,
     rollback_available: rollbackGuide && rollbackGuide.rollback_available === true,
   };
 }
@@ -724,13 +779,14 @@ function resolveSkillEvolutionStuckState(
   now = Date.now(),
 ): Record<string, unknown> {
   const ageBucket = classifySkillEvolutionAgeBucket(proposal.createdAt, now);
+  const inQueue = SKILL_EVOLUTION_QUEUE_STATUSES.has(proposal.status);
   const categories: Array<{
     category: string;
     severity: "info" | "warning" | "critical";
     reason: string;
     action_hint: string;
   }> = [];
-  if (automationBlock) {
+  if (inQueue && automationBlock) {
     categories.push({
       category: "automation_blocked",
       severity: "warning",
@@ -738,7 +794,7 @@ function resolveSkillEvolutionStuckState(
       action_hint: "Review the automation ceiling and decide whether this proposal should continue manually.",
     });
   }
-  if (proposal.status === "audit_failed") {
+  if (inQueue && proposal.status === "audit_failed") {
     categories.push({
       category: "audit_failed",
       severity: "critical",
@@ -746,7 +802,7 @@ function resolveSkillEvolutionStuckState(
       action_hint: "Inspect the audit report and regenerate or reject the proposal.",
     });
   }
-  if (proposal.status === "validation_failed") {
+  if (inQueue && proposal.status === "validation_failed") {
     categories.push({
       category: "validation_failed",
       severity: "critical",
@@ -754,7 +810,7 @@ function resolveSkillEvolutionStuckState(
       action_hint: "Inspect validation failures before retrying or regenerating the proposal.",
     });
   }
-  if (dynamicRisk.tier === "high" || dynamicRisk.auto_accept_blocked === true) {
+  if (inQueue && (dynamicRisk.tier === "high" || dynamicRisk.auto_accept_blocked === true)) {
     categories.push({
       category: "dynamic_risk_blocked",
       severity: dynamicRisk.tier === "high" ? "critical" : "warning",
@@ -762,7 +818,7 @@ function resolveSkillEvolutionStuckState(
       action_hint: "Wait for cooldown or manually review recent failures before accepting.",
     });
   }
-  if (validationSummary && validationSummary.auto_accept_ready !== true && proposal.status === "validated") {
+  if (inQueue && validationSummary && validationSummary.auto_accept_ready !== true && proposal.status === "validated") {
     categories.push({
       category: "manual_accept_required",
       severity: "warning",
@@ -770,7 +826,7 @@ function resolveSkillEvolutionStuckState(
       action_hint: "Review validation summary and accept or reject manually.",
     });
   }
-  if (ageBucket !== "under_1h" && SKILL_EVOLUTION_QUEUE_STATUSES.has(proposal.status)) {
+  if (inQueue && ageBucket !== "under_1h") {
     categories.push({
       category: "aging_queue",
       severity: ageBucket === "over_24h" ? "critical" : "warning",
@@ -780,12 +836,26 @@ function resolveSkillEvolutionStuckState(
   }
   const reasons = categories.map((item) => item.reason);
   const primary = categories[0] ?? null;
+  const nextAction = primary?.category === "automation_blocked"
+    ? "manual_review"
+    : primary?.category === "audit_failed"
+      ? "regenerate_or_reject"
+      : primary?.category === "validation_failed"
+        ? "inspect_validation"
+        : primary?.category === "dynamic_risk_blocked"
+          ? "wait_or_manual_review"
+          : primary?.category === "manual_accept_required"
+            ? "manual_review"
+            : primary?.category === "aging_queue"
+              ? "prioritize_or_reject"
+              : null;
   return {
     stuck: reasons.length > 0,
     stage: primary?.reason ?? null,
     primary_category: primary?.category ?? null,
     severity: primary?.severity ?? null,
     action_hint: primary?.action_hint ?? null,
+    next_action: nextAction,
     categories,
     reasons,
     age_bucket: ageBucket,
@@ -855,7 +925,11 @@ function buildSkillEvolutionDynamicRiskSummary(
   proposalHistory?: SkillEvolutionProposal[],
 ): Record<string, unknown> {
   const now = Date.now();
-  const windowMs = SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS * 60 * 60 * 1000;
+  const windowHours = typeof config.skillEvolution.riskTiering.dynamicWindowHours === "number"
+    && Number.isFinite(config.skillEvolution.riskTiering.dynamicWindowHours)
+    ? config.skillEvolution.riskTiering.dynamicWindowHours
+    : 24;
+  const windowMs = windowHours * 60 * 60 * 1000;
   const skillProposals = (proposalHistory ?? listSkillEvolutionProposals(config.skillEvolution.candidateDir))
     .filter((item) => item.skillId === proposal.skillId)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
@@ -924,6 +998,50 @@ function buildSkillEvolutionDynamicRiskSummary(
   if (cooldownActive && cooldownUntil) {
     reasons.push(`dynamic risk cooldown active until ${cooldownUntil}`);
   }
+  const failureClusters = [
+    {
+      category: "audit_failure",
+      count: auditFailureCount,
+      window_hours: windowHours,
+      newest_signal_at: auditFailureSignals
+        .map((createdAt) => Date.parse(createdAt))
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => right - left)[0],
+      downgrade_stage: auditFailureCount > 0 ? "auto_propose" : null,
+    },
+    {
+      category: "validation_failure",
+      count: validationFailureCount,
+      window_hours: windowHours,
+      newest_signal_at: validationFailureSignals
+        .map((createdAt) => Date.parse(createdAt))
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => right - left)[0],
+      downgrade_stage: validationFailureCount > 0 ? "auto_audit" : null,
+    },
+    {
+      category: "replay_instability",
+      count: replayInstabilityCount,
+      window_hours: windowHours,
+      newest_signal_at: replayInstabilitySignals
+        .map((createdAt) => Date.parse(createdAt))
+        .filter((value) => Number.isFinite(value))
+        .sort((left, right) => right - left)[0],
+      downgrade_stage: replayInstabilityCount >= 2 ? "auto_audit" : replayInstabilityCount > 0 ? "auto_validate" : null,
+    },
+    {
+      category: "validation_failure_rate",
+      count: failureRateFailureCount,
+      window_hours: windowHours,
+      sample_count: failureRateSampleCount,
+      failure_rate: failureRate,
+      downgrade_stage: failureRateDowngrade ? "auto_audit" : null,
+    },
+  ].map((cluster) => ({
+    ...cluster,
+    newest_signal_at: typeof cluster.newest_signal_at === "number" ? new Date(cluster.newest_signal_at).toISOString() : null,
+    active: (typeof cluster.count === "number" && cluster.count > 0) || cluster.downgrade_stage !== null,
+  }));
 
   const tier: "low" | "medium" | "high" = validationFailureCount > 0 || replayInstabilityCount >= 2 || failureRateDowngrade
     ? "high"
@@ -937,6 +1055,31 @@ function buildSkillEvolutionDynamicRiskSummary(
       : replayInstabilityCount > 0
         ? "auto_validate"
         : config.skillEvolution.riskTiering.automationCeilings.low;
+  const gateSummary = (["auto_audit", "auto_validate", "auto_accept"] as const).map((stage) => ({
+    stage,
+    allowed_by_ceiling: isAutomationStageAllowedForCeiling(automationCeiling, stage),
+    allowed_by_config: stage === "auto_audit"
+      ? config.skillEvolution.autoAudit
+      : stage === "auto_validate"
+        ? config.skillEvolution.autoValidate
+        : config.skillEvolution.autoAccept,
+    blocked_by_dynamic_risk: !isAutomationStageAllowedForCeiling(automationCeiling, stage),
+    reason: !isAutomationStageAllowedForCeiling(automationCeiling, stage)
+      ? `dynamic risk ceiling ${automationCeiling} is below ${stage}`
+      : stage === "auto_accept" && !currentAutoAcceptReady
+        ? "current proposal is not auto-accept ready"
+        : "gate allowed by dynamic risk",
+  }));
+  const recoveryPolicy = {
+    strategy: "cooldown_window_clear",
+    window_hours: windowHours,
+    cooldown_active: cooldownActive,
+    cooldown_until: cooldownUntil,
+    recovery_condition: cooldownActive
+      ? `no new audit, validation, or replay instability signals before ${cooldownUntil}`
+      : "dynamic risk can recover when no recent failure cluster remains in the configured window",
+    restored_ceiling: config.skillEvolution.riskTiering.automationCeilings.low,
+  };
   return {
     tier,
     source: "recent_skill_evolution_history",
@@ -949,8 +1092,11 @@ function buildSkillEvolutionDynamicRiskSummary(
     failure_rate_sample_count: failureRateSampleCount,
     failure_rate_failure_count: failureRateFailureCount,
     failure_rate_downgrade: failureRateDowngrade,
+    failure_clusters: failureClusters,
+    gate_summary: gateSummary,
+    recovery_policy: recoveryPolicy,
     sampled_proposal_count: skillProposals.length,
-    window_hours: SKILL_EVOLUTION_DYNAMIC_RISK_WINDOW_HOURS,
+    window_hours: windowHours,
     newest_signal_at: newestSignalAt,
     cooldown_until: cooldownUntil,
     cooldown_active: cooldownActive,
@@ -991,10 +1137,37 @@ function buildSkillEvolutionEligibilitySummary(
     reasons.push("dynamic risk blocks auto-accept");
   }
   const eligible = reasons.length === 0;
+  const validationReady = validationSummary?.auto_accept_ready === true;
+  const sameInputReadiness = typeof validationSummary?.same_input_readiness === "string"
+    ? validationSummary.same_input_readiness
+    : null;
+  const state = eligible
+    ? "eligible"
+    : !validationSummary
+      ? "pending_validation"
+      : validationSummary.passed !== true
+        ? "validation_required"
+        : "blocked";
   return {
     eligible,
     action: eligible ? "auto_accept" : "manual_review",
     reasons: eligible ? ["auto-accept eligibility checks passed"] : reasons,
+    contract: {
+      state,
+      gates: {
+        proposal_status_validated: proposal.status === "validated",
+        validation_passed: validationSummary?.passed === true,
+        validation_auto_accept_ready: validationReady,
+        same_input_ready: sameInputReadiness === null || sameInputReadiness === "ready",
+        automation_not_blocked: automationBlock === null,
+        dynamic_risk_allows_auto_accept: dynamicRisk.auto_accept_blocked !== true,
+      },
+      required_action: eligible
+        ? "auto_accept"
+        : state === "pending_validation"
+          ? "run_validation"
+          : "manual_review",
+    },
   };
 }
 
@@ -1053,6 +1226,7 @@ function buildSkillEvolutionOpsItem(
     validate_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/validate`,
     accept_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/accept`,
     reject_url: `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}/reject`,
+    rollback_guide_url: record.status === "accepted" ? `/v1/skill-evolution/proposals/${encodeURIComponent(record.id)}` : null,
     candidate_path: getSkillEvolutionProposalCandidateRoot(record.id, config.skillEvolution.candidateDir),
   };
 }
@@ -1136,6 +1310,22 @@ function buildSkillEvolutionOpsSummary(config: OrchestratorConfig): Record<strin
     }
     return acc;
   }, {});
+  const filterOptions = {
+    skills: [...new Set(records.map((record) => record.skillId))].sort(),
+    statuses: [...new Set(records.map((record) => record.status))].sort(),
+    risk_tiers: [...new Set(records.map((record) => {
+      const tier = record.dynamic_risk.tier;
+      return typeof tier === "string" ? tier : "unknown";
+    }))].sort(),
+    queue_states: [...new Set(records.map((record) => {
+      const queueState = record.ops_summary.queue_state;
+      return typeof queueState === "string" ? queueState : "unknown";
+    }))].sort(),
+    next_actions: [...new Set(records.map((record) => {
+      const nextAction = record.ops_summary.next_action;
+      return typeof nextAction === "string" ? nextAction : "unknown";
+    }))].sort(),
+  };
   return {
     object: "skill_evolution_ops",
     generated_at: new Date().toISOString(),
@@ -1166,6 +1356,7 @@ function buildSkillEvolutionOpsSummary(config: OrchestratorConfig): Record<strin
       stuck_count: stuckCount,
       stuck_categories: stuckCategories,
     },
+    filters: filterOptions,
     proposal_queue: proposalQueue,
     accepted_history: acceptedHistory,
     rollback_guides: acceptedHistory.map((item) => item.rollback),
@@ -1208,6 +1399,11 @@ function buildSkillEvolutionValidationSummary(validation: {
   decision?: {
     reasonCode?: string;
     autoAcceptReady?: boolean;
+  };
+  resultTaxonomy?: {
+    category?: string;
+    reason?: string;
+    retryable?: boolean;
   };
   replay?: {
     runtimeBoundary?: {
@@ -1275,6 +1471,9 @@ function buildSkillEvolutionValidationSummary(validation: {
     passed: validation.passed,
     risk_tier: validation.risk?.tier ?? null,
     reason_code: validation.decision?.reasonCode ?? null,
+    result_category: validation.resultTaxonomy?.category ?? null,
+    result_reason: validation.resultTaxonomy?.reason ?? null,
+    result_retryable: validation.resultTaxonomy?.retryable ?? null,
     auto_accept_ready: validation.decision?.autoAcceptReady ?? false,
     replay_stability_score: validation.stability?.replayStabilityScore ?? null,
     replay_stability_level: validation.stability?.replayStabilityLevel ?? null,
@@ -1439,8 +1638,10 @@ async function runAutomaticSkillEvolutionForRecord(record: StoredJobRecord, conf
   const auditDynamicCeiling = isSkillEvolutionAutomationStage(auditDynamicRisk.automation_ceiling)
     ? auditDynamicRisk.automation_ceiling
     : "auto_validate";
+  const lowRiskPilotValidate = isLowRiskPilotSkill(auditedProposal.skillId, riskTier, config);
+  const autoValidateAllowedByConfig = config.skillEvolution.autoValidate || lowRiskPilotValidate;
   if (audit.passed
-    && config.skillEvolution.autoValidate
+    && autoValidateAllowedByConfig
     && config.skillEvolution.riskTiering.enabled
     && !isAutomationStageAllowedForCeiling(auditDynamicCeiling, "auto_validate")) {
     appendEvent(createLifecycleEvent({
@@ -1459,8 +1660,8 @@ async function runAutomaticSkillEvolutionForRecord(record: StoredJobRecord, conf
     return;
   }
 
-  if (!audit.passed || !config.skillEvolution.autoValidate || !isAutomationStageAllowedForTier(riskTier, "auto_validate", config)) {
-    if (audit.passed && config.skillEvolution.autoValidate && config.skillEvolution.riskTiering.enabled
+  if (!audit.passed || !autoValidateAllowedByConfig || !isAutomationStageAllowedForTier(riskTier, "auto_validate", config)) {
+    if (audit.passed && autoValidateAllowedByConfig && config.skillEvolution.riskTiering.enabled
       && !isAutomationStageAllowedForTier(riskTier, "auto_validate", config)) {
       appendEvent(createLifecycleEvent({
         jobId: reflection.jobId,
@@ -1474,6 +1675,25 @@ async function runAutomaticSkillEvolutionForRecord(record: StoredJobRecord, conf
           reflectionId: reflection.id,
           proposalId: auditedProposal.id,
         }),
+      }));
+    } else if (audit.passed && !autoValidateAllowedByConfig) {
+      appendEvent(createLifecycleEvent({
+        jobId: reflection.jobId,
+        seq: getNextSeq(reflection.jobId),
+        time: new Date().toISOString(),
+        type: "system.skill_evolution_automation_blocked",
+        title: "Skill evolution automation blocked",
+        summary: "Automatic skill evolution stopped before validation because auto_validate is disabled and this skill is not in the low-risk pilot allowlist.",
+        status: "blocked",
+        meta: {
+          skill_id: auditedProposal.skillId,
+          reflection_id: reflection.id,
+          proposal_id: auditedProposal.id,
+          risk_tier: riskTier,
+          blocked_stage: "auto_validate",
+          automation_ceiling: config.skillEvolution.riskTiering.automationCeilings[riskTier],
+          low_risk_pilot: false,
+        },
       }));
     }
     return;
@@ -2766,6 +2986,8 @@ function buildHealthResponse(
         enabled: config.skillEvolution.riskTiering.enabled,
         default_tier: config.skillEvolution.riskTiering.defaultTier,
         automation_ceilings: config.skillEvolution.riskTiering.automationCeilings,
+        dynamic_window_hours: config.skillEvolution.riskTiering.dynamicWindowHours,
+        low_risk_pilot_skills: config.skillEvolution.riskTiering.lowRiskPilotSkills,
       },
       proposal_count: skillEvolutionProposals.length,
       audit_failed_count: skillEvolutionProposals.filter((proposal) => proposal.status === "audit_failed").length,
@@ -3126,6 +3348,7 @@ async function handleListSkillEvolutionProposals(_req: IncomingMessage, res: Ser
   jsonResponse(res, 200, {
     object: "list",
     summary: isObjectRecord(ops.summary) ? ops.summary : {},
+    filters: isObjectRecord(ops.filters) ? ops.filters : {},
     data: proposals
       .map((proposal) => buildSkillEvolutionProposalControlPlaneRecord(proposal, config, proposals)),
   });
@@ -6410,7 +6633,9 @@ async function handleBrowserListJobs(req: IncomingMessage, res: ServerResponse):
 
 async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<CreateJobRequest>(req);
-  const goal = typeof body.goal === "string" ? body.goal.trim() : "";
+  const rawGoal = typeof body.goal === "string" ? body.goal.trim() : "";
+  const normalizedGoal = normalizeDaoRunGoal(rawGoal);
+  const goal = normalizedGoal.goal;
   if (!goal) {
     jsonResponse(res, 400, {
       error: {
@@ -6465,6 +6690,8 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
       job_id: fixedIds.jobId,
       status: record?.job.status ?? "running",
       accepted: true,
+      goal_sanitized: normalizedGoal.sanitized,
+      goal_sanitized_reason: normalizedGoal.reason,
       stream_url: `/v1/jobs/${fixedIds.jobId}/stream`,
       events_url: `/v1/jobs/${fixedIds.jobId}/events`,
       timeline_url: `/v1/jobs/${fixedIds.jobId}/timeline`,
@@ -6491,6 +6718,8 @@ async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promi
   jsonResponse(res, 201, {
     object: "job",
     job_id: result.job.id,
+    goal_sanitized: normalizedGoal.sanitized,
+    goal_sanitized_reason: normalizedGoal.reason,
     resolved_model: result.resolvedModel,
     log_path: result.logPath,
     workflow: buildWorkflowPayload(result),
@@ -8170,6 +8399,20 @@ function getPort(args: string[]): number {
   return Number.isFinite(explicitPort) && explicitPort > 0 ? explicitPort : 9898;
 }
 
+function parseDaoRunCliArgs(args: string[]): { goal: string; port: number } {
+  const portFlagIndex = args.findIndex((arg) => arg === "--port" || arg === "-p");
+  const port = portFlagIndex >= 0 && args[portFlagIndex + 1]
+    ? Number(args[portFlagIndex + 1])
+    : Number(process.env.PORT ?? "9898");
+  const goalArgs = portFlagIndex >= 0
+    ? args.filter((arg, index) => index !== portFlagIndex && index !== portFlagIndex + 1)
+    : args;
+  return {
+    goal: goalArgs.join(" ").trim(),
+    port: Number.isFinite(port) && port > 0 ? port : 9898,
+  };
+}
+
 function parseTeamCliArgs(args: string[]): { goal: string; planOnly: boolean } {
   const planOnly = args[0] === "plan" || args.includes("--plan-only");
   const goalArgs = args
@@ -8528,6 +8771,63 @@ function runDoctor(configPath?: string): void {
   console.log(JSON.stringify(buildDoctorReport(configPath), null, 2));
 }
 
+async function runDaoRunCli(goal: string, port = 9898): Promise<void> {
+  const trimmedGoal = goal.trim();
+  if (!trimmedGoal) {
+    throw new Error("Usage: node dist/index.js dao-run \"your task here\"");
+  }
+  const jobsUrl = `http://127.0.0.1:${port}/v1/jobs`;
+  let response: Response;
+  try {
+    response = await fetch(jobsUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${getServerApiKey()}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        goal: trimmedGoal,
+        mode: "task",
+        policy: {
+          async: true,
+        },
+      }),
+    });
+  } catch (error) {
+    // Service unreachable (e.g. ECONNREFUSED surfaces as "fetch failed"). Emit actionable
+    // guidance on stdout so the caller never mistakes a down service for a completed job,
+    // then fail loudly so the exit code is non-zero.
+    const detail = error instanceof Error ? error.message : String(error);
+    console.log([
+      "## DAO Run Blocked",
+      "",
+      "- **Route**: service_job (NOT started)",
+      `- **Reason**: DAO service is not reachable at ${jobsUrl} (${detail}).`,
+      "- **Action**: Start the service with `npm run serve:restart:9898`, then re-run this command.",
+      "- **Do not** answer the task locally, fabricate a job id, or edit repository files.",
+    ].join("\n"));
+    throw new Error(`DAO service not reachable at http://127.0.0.1:${port}. Start it with: npm run serve:restart:9898`);
+  }
+  const payload = await response.json() as {
+    job_id?: string;
+    status?: string;
+    timeline_url?: string;
+    error?: { message?: string };
+  };
+  if (!response.ok || !payload.job_id) {
+    throw new Error(payload.error?.message ?? `DAO service returned HTTP ${response.status}`);
+  }
+  console.log([
+    "## DAO Run Summary",
+    "",
+    "- **Route**: service_job",
+    `- **Job**: ${payload.job_id}`,
+    `- **Timeline**: http://127.0.0.1:${port}${payload.timeline_url ?? `/v1/jobs/${payload.job_id}/timeline`}`,
+    `- **Status**: ${payload.status ?? "running"}`,
+    "- **CTA**: Open the timeline URL.",
+  ].join("\n"));
+}
+
 async function runCliTask(task: string): Promise<void> {
   const baseConfig = loadConfig();
   const healthSelection = await buildHealthyExecutorRuntimeConfig(baseConfig);
@@ -8647,6 +8947,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "dao-run") {
+    const parsed = parseDaoRunCliArgs(args.slice(1));
+    await runDaoRunCli(parsed.goal, parsed.port);
+    return;
+  }
+
   if (args[0] === "team") {
     const { goal, planOnly } = parseTeamCliArgs(args.slice(1));
     if (!goal) {
@@ -8668,6 +8974,7 @@ const entryHref = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === entryHref) {
   main().catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   });
 }
 
