@@ -49,10 +49,20 @@ function Wait-ForHealth([string]$Url, [int]$TimeoutSeconds) {
   return $false
 }
 
+# Build synchronously first. The previous version launched `npm run serve` (which runs tsc)
+# inside the detached process, so the 30s health-wait below raced against the build and threw
+# a false "not healthy" error even when the server later came up fine. Building here means the
+# wait only covers server boot, and a failed build never takes down the running listener.
+Write-Host "Building (tsc) before restart..."
+& npm run build
+if ($LASTEXITCODE -ne 0) {
+  throw "Build failed (tsc exit code $LASTEXITCODE). Leaving any existing serve process untouched."
+}
+
 Stop-PortProcess -TargetPort $port
 
 Start-Process cmd.exe `
-  -ArgumentList '/c', 'npm run serve > runtime\serve.log 2>&1' `
+  -ArgumentList '/c', 'node --enable-source-maps dist/index.js serve > runtime\serve.log 2>&1' `
   -WorkingDirectory $workspace `
   -WindowStyle Hidden
 

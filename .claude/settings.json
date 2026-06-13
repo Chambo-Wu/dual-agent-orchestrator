@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "script": ".claude/hooks/protect-claude-md-during-dao-run.js",
+        "description": "Prevent CLAUDE.md from being overwritten during dao-run/dao-exec execution"
+      }
+    ]
+  }
+}
