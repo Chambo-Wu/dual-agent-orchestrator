@@ -48,10 +48,11 @@ The repository also includes a Claude Code-native orchestration layer for local 
 
 - `CLAUDE.md`: project-level routing and orchestration guidance
 - `.claude/agents/`: planner, coder, researcher, writer, and verifier subagent definitions
-- `.claude/commands/`: workflow commands such as `/build-feature`, `/research-and-report`, `/verify-quality`, and `/orchestrator-demo`
+- `.claude/commands/`: workflow commands such as `/dao-run`, `/build-feature`, `/research-and-report`, `/verify-quality`, and `/orchestrator-demo`
 - `SHARED_TASK_NOTES.template.md`: template for task notes copied into `runtime/agentic-os/tasks/`
 
 This layer complements the service runtime. Use it for interactive Claude Code workflows; use the HTTP job control plane when you need durable async jobs, dashboard/timeline observability, or API integrations.
+Use `/dao-run <task>` when you want Claude Code to preserve the original Dual Agent Orchestrator large-flow route and choose between native subagents, service jobs, MCP service jobs, or a hybrid flow.
 
 ## Current Status
 

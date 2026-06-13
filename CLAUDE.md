@@ -55,6 +55,28 @@ Complex Task:
 
 ## Workflow Execution Pattern
 
+### DAO Route Contract
+
+When a user asks to preserve the original Dual Agent Orchestrator large-flow behavior, use `/dao-run` semantics:
+
+| Route | Use When | Source of Truth |
+| --- | --- | --- |
+| `native` | Short, local, synchronous tasks that do not need durable replay. | Claude Code conversation + task note |
+| `service_job` | Long-running, multi-step, resumable, or dashboard/timeline-visible tasks. | Dual Agent Orchestrator `/v1/jobs` record |
+| `mcp_service_job` | Dual Agent Orchestrator MCP workflow tools are configured. | MCP job/status/event tools |
+| `hybrid` | Claude Code should inspect/edit locally while the service owns durable orchestration. | Task note + service job |
+
+Default to `service_job` for complex tasks when `http://127.0.0.1:9898/health` is reachable.
+Do not collapse durable workflow requests into a plain Q&A response.
+
+For every `/dao-run` style task:
+
+1. Create a task note from `SHARED_TASK_NOTES.template.md` under `runtime/agentic-os/tasks/`.
+2. Record route, status, acceptance criteria, artifacts, verification, and CTA.
+3. If a service job is used, record `job_id`, `events_url`, `stream_url`, and `timeline_url`.
+4. Prefer the service timeline/dashboard for observability and recovery.
+5. Use native subagents inside small local phases when that improves implementation quality.
+
 ### Phase 1: Planning (if complex)
 
 Spawn @planner with:

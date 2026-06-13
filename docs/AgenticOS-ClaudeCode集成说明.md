@@ -41,6 +41,7 @@ User → Claude Code Kernel → Task Decomposition → Parallel Subagents → Sy
 ### 3. Commands (`.claude/commands/`)
 | Command | 用途 |
 |---------|------|
+| `/dao-run` | 保持原 Dual Agent Orchestrator 大流程语义，自动选择 native / service job / MCP 路由 |
 | `/build-feature` | 构建完整功能（实现+测试+文档） |
 | `/research-and-report` | 深度研究并生成报告 |
 | `/verify-quality` | 综合质量验证 |
@@ -73,10 +74,26 @@ User: "构建一个带测试和文档的新 API 端点"
 
 ### 使用 Commands
 ```
+/dao-run 构建一个可恢复、可观测的后台任务
 /build-feature 添加用户资料页面，支持头像上传
 /research-and-report 比较 React 状态管理方案
 /verify-quality src/auth/
 ```
+
+### `/dao-run` 路由策略
+
+`/dao-run` 是 Claude Code 中恢复原 Dual Agent Orchestrator 大流程的主入口。它先判断任务应该走哪条路线：
+
+| 路由 | 适用场景 | 状态来源 |
+|------|----------|----------|
+| `native` | 短小、本地、同步完成，不需要恢复或 timeline | Claude Code subagents + task note |
+| `service_job` | 长任务、多步骤、需要 dashboard / timeline / replay / recovery | `/v1/jobs` 持久化 job |
+| `mcp_service_job` | 已配置 Dual Agent Orchestrator MCP 工具 | MCP job/status/event 工具 |
+| `hybrid` | Claude Code 负责局部读写和验证，服务负责持久化大流程 | task note + service job |
+
+复杂任务默认优先尝试 `service_job`，本地服务默认地址为 `http://127.0.0.1:9898`。如果服务不可达，再退回 `native`，并在 task note 中记录降级原因。
+
+每次 `/dao-run` 都必须创建 `runtime/agentic-os/tasks/<task-id>.md`，记录 route、status、job_id、timeline_url、acceptance criteria、artifacts、verification 和 CTA。
 
 ## 执行流程示例
 
