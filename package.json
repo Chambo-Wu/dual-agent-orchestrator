@@ -19,11 +19,16 @@
     "test:proposal-generator": "node --import tsx --test test/unit/skill-evolver.test.ts",
     "test:integration": "node --import tsx --test test/integration/**/*.test.ts",
     "test:integration:one": "node scripts/run-isolated-test.mjs",
-    "test:skill-evolution-v2": "node scripts/run-isolated-test.mjs --pattern \"proposal generator v2 fixtures|skill evolution auto pipeline can opt into deterministic runtime replay validation|skill evolution low-risk pilot can auto-validate without enabling global auto_validate|skill evolution ops exposes dynamic risk downgrade and eligibility reasons|skill evolution proposal audit endpoint fails a risky draft proposal\" test/unit/skill-evolver.test.ts test/integration/observability.api.test.ts",
+    "test:skill-evolution-v2": "node scripts/run-isolated-test.mjs --pattern \"proposal generator v2 fixtures|skill evolution auto pipeline can opt into deterministic runtime replay validation|skill evolution low-risk pilot can auto-validate without enabling global auto_validate|skill evolution ops exposes dynamic risk downgrade and eligibility reasons|skill evolution proposal audit endpoint fails a risky draft proposal\" test/unit/skill-evolver.test.ts test/integration/observability.skill-evolution-auto.test.ts test/integration/observability.skill-evolution-endpoints.test.ts",
     "test:e2e-lite": "node --import tsx --test test/e2e-lite/**/*.test.ts",
-    "test:regression": "node --import tsx test/regression.ts"
+    "test:regression": "node --import tsx test/regression.ts",
+    "lint": "biome check src/ test/",
+    "lint:fix": "biome check --write src/ test/",
+    "format": "biome format --write src/ test/",
+    "format:check": "biome format src/ test/"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.0",
     "@types/node": "^22.15.21",
     "electron": "^42.3.0",
     "tsx": "^4.21.0",

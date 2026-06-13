@@ -72,15 +72,16 @@ Agent 层：  Claude Code CLI 入口（/dao-run、/dao-exec）
 ## 架构一览
 
 ```
-HTTP 层
-├── /v1/chat/completions    OpenAI 兼容聊天
-├── /v1/messages             Anthropic 风格聊天
-├── /v1/responses            OpenAI Responses API
-├── /v1/jobs/*               Job CRUD + 事件流 + Timeline
-├── /v1/goals/*              Goal CRUD + Dashboard
-├── /v1/skills/*             Skill 管理
-├── /v1/skill-evolution/*    Skill 自进化控制面
-└── /health, /jobs/dashboard  运维面板
+src/index.ts (5586行 — 路由装配 + 核心执行)
+└── src/server/
+    ├── shared.ts                  共享 HTTP 工具
+    ├── skill-evolution-routes.ts  Skill Evolution API (13 handler)
+    ├── goal-routes.ts             Goal CRUD (11 handler)
+    ├── job-routes.ts              Job CRUD + Stream (17 handler)
+    └── chat-routes.ts             Chat/Responses/Messages (3 handler)
+└── src/cli/
+    ├── entry.ts                   CLI 入口
+    └── doctor.ts                  配置诊断
 
 执行引擎
 ├── src/orchestrator.ts       Planner/Executor 主循环
@@ -135,6 +136,7 @@ node dist/index.js "写一个 markdown 文件 notes/plan.md，列出三个优化
 | 2026-05-30 | Runtime Replay 确定验证 |
 | 2026-06-13 | dao-run 鲁棒性 + Electron 桌面端 + 审计分层 |
 | 2026-06-13b | 代码库优化：index.ts 模块化、crossFileConsistency 精度、审计匹配改进、文档清理 |
+| 2026-06-13c | 架构拆分：路由层四模块化（Skill Evolution/Goal/Job/Chat routes），index.ts 7531→5586行 |
 
 ---
 

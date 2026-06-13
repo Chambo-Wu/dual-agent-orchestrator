@@ -76,6 +76,63 @@ import {
 
 import { main, parseTeamCliArgs } from "./cli/entry.js";
 import { buildDoctorReport } from "./cli/doctor.js";
+import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody, responseAlreadyStarted } from "./server/shared.js";
+import {
+  handleListSkills,
+  handleInstallSkill,
+  handleListSkillReflections,
+  buildSkillReflectionFromRecord,
+  buildSkillEvolutionProposal,
+  handleCreateSkillReflection,
+  handleCreateSkillProposal,
+  handleListSkillEvolutionProposals,
+  handleSkillEvolutionOps,
+  handleSkillEvolutionOpsDashboard,
+  handleBrowserSkillEvolutionOpsData,
+  handleGetSkillEvolutionProposal,
+  handleCreateSkillEvolutionProposal,
+  handleAuditSkillEvolutionProposal,
+  handleValidateSkillEvolutionProposal,
+  handleSkillEvolutionDecision,
+} from "./server/skill-evolution-routes.js";
+import {
+  handleListGoals,
+  handleCreateGoal,
+  handleGoalEvents,
+  handleGetGoal,
+  handleRunNextGoal,
+  handleRetryGoal,
+  handleResumeGoal,
+  handleReviewGoal,
+  handleGoalsDashboard,
+  handleBrowserListGoals,
+  handleGoalTimeline,
+  buildListedGoalsResponse,
+} from "./server/goal-routes.js";
+import {
+  handleModels,
+  handleHealth,
+  handleListJobs,
+  handleJobsDashboard,
+  handleBrowserListJobs,
+  handleCreateJob,
+  handleGetJob,
+  handleGetJobArtifacts,
+  handleGetJobSteps,
+  handleGetJobRuntimeProfile,
+  handleGetJobEvents,
+  handleJobStream,
+  handleCancelJob,
+  handleRetryJob,
+  handleJobTimeline,
+  handleApproveJob,
+  handleResumeJob,
+} from "./server/job-routes.js";
+import {
+  handleChatCompletions,
+  handleResponses,
+  handleAnthropicMessages,
+} from "./server/chat-routes.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
@@ -86,10 +143,6 @@ const MAX_TOOL_RESULT_CHARS = 2000;
 const MAX_TOOL_MODE_ROUNDS = 4;
 const MAX_TOOL_CONTEXT_CHARS = 1200;
 let configOverrideForTests: OrchestratorConfig | null = null;
-
-function getRuntimeConfig(): OrchestratorConfig {
-  return configOverrideForTests ?? loadConfig();
-}
 
 type PlannerCircuitState = {
   consecutiveFailures: number;
@@ -163,7 +216,7 @@ function extractTaggedValue(input: string, tagName: string): string | undefined 
   return typeof match?.[1] === "string" && match[1].trim() ? match[1].trim() : undefined;
 }
 
-function normalizeDaoRunGoal(rawGoal: string): { goal: string; sanitized: boolean; reason?: string } {
+export function normalizeDaoRunGoal(rawGoal: string): { goal: string; sanitized: boolean; reason?: string } {
   const trimmed = rawGoal.trim();
   const commandName = extractTaggedValue(trimmed, "command-name")?.replace(/^\//, "");
   const commandArgs = extractTaggedValue(trimmed, "command-args");
@@ -285,7 +338,7 @@ function inferSkillInstallStatus(
   return undefined;
 }
 
-function resolveSelectedSkillSummary(
+export function resolveSelectedSkillSummary(
   record: StoredJobRecord,
   events?: WorkflowUiEvent[],
 ): SelectedSkillSummary | null {
@@ -360,7 +413,7 @@ function resolveCandidateSkillsSummary(
   return raw.filter(isCandidateSkillSummary);
 }
 
-function resolveSkillVerificationSummary(record: StoredJobRecord): Record<string, unknown> | null {
+export function resolveSkillVerificationSummary(record: StoredJobRecord): Record<string, unknown> | null {
   const skillVerifyTaskRun = [...record.taskRuns].reverse().find((taskRun) => taskRun.id.endsWith("__skill_verify"));
   if (!skillVerifyTaskRun) {
     return null;
@@ -526,7 +579,7 @@ export function resolveTeamAgents(config: OrchestratorConfig, envValue = process
   return [{ name: "planner", role: "planning and coordination" }, { name: "executor", role: "task execution" }];
 }
 
-function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): string {
+export function persistWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): string {
   ensureRuntimeDirectories();
   return persistJobRecord({
     job: payload.job,
@@ -2137,7 +2190,7 @@ export function getExposedModels(config: OrchestratorConfig): ExposedModel[] {
   }
 }
 
-function resolveRequestedModel(config: OrchestratorConfig, requestedModel: string | undefined): { exposed: ExposedModel; resolvedConfig: OrchestratorConfig } {
+export function resolveRequestedModel(config: OrchestratorConfig, requestedModel: string | undefined): { exposed: ExposedModel; resolvedConfig: OrchestratorConfig } {
   const exposedModels = getExposedModels(config);
   const exposed = exposedModels.find((item) => item.id === requestedModel) || exposedModels[0];
   const resolvedPlanner = {
@@ -2189,48 +2242,8 @@ function resolveRequestedModel(config: OrchestratorConfig, requestedModel: strin
   };
 }
 
-function jsonResponse(res: ServerResponse, statusCode: number, payload: unknown): void {
-  if (responseAlreadyStarted(res)) {
-    return;
-  }
-  res.statusCode = statusCode;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(payload));
-}
 
-function responseAlreadyStarted(res: ServerResponse): boolean {
-  const state = res as ServerResponse & { headersSent?: boolean; writableEnded?: boolean };
-  return state.headersSent === true || state.writableEnded === true;
-}
-
-function jsonErrorResponse(
-  res: ServerResponse,
-  statusCode: number,
-  message: string,
-  type: string,
-  classification?: {
-    status?: string;
-    error?: string;
-    summary?: string;
-  },
-  extras?: Record<string, unknown>,
-): void {
-  jsonResponse(res, statusCode, {
-    error: {
-      message,
-      type,
-      failure_category: classifyFailure({
-        type,
-        status: classification?.status,
-        error: classification?.error ?? message,
-        summary: classification?.summary ?? message,
-      }),
-      ...(extras ?? {}),
-    },
-  });
-}
-
-function parseNonNegativeIntegerParam(
+export function parseNonNegativeIntegerParam(
   value: string | null | undefined,
   name: string,
 ): { ok: true; value: number | undefined } | { ok: false; message: string } {
@@ -2255,7 +2268,7 @@ type JobEventQuery = {
   taskRunId?: string;
 };
 
-function readJobEventQuery(url: URL): JobEventQuery {
+export function readJobEventQuery(url: URL): JobEventQuery {
   const read = (name: string): string | undefined => {
     const value = url.searchParams.get(name)?.trim();
     return value ? value : undefined;
@@ -2277,7 +2290,7 @@ function eventMatchesQuery(event: WorkflowUiEvent, query: JobEventQuery): boolea
     && (!query.taskRunId || event.taskRunId === query.taskRunId);
 }
 
-function parseStringSetParam(url: URL, name: string): Set<string> {
+export function parseStringSetParam(url: URL, name: string): Set<string> {
   const values = url.searchParams.getAll(name)
     .flatMap((value) => value.split(","))
     .map((value) => value.trim())
@@ -2285,7 +2298,7 @@ function parseStringSetParam(url: URL, name: string): Set<string> {
   return new Set(values);
 }
 
-function filterJobEvents(
+export function filterJobEvents(
   events: WorkflowUiEvent[],
   filters: {
     types?: Set<string>;
@@ -2386,7 +2399,7 @@ function serviceUnavailableResponse(res: ServerResponse, message: string, retryA
   }));
 }
 
-function getHeaderValue(req: IncomingMessage, name: string): string {
+export function getHeaderValue(req: IncomingMessage, name: string): string {
   const raw = req.headers[name.toLowerCase()];
   if (Array.isArray(raw)) {
     return raw[0] ?? "";
@@ -2398,7 +2411,7 @@ function isTruthyFlag(value: string | undefined): boolean {
   return typeof value === "string" && /^(1|true|yes|on)$/i.test(value.trim());
 }
 
-function shouldIncludeWorkflowEvents(req: IncomingMessage, requested?: boolean): boolean {
+export function shouldIncludeWorkflowEvents(req: IncomingMessage, requested?: boolean): boolean {
   if (requested === true) {
     return true;
   }
@@ -2406,11 +2419,11 @@ function shouldIncludeWorkflowEvents(req: IncomingMessage, requested?: boolean):
     || isTruthyFlag(getHeaderValue(req, "x-workflow-events"));
 }
 
-function shouldMirrorProgressToContent(requested?: boolean): boolean {
+export function shouldMirrorProgressToContent(requested?: boolean): boolean {
   return requested !== false;
 }
 
-function isAuthorized(req: IncomingMessage): boolean {
+export function isAuthorized(req: IncomingMessage): boolean {
   const expectedKey = getServerApiKey();
   const authHeader = getHeaderValue(req, "authorization");
   const xApiKey = getHeaderValue(req, "x-api-key");
@@ -2418,7 +2431,7 @@ function isAuthorized(req: IncomingMessage): boolean {
   return bearer === expectedKey || xApiKey.trim() === expectedKey;
 }
 
-function unauthorizedResponse(res: ServerResponse): void {
+export function unauthorizedResponse(res: ServerResponse): void {
   jsonResponse(res, 401, {
     error: {
       message: "Unauthorized. Provide Authorization: Bearer <api_key> or X-API-Key.",
@@ -2427,7 +2440,7 @@ function unauthorizedResponse(res: ServerResponse): void {
   });
 }
 
-function getMessageText(message: OpenAIMessage): string {
+export function getMessageText(message: OpenAIMessage): string {
   if (typeof message.content === "string") {
     return message.content;
   }
@@ -2441,7 +2454,7 @@ function getMessageText(message: OpenAIMessage): string {
   return "";
 }
 
-function getAnthropicContentText(content: string | AnthropicContentBlock[] | undefined): string {
+export function getAnthropicContentText(content: string | AnthropicContentBlock[] | undefined): string {
   if (typeof content === "string") {
     return content;
   }
@@ -2474,7 +2487,7 @@ function extractWorkingDirectoryHint(text: string): string {
   return "";
 }
 
-function truncateToolResultContent(content: string): string {
+export function truncateToolResultContent(content: string): string {
   const normalized = content.trim();
   if (normalized.length <= MAX_TOOL_RESULT_CHARS) {
     return normalized;
@@ -2501,14 +2514,14 @@ export function summarizeToolResultContent(content: string): string {
     : compressToolOutput(normalized, MAX_TOOL_CONTEXT_CHARS);
 }
 
-function normalizeChatMessages(messages: OpenAIMessage[]): OpenAIMessage[] {
+export function normalizeChatMessages(messages: OpenAIMessage[]): OpenAIMessage[] {
   return messages.map((message) => ({
     role: message.role || "user",
     content: getMessageText(message),
   }));
 }
 
-function normalizeResponsesInput(input: string | ResponseInputItem[] | undefined, instructions?: string): OpenAIMessage[] {
+export function normalizeResponsesInput(input: string | ResponseInputItem[] | undefined, instructions?: string): OpenAIMessage[] {
   const messages: OpenAIMessage[] = [];
   if (typeof instructions === "string" && instructions.trim()) {
     messages.push({ role: "system", content: instructions.trim() });
@@ -2534,7 +2547,7 @@ function normalizeResponsesInput(input: string | ResponseInputItem[] | undefined
   return messages;
 }
 
-function normalizeAnthropicMessages(messages: AnthropicMessage[] | undefined, system?: string | AnthropicContentBlock[]): OpenAIMessage[] {
+export function normalizeAnthropicMessages(messages: AnthropicMessage[] | undefined, system?: string | AnthropicContentBlock[]): OpenAIMessage[] {
   const normalized: OpenAIMessage[] = [];
   const systemText = getAnthropicContentText(system);
   if (systemText) {
@@ -2549,7 +2562,7 @@ function normalizeAnthropicMessages(messages: AnthropicMessage[] | undefined, sy
   return normalized;
 }
 
-function normalizeAnthropicToolMessages(messages: AnthropicMessage[] | undefined, system?: string | AnthropicContentBlock[]): ChatMessage[] {
+export function normalizeAnthropicToolMessages(messages: AnthropicMessage[] | undefined, system?: string | AnthropicContentBlock[]): ChatMessage[] {
   const normalized: ChatMessage[] = [];
   const systemText = getAnthropicContentText(system);
   if (systemText) {
@@ -2624,7 +2637,7 @@ function normalizeAnthropicToolMessages(messages: AnthropicMessage[] | undefined
   return normalized;
 }
 
-function safeParseToolInput(argumentsText: string | undefined): Record<string, unknown> {
+export function safeParseToolInput(argumentsText: string | undefined): Record<string, unknown> {
   if (typeof argumentsText !== "string" || !argumentsText.trim()) {
     return {};
   }
@@ -2636,11 +2649,11 @@ function safeParseToolInput(argumentsText: string | undefined): Record<string, u
   }
 }
 
-function isSuccessfulNativeToolResult(content: string): boolean {
+export function isSuccessfulNativeToolResult(content: string): boolean {
   return /"ok"\s*:\s*true/i.test(content) || /"summary"\s*:\s*"Wrote file/i.test(content) || /"summary"\s*:\s*"Read file/i.test(content);
 }
 
-function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | undefined): boolean {
+export function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | undefined): boolean {
   if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
@@ -2650,7 +2663,7 @@ function extractLatestOpenAIWriteToolCompletion(messages: OpenAIMessage[] | unde
   return isSuccessfulNativeToolResult(getMessageText(lastMessage));
 }
 
-function extractLatestAnthropicWriteToolCompletion(messages: AnthropicMessage[] | undefined): boolean {
+export function extractLatestAnthropicWriteToolCompletion(messages: AnthropicMessage[] | undefined): boolean {
   if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
@@ -2668,7 +2681,7 @@ function extractLatestAnthropicWriteToolCompletion(messages: AnthropicMessage[] 
   return isSuccessfulNativeToolResult(content);
 }
 
-function extractLatestOpenAIResearchReadCompletion(messages: OpenAIMessage[] | undefined): boolean {
+export function extractLatestOpenAIResearchReadCompletion(messages: OpenAIMessage[] | undefined): boolean {
   if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
@@ -2678,7 +2691,7 @@ function extractLatestOpenAIResearchReadCompletion(messages: OpenAIMessage[] | u
   return isSuccessfulNativeToolResult(getMessageText(lastMessage));
 }
 
-function extractLatestAnthropicResearchReadCompletion(messages: AnthropicMessage[] | undefined): boolean {
+export function extractLatestAnthropicResearchReadCompletion(messages: AnthropicMessage[] | undefined): boolean {
   if (!Array.isArray(messages) || messages.length < 2) return false;
   const lastMessage = messages[messages.length - 1];
   const previousMessage = messages[messages.length - 2];
@@ -2696,7 +2709,7 @@ function extractLatestAnthropicResearchReadCompletion(messages: AnthropicMessage
   return isSuccessfulNativeToolResult(content);
 }
 
-function countToolModeRounds(messages: ChatMessage[]): number {
+export function countToolModeRounds(messages: ChatMessage[]): number {
   return messages.filter((message) => message.role === "assistant" && message.tool_calls && message.tool_calls.length > 0).length;
 }
 
@@ -2711,7 +2724,7 @@ export function shouldForceTextResponseForToolMessage(message: ChatMessage | und
     || content.length > MAX_TOOL_CONTEXT_CHARS;
 }
 
-function buildUserGoal(messages: OpenAIMessage[]): string {
+export function buildUserGoal(messages: OpenAIMessage[]): string {
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
   const systemContext = messages
     .filter((message) => message.role === "system")
@@ -2734,7 +2747,7 @@ function buildUserGoal(messages: OpenAIMessage[]): string {
     .trim();
 }
 
-function isClaudeControlMessage(goal: string): boolean {
+export function isClaudeControlMessage(goal: string): boolean {
   const trimmed = goal.trim();
   return trimmed === "/init"
     || trimmed.startsWith("/init ")
@@ -2743,7 +2756,7 @@ function isClaudeControlMessage(goal: string): boolean {
     || /^\[SUGGESTION MODE:/i.test(trimmed);
 }
 
-function hasAnthropicToolHistory(messages: AnthropicMessage[] | undefined): boolean {
+export function hasAnthropicToolHistory(messages: AnthropicMessage[] | undefined): boolean {
   for (const message of messages || []) {
     const content = message.content;
     if (!Array.isArray(content)) {
@@ -2756,7 +2769,7 @@ function hasAnthropicToolHistory(messages: AnthropicMessage[] | undefined): bool
   return false;
 }
 
-function buildClaudeControlResponse(goal: string): TaskExecutionPayload | null {
+export function buildClaudeControlResponse(goal: string): TaskExecutionPayload | null {
   const trimmed = goal.trim();
   if (!isClaudeControlMessage(trimmed)) {
     return null;
@@ -2809,7 +2822,7 @@ function buildClaudeControlResponse(goal: string): TaskExecutionPayload | null {
   };
 }
 
-function splitContentForStreaming(content: string): string[] {
+export function splitContentForStreaming(content: string): string[] {
   if (!content.trim()) {
     return [];
   }
@@ -2831,38 +2844,13 @@ function splitContentForStreaming(content: string): string[] {
   return [normalized];
 }
 
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
+export function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
 
-function readJsonBody<T>(req: IncomingMessage): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    let raw = "";
-    let totalBytes = 0;
-    const decoder = new TextDecoder();
-    req.on("data", (chunk) => {
-      const str = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-      totalBytes += Buffer.byteLength(str);
-      if (totalBytes > MAX_BODY_BYTES) {
-        reject(new Error("Request body exceeds maximum size of 10MB."));
-        return;
-      }
-      raw += str;
-    });
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(raw) as T);
-      } catch (error) {
-        reject(new Error("Invalid JSON in request body."));
-      }
-    });
-    req.on("error", reject);
-  });
-}
-
-function buildModelsResponse(config = loadConfig()): unknown {
+export function buildModelsResponse(config = loadConfig()): unknown {
   return {
     object: "list",
     data: getExposedModels(config).map((model) => ({
@@ -2880,7 +2868,7 @@ function buildModelsResponse(config = loadConfig()): unknown {
   };
 }
 
-function buildHealthResponse(
+export function buildHealthResponse(
   config = loadConfig(),
   executorHealthResults?: ModelHealthResult[],
 ): HealthResponse {
@@ -3002,678 +2990,8 @@ function buildHealthResponse(
   };
 }
 
-function buildSkillListResponse(config = loadConfig()): Record<string, unknown> {
-  const available = listAvailableSkills(config);
-  return {
-    object: "list",
-    data: available.map((skill) => {
-      const installedRecord = getInstalledSkillRecord(config, skill.id);
-      const runtimeInstalled = listInstalledSkills(config).find((entry) => entry.id === skill.id);
-      return {
-        skill_id: skill.id,
-        version: skill.version,
-        title: skill.title,
-        description: skill.description,
-        intents: skill.intents,
-        source: skill.install.source,
-        install_status: installedRecord
-          ? "installed"
-          : runtimeInstalled
-            ? "builtin_available"
-            : "available",
-        auto_install_eligible: config.skills.enabled
-          && config.skills.autoInstall
-          && config.skills.allowSources.includes(skill.install.source),
-        explicit_install: Boolean(installedRecord),
-        location: runtimeInstalled?.location ?? skill.install.location,
-      };
-    }),
-  };
-}
 
-async function handleListSkills(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  jsonResponse(res, 200, buildSkillListResponse(config));
-}
-
-async function handleInstallSkill(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<{ skill_id?: string }>(req);
-  const skillId = typeof body.skill_id === "string" ? body.skill_id.trim() : "";
-  if (!skillId) {
-    throw new Error("`skill_id` must be a non-empty string.");
-  }
-  const config = getRuntimeConfig();
-  const result = installSkillById(config, skillId);
-  const statusCode = result.status === "installed" || result.status === "already_installed"
-    ? 200
-    : result.status === "blocked" || result.status === "unavailable"
-      ? 409
-      : 400;
-  jsonResponse(res, statusCode, {
-    skill_id: result.skillId,
-    status: result.status,
-    reason: result.reason,
-    source: result.source ?? null,
-    location: result.location ?? result.record?.location ?? null,
-    record: result.record ?? null,
-  });
-}
-
-function buildSkillReflectionsResponse(skillId: string, candidateDir: string, limit?: number): Record<string, unknown> {
-  const records = listSkillReflectionRecords(skillId, candidateDir);
-  const data = Number.isFinite(limit) && (limit as number) >= 0
-    ? records.slice(0, limit as number)
-    : records;
-  return {
-    object: "list",
-    skill_id: skillId,
-    count: data.length,
-    data,
-  };
-}
-
-async function handleListSkillReflections(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  if (!getSkillManifest(skillId, config)) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill not found: ${skillId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  const url = new URL(req.url ?? "/", "http://127.0.0.1");
-  const limitRaw = url.searchParams.get("limit");
-  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : undefined;
-  jsonResponse(res, 200, buildSkillReflectionsResponse(skillId, config.skillEvolution.candidateDir, limit));
-}
-
-function buildSkillReflectionFromRecord(record: StoredJobRecord): ReturnType<typeof buildSkillReflectionRecord> {
-  const events = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
-  const selectedSkill = resolveSelectedSkillSummary(record, events);
-  const skillVerification = resolveSkillVerificationSummary(record);
-  const skillOutcome = buildSkillOutcomeSummary(record, events, selectedSkill, skillVerification);
-  return buildSkillReflectionRecord(skillOutcome, {
-    record,
-    events,
-  });
-}
-
-function findLatestSkillJobRecord(skillId: string): StoredJobRecord | null {
-  for (const stored of listStoredJobs()) {
-    const record = readJobRecord(stored.id);
-    if (!record) {
-      continue;
-    }
-    const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
-    if (selectedSkillId === skillId) {
-      return record;
-    }
-  }
-  return null;
-}
-
-function findLatestSkillReflectionRecord(skillId: string, candidateDir: string): SkillReflectionRecord | null {
-  return listSkillReflectionRecords(skillId, candidateDir)[0] ?? null;
-}
-
-function findReflectionForProposalCreate(
-  config: OrchestratorConfig,
-  input: { skillId?: string; reflectionId?: string },
-): SkillReflectionRecord | null {
-  const requestedSkillId = input.skillId?.trim() ?? "";
-  const requestedReflectionId = input.reflectionId?.trim() ?? "";
-  if (requestedSkillId && requestedReflectionId) {
-    return readSkillReflectionRecord(requestedSkillId, requestedReflectionId, config.skillEvolution.candidateDir);
-  }
-  if (requestedReflectionId) {
-    for (const skill of listAvailableSkills(config)) {
-      const reflection = readSkillReflectionRecord(skill.id, requestedReflectionId, config.skillEvolution.candidateDir);
-      if (reflection) {
-        return reflection;
-      }
-    }
-    return null;
-  }
-  if (requestedSkillId) {
-    return findLatestSkillReflectionRecord(requestedSkillId, config.skillEvolution.candidateDir);
-  }
-  return null;
-}
-
-function appendBulletToMarkdownSection(markdown: string, heading: string, bullet: string): string {
-  const headingPattern = new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "im");
-  const lines = markdown.split(/\r?\n/);
-  const headingIndex = lines.findIndex((line) => new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i").test(line.trim()));
-  if (headingIndex === -1) {
-    return `${markdown.trimEnd()}\n\n## ${heading}\n${bullet}\n`;
-  }
-  let insertIndex = lines.length;
-  for (let index = headingIndex + 1; index < lines.length; index += 1) {
-    if (/^##\s+/.test(lines[index] ?? "")) {
-      insertIndex = index;
-      break;
-    }
-  }
-  lines.splice(insertIndex, 0, bullet);
-  const next = lines.join("\n");
-  return headingPattern.test(next) ? next : `${next.trimEnd()}\n`;
-}
-
-function buildStructuredSkillMarkdown(
-  reflection: SkillReflectionRecord,
-  existingMarkdown: string | null,
-  skillId: string,
-): string {
-  const title = skillId;
-  const coreBullet = reflection.recommendedAction === "patch_verification"
-    ? `- Clarify the verification-critical steps for the ${reflection.reflectionKind} scenario: ${reflection.reason}`
-    : `- Refine the core procedure for the ${reflection.reflectionKind} scenario: ${reflection.reason}`;
-  const appendixBullet = `- Auto-evolve note (${reflection.reflectionKind}): ${reflection.reason}`;
-
-  const template = [
-    `# Skill: ${title}`,
-    "",
-    "## Core Procedure",
-    "- Start from the most relevant repository evidence before taking downstream action.",
-    "",
-    "## Scenario Extensions",
-    "- Add scenario-specific guidance here when repeated runs expose a reusable pattern.",
-    "",
-    "## Appendix",
-    "- Capture recurring pitfalls, evidence expectations, and reminders here.",
-    "",
-  ].join("\n");
-
-  let markdown = existingMarkdown && existingMarkdown.trim().length > 0
-    ? existingMarkdown
-    : template;
-  if (!/^#\s+Skill:/im.test(markdown)) {
-    markdown = `# Skill: ${title}\n\n${markdown.trimStart()}`;
-  }
-  if (!/^##\s+Core Procedure\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Core Procedure\n- Establish the stable body steps for this skill.\n`;
-  }
-  if (!/^##\s+Scenario Extensions\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Scenario Extensions\n- Add scenario-specific extensions here.\n`;
-  }
-  if (!/^##\s+Appendix\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Appendix\n- Capture recurring pitfalls and reminders here.\n`;
-  }
-
-  if (reflection.recommendedAction !== "append_appendix") {
-    markdown = appendBulletToMarkdownSection(markdown, "Core Procedure", coreBullet);
-  }
-  markdown = appendBulletToMarkdownSection(markdown, "Appendix", appendixBullet);
-  return markdown.endsWith("\n") ? markdown : `${markdown}\n`;
-}
-
-function buildSkillEvolutionProposal(
-  reflection: SkillReflectionRecord,
-  candidateDir: string,
-  config: OrchestratorConfig,
-): SkillEvolutionProposal {
-  return generateSkillEvolutionProposal({
-    reflection,
-    candidateDir,
-    config,
-    manifest: getSkillManifest(reflection.skillId, config),
-  });
-}
-
-async function handleCreateSkillReflection(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  if (!getSkillManifest(skillId, config)) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill not found: ${skillId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const body = await readJsonBody<{ job_id?: string }>(req);
-  const requestedJobId = typeof body.job_id === "string" ? body.job_id.trim() : "";
-  const record = requestedJobId
-    ? readJobRecord(requestedJobId)
-    : findLatestSkillJobRecord(skillId);
-
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: requestedJobId
-          ? `Job not found: ${requestedJobId}`
-          : `No job history found for skill ${skillId}.`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
-  if (selectedSkillId !== skillId) {
-    jsonResponse(res, 409, {
-      error: {
-        message: `Job ${record.job.id} is associated with skill ${selectedSkillId ?? "unknown"}, not ${skillId}.`,
-        type: "invalid_request_error",
-      },
-    });
-    return;
-  }
-
-  const reflection = buildSkillReflectionFromRecord(record);
-  if (!reflection) {
-    jsonResponse(res, 409, {
-      error: {
-        message: `Unable to build a reflection for skill ${skillId} from job ${record.job.id}.`,
-        type: "invalid_request_error",
-      },
-    });
-    return;
-  }
-
-  const path = persistSkillReflectionRecord(reflection, config.skillEvolution.candidateDir);
-  jsonResponse(res, 201, {
-    skill_id: skillId,
-    job_id: record.job.id,
-    reflection,
-    path,
-  });
-}
-
-async function handleCreateSkillProposal(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  if (!getSkillManifest(skillId, config)) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill not found: ${skillId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const body = await readJsonBody<{ reflection_id?: string }>(req);
-  const requestedReflectionId = typeof body.reflection_id === "string" ? body.reflection_id.trim() : "";
-  const reflection = requestedReflectionId
-    ? readSkillReflectionRecord(skillId, requestedReflectionId, config.skillEvolution.candidateDir)
-    : findLatestSkillReflectionRecord(skillId, config.skillEvolution.candidateDir);
-
-  if (!reflection) {
-    jsonResponse(res, 404, {
-      error: {
-        message: requestedReflectionId
-          ? `Reflection not found: ${requestedReflectionId}`
-          : `No reflection history found for skill ${skillId}.`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const proposal = buildSkillEvolutionProposal(reflection, config.skillEvolution.candidateDir, config);
-  const path = persistSkillEvolutionProposal(proposal, config.skillEvolution.candidateDir);
-  const candidatePath = getSkillEvolutionProposalCandidateRoot(proposal.id, config.skillEvolution.candidateDir);
-  appendEvent(createLifecycleEvent({
-    jobId: reflection.jobId,
-    seq: getNextSeq(reflection.jobId),
-    time: proposal.createdAt,
-    type: "system.skill_evolution_proposed",
-    title: "Skill evolution proposed",
-    summary: proposal.patchSummary,
-    status: "running",
-    meta: {
-      skill_id: proposal.skillId,
-      reflection_id: proposal.sourceReflectionId,
-      proposal_id: proposal.id,
-      proposal_status: proposal.status,
-      patch_summary: proposal.patchSummary,
-      change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
-      rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
-      changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
-    },
-  }));
-  jsonResponse(res, 201, {
-    skill_id: skillId,
-    reflection_id: reflection.id,
-    proposal,
-    path,
-    candidate_path: candidatePath,
-  });
-}
-
-async function handleListSkillEvolutionProposals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  const ops = buildSkillEvolutionOpsSummary(config);
-  const proposals = listSkillEvolutionProposals(config.skillEvolution.candidateDir);
-  jsonResponse(res, 200, {
-    object: "list",
-    summary: isObjectRecord(ops.summary) ? ops.summary : {},
-    filters: isObjectRecord(ops.filters) ? ops.filters : {},
-    data: proposals
-      .map((proposal) => buildSkillEvolutionProposalControlPlaneRecord(proposal, config, proposals)),
-  });
-}
-
-async function handleSkillEvolutionOps(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  jsonResponse(res, 200, buildSkillEvolutionOpsSummary(config));
-}
-
-async function handleSkillEvolutionOpsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  const html = renderSkillEvolutionOpsDashboardHtml(buildSkillEvolutionOpsSummary(config), {
-    dataUrl: "/skill-evolution/ops/data",
-  });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(html);
-}
-
-async function handleBrowserSkillEvolutionOpsData(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  jsonResponse(res, 200, buildSkillEvolutionOpsSummary(config));
-}
-
-async function handleGetSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  const proposal = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
-  if (!proposal) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill evolution proposal not found: ${proposalId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  jsonResponse(res, 200, buildSkillEvolutionProposalControlPlaneRecord(proposal, config));
-}
-
-async function handleCreateSkillEvolutionProposal(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  const body = await readJsonBody<{ skill_id?: string; reflection_id?: string }>(req);
-  const reflection = findReflectionForProposalCreate(config, {
-    skillId: typeof body.skill_id === "string" ? body.skill_id : undefined,
-    reflectionId: typeof body.reflection_id === "string" ? body.reflection_id : undefined,
-  });
-  if (!reflection) {
-    jsonResponse(res, 404, {
-      error: {
-        message: "No matching reflection found for proposal creation.",
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const proposal = buildSkillEvolutionProposal(reflection, config.skillEvolution.candidateDir, config);
-  const path = persistSkillEvolutionProposal(proposal, config.skillEvolution.candidateDir);
-  const candidatePath = getSkillEvolutionProposalCandidateRoot(proposal.id, config.skillEvolution.candidateDir);
-  appendEvent(createLifecycleEvent({
-    jobId: reflection.jobId,
-    seq: getNextSeq(reflection.jobId),
-    time: proposal.createdAt,
-    type: "system.skill_evolution_proposed",
-    title: "Skill evolution proposed",
-    summary: proposal.patchSummary,
-    status: "running",
-    meta: {
-      skill_id: proposal.skillId,
-      reflection_id: proposal.sourceReflectionId,
-      proposal_id: proposal.id,
-      proposal_status: proposal.status,
-      patch_summary: proposal.patchSummary,
-      change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
-      rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
-      changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
-    },
-  }));
-  jsonResponse(res, 201, {
-    skill_id: reflection.skillId,
-    reflection_id: reflection.id,
-    proposal,
-    path,
-    candidate_path: candidatePath,
-  });
-}
-
-async function handleAuditSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
-  if (!existing) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill evolution proposal not found: ${proposalId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  if (existing.status !== "draft") {
-    jsonResponse(res, 409, {
-      error: {
-        message: `Skill evolution proposal ${proposalId} cannot be audited from status ${existing.status}.`,
-        type: "conflict_error",
-      },
-    });
-    return;
-  }
-
-  const auditing = updateSkillEvolutionProposal(proposalId, (proposal) => ({
-    ...proposal,
-    status: "auditing",
-  }), config.skillEvolution.candidateDir);
-
-  if (!auditing) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill evolution proposal not found: ${proposalId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const reflection = readSkillReflectionRecord(auditing.skillId, auditing.sourceReflectionId, config.skillEvolution.candidateDir);
-  const manifest = getSkillManifest(auditing.skillId, config);
-  const audit = auditSkillEvolutionProposal({
-    proposal: auditing,
-    reflection,
-    manifest,
-  });
-  const path = persistSkillAuditReport(audit, config.skillEvolution.candidateDir);
-  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
-    ...current,
-    status: audit.passed ? "validated" : "audit_failed",
-    auditReportPath: path,
-  }), config.skillEvolution.candidateDir);
-  if (reflection && proposal) {
-    appendEvent(createLifecycleEvent({
-      jobId: reflection.jobId,
-      seq: getNextSeq(reflection.jobId),
-      time: new Date().toISOString(),
-      type: audit.passed ? "system.skill_evolution_audit_passed" : "system.skill_evolution_audit_failed",
-      title: audit.passed ? "Skill evolution audit passed" : "Skill evolution audit failed",
-      summary: audit.summary,
-      status: audit.passed ? "success" : "blocked",
-      meta: {
-        skill_id: proposal.skillId,
-        reflection_id: proposal.sourceReflectionId,
-        proposal_id: proposal.id,
-        proposal_status: proposal.status,
-        audit_report_path: path,
-      },
-    }));
-  }
-
-  jsonResponse(res, 200, {
-    proposal,
-    audit,
-    path,
-  });
-}
-
-async function handleValidateSkillEvolutionProposal(_req: IncomingMessage, res: ServerResponse, proposalId: string): Promise<void> {
-  const config = getRuntimeConfig();
-  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
-  if (!existing) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill evolution proposal not found: ${proposalId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  if (existing.status !== "validated") {
-    jsonResponse(res, 409, {
-      error: {
-        message: `Skill evolution proposal ${proposalId} cannot be validated from status ${existing.status}.`,
-        type: "conflict_error",
-      },
-    });
-    return;
-  }
-
-  const reflection = readSkillReflectionRecord(existing.skillId, existing.sourceReflectionId, config.skillEvolution.candidateDir);
-  const baselineRecord = reflection?.jobId ? readJobRecord(reflection.jobId) : null;
-  const validation = await validateSkillEvolutionProposalWithRuntimeReplay({
-    proposal: existing,
-    reflection,
-    baselineRecord,
-    config,
-  });
-  const path = persistSkillDeploymentValidationReport(validation, config.skillEvolution.candidateDir);
-  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
-    ...current,
-    status: validation.passed ? "validated" : "validation_failed",
-    validationReportPath: path,
-  }), config.skillEvolution.candidateDir);
-  if (reflection && proposal) {
-    appendEvent(createLifecycleEvent({
-      jobId: reflection.jobId,
-      seq: getNextSeq(reflection.jobId),
-      time: new Date().toISOString(),
-      type: validation.passed ? "system.skill_evolution_validation_passed" : "system.skill_evolution_validation_failed",
-      title: validation.passed ? "Skill evolution validation passed" : "Skill evolution validation failed",
-      summary: validation.summary,
-      status: validation.passed ? "success" : "blocked",
-      meta: {
-        skill_id: proposal.skillId,
-        reflection_id: proposal.sourceReflectionId,
-        proposal_id: proposal.id,
-        proposal_status: proposal.status,
-        validation_report_path: path,
-      },
-    }));
-  }
-
-  jsonResponse(res, 200, {
-    proposal,
-    validation,
-    path,
-  });
-}
-
-async function handleSkillEvolutionDecision(
-  req: IncomingMessage,
-  res: ServerResponse,
-  proposalId: string,
-  decision: SkillEvolutionDecisionRecord["decision"],
-): Promise<void> {
-  const config = getRuntimeConfig();
-  const existing = readSkillEvolutionProposal(proposalId, config.skillEvolution.candidateDir);
-  if (!existing) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Skill evolution proposal not found: ${proposalId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const allowedStatuses = decision === "accepted" ? new Set(["validated"]) : new Set(["validated", "validation_failed", "audit_failed", "draft"]);
-  if (!allowedStatuses.has(existing.status)) {
-    jsonResponse(res, 409, {
-      error: {
-        message: `Skill evolution proposal ${proposalId} cannot be ${decision} from status ${existing.status}.`,
-        type: "conflict_error",
-      },
-    });
-    return;
-  }
-
-  const body = await readJsonBody<{ reason?: string }>(req);
-  const reason = typeof body.reason === "string" && body.reason.trim().length > 0 ? body.reason.trim() : undefined;
-  let acceptResult: { appliedFiles: string[]; rollbackDir: string } | null = null;
-  if (decision === "accepted") {
-    try {
-      acceptResult = applyAcceptedSkillProposal(existing, config.skillEvolution.candidateDir);
-    } catch (error) {
-      jsonResponse(res, 409, {
-        error: {
-          message: error instanceof Error ? error.message : String(error),
-          type: "conflict_error",
-        },
-      });
-      return;
-    }
-  }
-  const record: SkillEvolutionDecisionRecord = {
-    proposalId: existing.id,
-    skillId: existing.skillId,
-    decision,
-    reason,
-    createdAt: new Date().toISOString(),
-  };
-  const path = persistSkillEvolutionDecisionRecord(record, config.skillEvolution.candidateDir);
-  const proposal = updateSkillEvolutionProposal(proposalId, (current) => ({
-    ...current,
-    status: decision,
-    decidedAt: record.createdAt,
-  }), config.skillEvolution.candidateDir);
-  const reflection = readSkillReflectionRecord(existing.skillId, existing.sourceReflectionId, config.skillEvolution.candidateDir);
-  if (reflection && proposal) {
-    appendEvent(createLifecycleEvent({
-      jobId: reflection.jobId,
-      seq: getNextSeq(reflection.jobId),
-      time: record.createdAt,
-      type: decision === "accepted" ? "system.skill_evolution_accepted" : "system.skill_evolution_rejected",
-      title: decision === "accepted" ? "Skill evolution accepted" : "Skill evolution rejected",
-      summary: proposal.controlPlaneSummary?.changeHeadline
-        ? `${proposal.controlPlaneSummary.changeHeadline}${reason ? `. ${reason}` : ""}`
-        : reason ? `${proposal.patchSummary}. ${reason}` : proposal.patchSummary,
-      status: decision === "accepted" ? "success" : "blocked",
-      meta: {
-        skill_id: proposal.skillId,
-        reflection_id: proposal.sourceReflectionId,
-        proposal_id: proposal.id,
-        proposal_status: proposal.status,
-        patch_summary: proposal.patchSummary,
-        change_summary: proposal.controlPlaneSummary?.changeHeadline ?? null,
-        rationale_summary: proposal.controlPlaneSummary?.rationaleHeadline ?? null,
-        changed_files: proposal.controlPlaneSummary?.changedFiles ?? proposal.targetFiles,
-        decision_reason: reason ?? null,
-      },
-    }));
-  }
-
-  jsonResponse(res, 200, {
-    proposal,
-    decision: record,
-    path,
-    applied_files: acceptResult?.appliedFiles ?? [],
-    rollback_path: decision === "accepted" ? getSkillEvolutionProposalRollbackRoot(existing.id, config.skillEvolution.candidateDir) : null,
-  });
-}
-
-function buildWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): unknown {
+export function buildWorkflowPayload(payload: Pick<TaskExecutionPayload, "job" | "plan" | "taskRuns" | "artifacts">): unknown {
   return {
     intent_route: payload.job.intentRoute ?? payload.plan.intentRoute ?? null,
     job: payload.job,
@@ -3710,7 +3028,7 @@ function summarizeRecentIntentRoutes(limit = 10): Record<string, unknown> {
   };
 }
 
-function buildStepList(record: StoredJobRecord): unknown[] {
+export function buildStepList(record: StoredJobRecord): unknown[] {
   const currentTask = getWorkflowCurrentTask(record);
   const awaitingApprovalTask = getWorkflowAwaitingApprovalTask(record);
   return record.taskRuns.map((taskRun) => {
@@ -3747,7 +3065,7 @@ function latestExecutorStatus(record: StoredJobRecord): ExecutorOutput["status"]
   return history.at(-1)?.status ?? null;
 }
 
-function createLifecycleEvent(input: {
+export function createLifecycleEvent(input: {
   jobId: string;
   seq: number;
   time: string;
@@ -3867,7 +3185,7 @@ function attachFailureCategory(
   };
 }
 
-function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
+export function buildJobEvents(record: StoredJobRecord): WorkflowUiEvent[] {
   const events: WorkflowUiEvent[] = [];
   let seq = 1;
   const push = (event: WorkflowUiEvent) => {
@@ -4222,7 +3540,7 @@ function createRecoveryEvent(record: StoredJobRecord, seq: number): WorkflowUiEv
     });
 }
 
-function buildJobRouteSet(jobId: string, routeBasePath = "/v1/jobs"): {
+export function buildJobRouteSet(jobId: string, routeBasePath = "/v1/jobs"): {
   job_url: string;
   events_url: string;
   stream_url: string;
@@ -4236,7 +3554,7 @@ function buildJobRouteSet(jobId: string, routeBasePath = "/v1/jobs"): {
   };
 }
 
-function buildResumeFollowTarget(
+export function buildResumeFollowTarget(
   sourceJobId: string,
   resumedToJobId: string | undefined,
   routeBasePath = "/v1/jobs",
@@ -4252,7 +3570,7 @@ function buildResumeFollowTarget(
   };
 }
 
-function buildControlActions(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Array<Record<string, unknown>> {
+export function buildControlActions(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Array<Record<string, unknown>> {
   const actions: Array<Record<string, unknown>> = [];
   const follow = buildResumeFollowTarget(record.job.id, record.control?.resumedToJobId, routeBasePath);
   if (follow) {
@@ -4291,14 +3609,14 @@ function buildControlActions(record: StoredJobRecord, routeBasePath = "/v1/jobs"
   return actions;
 }
 
-function isRecoveryLifecycleEvent(type: string): boolean {
+export function isRecoveryLifecycleEvent(type: string): boolean {
   return type === "job.recovered"
     || type === "job.auto_resume_started"
     || type === "job.resumed"
     || type === "job.failed";
 }
 
-function getConfiguredAutoResumeConcurrency(): number {
+export function getConfiguredAutoResumeConcurrency(): number {
   try {
     return loadConfig().policy.autoResumeConcurrency;
   } catch {
@@ -4306,7 +3624,7 @@ function getConfiguredAutoResumeConcurrency(): number {
   }
 }
 
-function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[], routeBasePath = "/v1/jobs"): Record<string, unknown> | null {
+export function buildEventSnapshot(record: StoredJobRecord, events: WorkflowUiEvent[], routeBasePath = "/v1/jobs"): Record<string, unknown> | null {
   if (events.length === 0) {
     return null;
   }
@@ -4382,7 +3700,7 @@ function resolveTeamAgentRegistrySummary(
   }
 }
 
-function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEvent[]): WorkflowUiEvent[] {
+export function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEvent[]): WorkflowUiEvent[] {
   if (persistedEvents.length === 0) {
     return buildJobEvents(record);
   }
@@ -4581,7 +3899,7 @@ export async function recoverInterruptedJobs(
   return recoveredJobIds;
 }
 
-function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): unknown {
+export function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): unknown {
   const persistedEvents = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
   const liveSnapshot = buildEventSnapshot(record, persistedEvents, routeBasePath);
   const latestStep = record.taskRuns.at(-1);
@@ -4647,7 +3965,7 @@ function buildJobResponse(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
   };
 }
 
-function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Record<string, unknown> {
+export function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): Record<string, unknown> {
   const persistedEvents = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
   const snapshot = buildEventSnapshot(record, persistedEvents, routeBasePath) as {
     recovery?: Record<string, unknown> | null;
@@ -4678,191 +3996,8 @@ function buildJobListItem(record: StoredJobRecord, routeBasePath = "/v1/jobs"): 
   };
 }
 
-function buildListedJobsResponse(routeBasePath = "/v1/jobs"): Array<Record<string, unknown>> {
-  return listStoredJobs().flatMap((stored) => {
-    const record = readJobRecord(stored.id);
-    if (!record) {
-      return [{
-        id: stored.id,
-        goal: stored.goal,
-        status: stored.status,
-        saved_at: stored.savedAt,
-        ...buildJobRouteSet(stored.id, routeBasePath),
-      }];
-    }
-    return [buildJobListItem(record, routeBasePath)];
-  });
-}
 
-function normalizeJobDashboardFilter(value: string | null | undefined): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replaceAll(/[^a-z0-9]+/g, "_")
-    .replaceAll(/^_+|_+$/g, "");
-}
-
-function getJobRouteKind(record: StoredJobRecord): string {
-  return normalizeJobDashboardFilter(record.job.intentRoute?.kind ?? record.plan.intentRoute?.kind ?? "unknown");
-}
-
-function buildListedJobsPageResponse(
-  routeBasePath = "/jobs",
-  options?: {
-    page?: number;
-    pageSize?: number;
-    status?: string | null;
-    route?: string | null;
-    query?: string | null;
-  },
-): {
-  object: "list";
-  data: Array<Record<string, unknown>>;
-  pagination: {
-    page: number;
-    page_size: number;
-    total: number;
-    total_pages: number;
-    has_prev: boolean;
-    has_next: boolean;
-  };
-  counts: {
-    by_status: Record<string, number>;
-    by_route: Record<string, number>;
-  };
-} {
-  const pageSize = Math.min(Math.max(options?.pageSize ?? 50, 1), 100);
-  const page = Math.max(options?.page ?? 1, 1);
-  const statusFilter = normalizeJobDashboardFilter(options?.status);
-  const routeFilter = normalizeJobDashboardFilter(options?.route);
-  const query = String(options?.query ?? "").trim().toLowerCase();
-
-  type DashboardJobRow = {
-    id: string;
-    goal: string;
-    status: string;
-    routeKind: string;
-    fallback?: Record<string, unknown>;
-    record?: StoredJobRecord;
-  };
-
-  const buildFallbackRow = (stored: { id: string; savedAt: string; status: Job["status"]; goal: string }): DashboardJobRow => ({
-    id: stored.id,
-    goal: stored.goal,
-    status: normalizeJobDashboardFilter(stored.status),
-    routeKind: "unknown",
-    fallback: {
-      id: stored.id,
-      goal: stored.goal,
-      status: stored.status,
-      saved_at: stored.savedAt,
-      ...buildJobRouteSet(stored.id, routeBasePath),
-    },
-  });
-
-  const queryRows = listStoredJobs()
-    .filter((stored) => {
-      if (!query) {
-        return true;
-      }
-      return stored.id.toLowerCase().includes(query) || stored.goal.toLowerCase().includes(query);
-    })
-    .map(buildFallbackRow);
-
-  const routeScopedRows = routeFilter
-    ? queryRows.flatMap<DashboardJobRow>((row) => {
-        const record = readJobRecord(row.id);
-        if (!record) {
-          return routeFilter === "unknown" ? [row] : [];
-        }
-        const routeKind = getJobRouteKind(record);
-        if (routeKind !== routeFilter) {
-          return [];
-        }
-        return [{
-          id: record.job.id,
-          goal: record.job.goal,
-          status: normalizeJobDashboardFilter(record.job.status),
-          routeKind,
-          record,
-        }];
-      })
-    : queryRows;
-
-  const byStatus = routeScopedRows.reduce<Record<string, number>>((acc, row) => {
-    acc[row.status] = (acc[row.status] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  const statusScopedRows = statusFilter
-    ? routeScopedRows.filter((row) => row.status === statusFilter)
-    : routeScopedRows;
-
-  const total = statusScopedRows.length;
-  const totalPages = total === 0 ? 1 : Math.ceil(total / pageSize);
-  const safePage = Math.min(page, totalPages);
-  const start = (safePage - 1) * pageSize;
-  const pageRows = statusScopedRows.slice(start, start + pageSize);
-  const hydratePageRecords = Boolean(query || routeFilter);
-  const pageItems = pageRows.flatMap((row) => {
-    if (row.record) {
-      return [{
-        row: {
-          ...row,
-          routeKind: getJobRouteKind(row.record),
-        },
-        item: buildJobListItem(row.record, routeBasePath),
-      }];
-    }
-    const record = hydratePageRecords ? readJobRecord(row.id) : null;
-    if (record) {
-      return [{
-        row: {
-          ...row,
-          status: normalizeJobDashboardFilter(record.job.status),
-          routeKind: getJobRouteKind(record),
-        },
-        item: buildJobListItem(record, routeBasePath),
-      }];
-    }
-    return [{
-      row,
-      item: row.fallback ?? {
-        id: row.id,
-        goal: row.goal,
-        status: row.status,
-        ...buildJobRouteSet(row.id, routeBasePath),
-      },
-    }];
-  });
-
-  const routeCountRows = routeFilter
-    ? statusScopedRows
-    : pageItems.map((entry) => entry.row);
-  const byRoute = routeCountRows.reduce<Record<string, number>>((acc, row) => {
-    acc[row.routeKind] = (acc[row.routeKind] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  return {
-    object: "list",
-    data: pageItems.map((entry) => entry.item),
-    pagination: {
-      page: safePage,
-      page_size: pageSize,
-      total,
-      total_pages: totalPages,
-      has_prev: safePage > 1,
-      has_next: safePage < totalPages,
-    },
-    counts: {
-      by_status: byStatus,
-      by_route: byRoute,
-    },
-  };
-}
-
-function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> {
+export function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> {
   const counts = {
     pending: 0,
     in_progress: 0,
@@ -4948,7 +4083,7 @@ function buildWorkflowSummary(record: StoredJobRecord): Record<string, unknown> 
   };
 }
 
-function buildFailureSummary(events: WorkflowUiEvent[]): {
+export function buildFailureSummary(events: WorkflowUiEvent[]): {
   total: number;
   by_category: Record<string, number>;
   latest_category: string | null;
@@ -4975,7 +4110,7 @@ function buildFailureSummary(events: WorkflowUiEvent[]): {
   };
 }
 
-function getWorkflowCurrentTask(record: StoredJobRecord): TaskRun | null {
+export function getWorkflowCurrentTask(record: StoredJobRecord): TaskRun | null {
   return record.taskRuns.find((taskRun) =>
     taskRun.status === "awaiting_approval"
     || taskRun.status === "in_progress"
@@ -4983,11 +4118,11 @@ function getWorkflowCurrentTask(record: StoredJobRecord): TaskRun | null {
   ) ?? null;
 }
 
-function getWorkflowAwaitingApprovalTask(record: StoredJobRecord): TaskRun | null {
+export function getWorkflowAwaitingApprovalTask(record: StoredJobRecord): TaskRun | null {
   return record.taskRuns.find((taskRun) => taskRun.status === "awaiting_approval") ?? null;
 }
 
-function buildWorkflowEvent(type: string, workflow: unknown, extra: Record<string, unknown> = {}): string {
+export function buildWorkflowEvent(type: string, workflow: unknown, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     type,
     workflow,
@@ -4995,110 +4130,8 @@ function buildWorkflowEvent(type: string, workflow: unknown, extra: Record<strin
   });
 }
 
-function buildChatCompletionResponse(model: string, content: string, workflow?: unknown): unknown {
-  const created = Math.floor(Date.now() / 1000);
-  return {
-    id: `chatcmpl-${Date.now()}`,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content,
-        },
-        finish_reason: "stop",
-      },
-    ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
-    workflow,
-  };
-}
 
-function buildToolChatCompletionResponse(model: string, toolCalls: Array<{ id: string; name: string; arguments: string }>): unknown {
-  const created = Math.floor(Date.now() / 1000);
-  return {
-    id: `chatcmpl-${Date.now()}`,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: "",
-          tool_calls: toolCalls.map((call) => ({
-            id: call.id,
-            type: "function",
-            function: {
-              name: call.name,
-              arguments: call.arguments,
-            },
-          })),
-        },
-        finish_reason: "tool_calls",
-      },
-    ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
-  };
-}
-
-function buildChatCompletionChunk(model: string, id: string, delta: Record<string, unknown>, finishReason: string | null): string {
-  return JSON.stringify({
-    id,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        delta,
-        finish_reason: finishReason,
-      },
-    ],
-  });
-}
-
-function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id: string; name: string; arguments: string }, finishReason: string | null, toolIndex = 0): string {
-  return JSON.stringify({
-    id,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        delta: {
-          tool_calls: [
-            {
-              index: toolIndex,
-              id: toolCall.id,
-              type: "function",
-              function: {
-                name: toolCall.name,
-                arguments: toolCall.arguments,
-              },
-            },
-          ],
-        },
-        finish_reason: finishReason,
-      },
-    ],
-  });
-}
-
-function formatProgressUpdate(event: OrchestratorEvent): string | null {
+export function formatProgressUpdate(event: OrchestratorEvent): string | null {
   switch (event.type) {
     case "workflow.step.start":
       return buildProgressCard(`步骤 ${event.step ?? 1} · 规划中`, "正在规划下一步。");
@@ -5309,11 +4342,11 @@ type ProgressAggregationState = {
   summaries: string[];
 };
 
-function shouldAggregateToolProgress(tool: string): boolean {
+export function shouldAggregateToolProgress(tool: string): boolean {
   return tool === "web_search" || tool === "url_fetch" || tool === "read_file";
 }
 
-function createProgressAggregationState(tool: string, step?: number): ProgressAggregationState {
+export function createProgressAggregationState(tool: string, step?: number): ProgressAggregationState {
   return {
     tool,
     step,
@@ -5326,7 +4359,7 @@ function createProgressAggregationState(tool: string, step?: number): ProgressAg
   };
 }
 
-function buildAggregatedToolStart(tool: string): string {
+export function buildAggregatedToolStart(tool: string): string {
   switch (tool) {
     case "web_search":
       return buildProgressCard("检索中", "正在扩展检索范围，补充更多候选资料。");
@@ -5339,7 +4372,7 @@ function buildAggregatedToolStart(tool: string): string {
   }
 }
 
-function buildAggregatedToolResult(state: ProgressAggregationState): string | null {
+export function buildAggregatedToolResult(state: ProgressAggregationState): string | null {
   if (state.resultCount === 0) {
     return null;
   }
@@ -5379,7 +4412,7 @@ function buildAggregatedToolResult(state: ProgressAggregationState): string | nu
   return summary ? buildProgressCard(phaseLabelForTool(state.tool), summary) : null;
 }
 
-function accumulateToolProgressResult(state: ProgressAggregationState, event: OrchestratorEvent): void {
+export function accumulateToolProgressResult(state: ProgressAggregationState, event: OrchestratorEvent): void {
   const ok = event.data.ok === true;
   const summary = typeof event.data.summary === "string" ? event.data.summary.trim() : "";
   state.resultCount += 1;
@@ -5397,18 +4430,18 @@ function accumulateToolProgressResult(state: ProgressAggregationState, event: Or
   }
 }
 
-function sseWrite(res: ServerResponse, payload: string): void {
+export function sseWrite(res: ServerResponse, payload: string): void {
   res.write(`data: ${payload}\n\n`);
 }
 
-function sseWriteEvent(res: ServerResponse, eventName: string, payload: string, eventId?: number): void {
+export function sseWriteEvent(res: ServerResponse, eventName: string, payload: string, eventId?: number): void {
   if (typeof eventId === "number" && Number.isFinite(eventId)) {
     res.write(`id: ${eventId}\n`);
   }
   res.write(`event: ${eventName}\ndata: ${payload}\n\n`);
 }
 
-function normalizeIncomingTools(tools: unknown): typeof TOOL_DEFINITIONS {
+export function normalizeIncomingTools(tools: unknown): typeof TOOL_DEFINITIONS {
   if (!Array.isArray(tools) || tools.length === 0) {
     return TOOL_DEFINITIONS;
   }
@@ -5433,7 +4466,7 @@ function normalizeIncomingTools(tools: unknown): typeof TOOL_DEFINITIONS {
   return filtered.length > 0 ? filtered : TOOL_DEFINITIONS;
 }
 
-function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
+export function normalizeOpenAIToolMessages(messages: OpenAIMessage[]): ChatMessage[] {
   return messages.flatMap<ChatMessage>((message) => {
     if (!message || typeof message !== "object") {
       return [];
@@ -5986,7 +5019,7 @@ async function executeTeamGoal(
   }
 }
 
-async function executeJobByMode(
+export async function executeJobByMode(
   mode: Job["mode"],
   goal: string,
   model: string | undefined,
@@ -6017,7 +5050,7 @@ async function executePromptByIntent(
   return executeTaskGoal(goal, model, true, onEvent, undefined, onRegistered, intentRoute);
 }
 
-async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExecutionPayload> {
+export async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExecutionPayload> {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
   }
@@ -6046,7 +5079,7 @@ async function runTaskFromRequest(body: ChatCompletionRequest): Promise<TaskExec
   return executeTaskGoal(userGoal, body.model, false, undefined, undefined, undefined, intentRoute);
 }
 
-async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
+export async function runTaskFromMessages(messages: OpenAIMessage[], model: string | undefined, onEvent?: OrchestratorEventCallback): Promise<TaskExecutionPayload> {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error("`messages` must be a non-empty array.");
   }
@@ -6065,7 +5098,7 @@ async function runTaskFromMessages(messages: OpenAIMessage[], model: string | un
   return executePromptByIntent(userGoal, model, onEvent);
 }
 
-async function runTaskFromMessagesWithRegistration(
+export async function runTaskFromMessagesWithRegistration(
   messages: OpenAIMessage[],
   model: string | undefined,
   onEvent?: OrchestratorEventCallback,
@@ -6089,7 +5122,7 @@ async function runTaskFromMessagesWithRegistration(
   return executePromptByIntent(userGoal, model, onEvent, onRegistered);
 }
 
-function attachRequestAbortCancellation(
+export function attachRequestAbortCancellation(
   res: ServerResponse,
   lookupJobId: () => string | null,
 ): () => void {
@@ -6115,7 +5148,7 @@ function attachRequestAbortCancellation(
   };
 }
 
-async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown, requestOverrides?: import("./providers/openai-compatible.js").CompletionOverrides): Promise<{
+export async function runToolMode(messages: ChatMessage[], model: string | undefined, tools: unknown, requestOverrides?: import("./providers/openai-compatible.js").CompletionOverrides): Promise<{
   resolvedModel: string;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
   content: string;
@@ -6142,1890 +5175,6 @@ async function runToolMode(messages: ChatMessage[], model: string | undefined, t
   };
 }
 
-async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  jsonResponse(res, 200, buildModelsResponse());
-}
-
-async function handleHealth(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const config = getRuntimeConfig();
-  const healthSelection = await buildHealthyExecutorRuntimeConfig(config);
-  const payload = buildHealthResponse(healthSelection.config, healthSelection.results);
-  if (healthSelection.healthyExecutorIds.length === 0) {
-    payload.status = "degraded";
-  }
-  jsonResponse(res, payload.status === "ok" ? 200 : 503, payload);
-}
-
-async function handleListJobs(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  jsonResponse(res, 200, {
-    object: "list",
-    data: buildListedJobsResponse(),
-  });
-}
-
-function normalizeCreateGoalInput(body: CreateGoalRequest, config: OrchestratorConfig): CreateGoalInput {
-  const goal = typeof body.goal === "string" ? body.goal.trim() : "";
-  if (!goal) {
-    throw new Error("`goal` must be a non-empty string.");
-  }
-  const tasks: GoalTaskInput[] | undefined = Array.isArray(body.tasks)
-    ? body.tasks.flatMap((task) => {
-        const title = typeof task?.title === "string" ? task.title.trim() : "";
-        const description = typeof task?.description === "string" ? task.description.trim() : "";
-        if (!title && !description) {
-          return [];
-        }
-        const mode: GoalTaskMode = task?.mode === "team" ? "team" : "task";
-        return [{
-          title: title || description,
-          description: description || title,
-          mode,
-        }];
-      })
-    : undefined;
-  const plannedTasks = tasks && tasks.length > 0
-    ? (body.insert_large_checks === true
-        ? insertLargeCheckTasks(tasks, {
-            interval: config.goalMode.largeCheckInterval,
-            mode: config.goalMode.largeCheckMode,
-          })
-        : tasks)
-    : planGoalTasks(goal, {
-        autoInsertLargeChecks: config.goalMode.autoInsertLargeChecks,
-        largeCheckInterval: config.goalMode.largeCheckInterval,
-        largeCheckMode: config.goalMode.largeCheckMode,
-      });
-  return {
-    goal,
-    tasks: plannedTasks,
-  };
-}
-
-async function handleListGoals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  jsonResponse(res, 200, {
-    object: "list",
-    data: listGoals(),
-  });
-}
-
-function buildGoalRouteSet(
-  goalId: string,
-  routeBasePath = "/v1/goals",
-): Pick<GoalDashboardItem, "detail_url" | "timeline_url" | "events_url"> {
-  return {
-    detail_url: `${routeBasePath}/${goalId}`,
-    timeline_url: `${routeBasePath}/${goalId}/timeline`,
-    events_url: `${routeBasePath}/${goalId}/events`,
-  };
-}
-
-function buildGoalActions(record: GoalRecord, routeBasePath = "/v1/goals"): GoalDashboardItem["actions"] {
-  const actions: GoalDashboardItem["actions"] = [
-    { label: "Timeline", href: `${routeBasePath}/${record.id}/timeline`, kind: "link", emphasis: "primary" },
-    { label: "Details", href: `${routeBasePath}/${record.id}`, kind: "link" },
-  ];
-  if (record.status === "waiting_review") {
-    actions.push({ label: "Review", href: `${routeBasePath}/${record.id}/review`, kind: "api", method: "POST" });
-  } else if (record.tasks.some((task) => task.status === "blocked")) {
-    actions.push({ label: "Resume", href: `${routeBasePath}/${record.id}/resume`, kind: "api", method: "POST" });
-    actions.push({ label: "Retry", href: `${routeBasePath}/${record.id}/retry`, kind: "api", method: "POST" });
-  } else if (record.tasks.some((task) => task.status === "failed")) {
-    actions.push({ label: "Retry", href: `${routeBasePath}/${record.id}/retry`, kind: "api", method: "POST" });
-  } else if (record.tasks.some((task) => task.status === "pending")) {
-    actions.push({ label: "Run Next", href: `${routeBasePath}/${record.id}/run-next`, kind: "api", method: "POST" });
-  }
-  return actions;
-}
-
-function buildGoalListItem(record: GoalRecord, routeBasePath = "/v1/goals"): GoalDashboardItem {
-  const currentTask = record.tasks.find((task) => task.id === record.currentTaskId) ?? null;
-  return {
-    id: record.id,
-    goal: record.goal,
-    status: record.status,
-    created_at: record.createdAt,
-    updated_at: record.updatedAt,
-    completed_task_count: record.completedTaskCount,
-    total_task_count: record.tasks.length,
-    current_task: currentTask
-      ? {
-          id: currentTask.id,
-          title: currentTask.title,
-          status: currentTask.status,
-          mode: currentTask.mode,
-        }
-      : null,
-    final_review_status: record.finalReview.status,
-    actions: buildGoalActions(record, routeBasePath),
-    ...buildGoalRouteSet(record.id, routeBasePath),
-  };
-}
-
-function buildListedGoalsResponse(routeBasePath = "/v1/goals"): GoalDashboardItem[] {
-  return listGoals().flatMap((stored) => {
-    const record = readGoal(stored.id);
-    return record ? [buildGoalListItem(record, routeBasePath)] : [];
-  });
-}
-
-async function handleCreateGoal(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<CreateGoalRequest>(req);
-  const config = getRuntimeConfig();
-  const input = normalizeCreateGoalInput(body, config);
-  const record = buildGoalRecord(input);
-  persistGoal(record);
-  appendGoalEvent(record.id, {
-    type: "goal.created",
-    title: "Goal created",
-    summary: `Created goal ${record.id} with ${record.tasks.length} planned tasks.`,
-    status: "success",
-    meta: {
-      goal_id: record.id,
-      task_count: record.tasks.length,
-      large_check_count: record.tasks.filter((task) => task.kind === "large_check").length,
-      large_check_interval: config.goalMode.largeCheckInterval,
-      large_check_mode: config.goalMode.largeCheckMode,
-      status: record.status,
-    },
-  });
-  jsonResponse(res, 201, buildGoalResponse(record));
-}
-
-async function handleGoalEvents(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const record = readGoal(goalId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  jsonResponse(res, 200, {
-    object: "list",
-    goal_id: goalId,
-    data: readGoalEvents(goalId),
-  });
-}
-
-async function handleGetGoal(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const record = readGoal(goalId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  jsonResponse(res, 200, buildGoalResponse(record));
-}
-
-async function handleRunNextGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const body = await readJsonBody<{ model?: string }>(req);
-  const existing = readGoal(goalId);
-  if (!existing) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pendingTask = existing.tasks.find((task) => task.status === "pending");
-  appendGoalEvent(goalId, {
-    type: "goal.run_next_started",
-    title: "Run-next started",
-    summary: pendingTask
-      ? `Starting goal task ${pendingTask.title}.`
-      : "Starting next pending goal task.",
-    status: "running",
-    meta: {
-      goal_id: goalId,
-      task_id: pendingTask?.id ?? null,
-      task_title: pendingTask?.title ?? null,
-      task_kind: pendingTask?.kind ?? null,
-    },
-  });
-  let result;
-  try {
-    result = await runNextGoalTask(goalId, {
-      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
-    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const statusCode = message.includes("no pending tasks") ? 409 : 400;
-    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  appendGoalEvent(goalId, {
-    type: "goal.run_next_completed",
-    title: "Run-next completed",
-    summary: `Task ${result.executedTask.title} finished with status ${result.executedTask.status}.`,
-    status: result.executedTask.status === "completed" ? "success" : result.executedTask.status === "blocked" ? "blocked" : "failed",
-    meta: {
-      goal_id: goalId,
-      task_id: result.executedTask.id,
-      task_title: result.executedTask.title,
-      task_kind: result.executedTask.kind,
-      task_status: result.executedTask.status,
-      job_id: result.execution.job.id,
-      goal_status: result.goal.status,
-      verified: result.execution.job.verified,
-    },
-  });
-  jsonResponse(res, 200, {
-    object: "goal_run",
-    goal: result.goal,
-    executed_task: result.executedTask,
-    execution: {
-      job_id: result.execution.job.id,
-      status: result.execution.job.status,
-      verified: result.execution.job.verified,
-      output: result.execution.job.output,
-    },
-    control: buildGoalResponse(result.goal).control,
-    recent_events: readGoalEvents(goalId).slice(-10),
-    links: {
-      goal: `/v1/goals/${goalId}`,
-      events: `/v1/goals/${goalId}/events`,
-      job: `/v1/jobs/${result.execution.job.id}`,
-    },
-  });
-}
-
-async function handleRetryGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const body = await readJsonBody<{ model?: string }>(req);
-  const existing = readGoal(goalId);
-  if (!existing) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const retryableTask = [...existing.tasks].reverse().find((task) => task.status === "failed" || task.status === "blocked");
-  appendGoalEvent(goalId, {
-    type: "goal.retry_started",
-    title: "Goal retry started",
-    summary: retryableTask
-      ? `Retrying goal task ${retryableTask.title}.`
-      : "Retrying latest failed or blocked goal task.",
-    status: "running",
-    meta: {
-      goal_id: goalId,
-      task_id: retryableTask?.id ?? null,
-      task_title: retryableTask?.title ?? null,
-      task_kind: retryableTask?.kind ?? null,
-    },
-  });
-  try {
-    const result = await retryGoalTask(goalId, {
-      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
-    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
-    appendGoalEvent(goalId, {
-      type: "goal.retry_completed",
-      title: "Goal retry completed",
-      summary: `Retried task ${result.executedTask.title} finished with status ${result.executedTask.status}.`,
-      status: result.executedTask.status === "completed" ? "success" : result.executedTask.status === "blocked" ? "blocked" : "failed",
-      meta: {
-        goal_id: goalId,
-        task_id: result.executedTask.id,
-        task_title: result.executedTask.title,
-        task_kind: result.executedTask.kind,
-        task_status: result.executedTask.status,
-        job_id: result.execution.job.id,
-        goal_status: result.goal.status,
-        verified: result.execution.job.verified,
-      },
-    });
-    jsonResponse(res, 200, {
-      object: "goal_run",
-      goal: result.goal,
-      executed_task: result.executedTask,
-      execution: {
-        job_id: result.execution.job.id,
-        status: result.execution.job.status,
-        verified: result.execution.job.verified,
-        output: result.execution.job.output,
-      },
-      control: buildGoalResponse(result.goal).control,
-      recent_events: readGoalEvents(goalId).slice(-10),
-      links: {
-        goal: `/v1/goals/${goalId}`,
-        events: `/v1/goals/${goalId}/events`,
-        job: `/v1/jobs/${result.execution.job.id}`,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const statusCode = message.includes("not found") ? 404 : message.includes("no retryable tasks") ? 409 : 400;
-    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : statusCode === 404 ? "not_found_error" : "invalid_request_error", {
-      status: "failed",
-    });
-  }
-}
-
-async function handleResumeGoal(_req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const existing = readGoal(goalId);
-  if (!existing) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  try {
-    const record = resumeGoal(goalId);
-    const resumedTask = record.tasks.find((task) => task.status === "pending" && task.id === record.currentTaskId);
-    appendGoalEvent(goalId, {
-      type: "goal.resumed",
-      title: "Goal resumed",
-      summary: resumedTask
-        ? `Resumed blocked task ${resumedTask.title}.`
-        : "Goal moved back to ready state.",
-      status: "success",
-      meta: {
-        goal_id: goalId,
-        task_id: resumedTask?.id ?? null,
-        task_title: resumedTask?.title ?? null,
-        task_kind: resumedTask?.kind ?? null,
-        goal_status: record.status,
-      },
-    });
-    jsonResponse(res, 200, buildGoalResponse(record));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const statusCode = message.includes("no resumable tasks") ? 409 : 400;
-    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
-      status: "failed",
-    });
-  }
-}
-
-async function handleReviewGoal(req: IncomingMessage, res: ServerResponse, goalId: string): Promise<void> {
-  const body = await readJsonBody<{ model?: string }>(req);
-  const existing = readGoal(goalId);
-  if (!existing) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  appendGoalEvent(goalId, {
-    type: "goal.review_started",
-    title: "Goal review started",
-    summary: "Starting final review for the completed goal tasks.",
-    status: "running",
-    meta: {
-      goal_id: goalId,
-      completed_task_count: existing.completedTaskCount,
-      total_task_count: existing.tasks.length,
-    },
-  });
-  try {
-    const result = await reviewGoal(goalId, {
-      executeByMode: (mode, goal, model) => executeJobByMode(mode, goal, model),
-    }, typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined);
-    appendGoalEvent(goalId, {
-      type: "goal.review_completed",
-      title: "Goal review completed",
-      summary: `Final review finished with status ${result.goal.finalReview.status}.`,
-      status: result.goal.finalReview.status === "completed" ? "completed" : result.goal.finalReview.status === "blocked" ? "blocked" : "failed",
-      meta: {
-        goal_id: goalId,
-        job_id: result.execution.job.id,
-        review_status: result.goal.finalReview.status,
-        goal_status: result.goal.status,
-        verified: result.execution.job.verified,
-      },
-    });
-    jsonResponse(res, 200, {
-      object: "goal_review",
-      goal: result.goal,
-      final_review: result.goal.finalReview,
-      execution: {
-        job_id: result.execution.job.id,
-        status: result.execution.job.status,
-        verified: result.execution.job.verified,
-        output: result.execution.job.output,
-      },
-      control: buildGoalResponse(result.goal).control,
-      recent_events: readGoalEvents(goalId).slice(-10),
-      links: {
-        goal: `/v1/goals/${goalId}`,
-        events: `/v1/goals/${goalId}/events`,
-        job: `/v1/jobs/${result.execution.job.id}`,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const statusCode = message.includes("not ready for final review") || message.includes("already completed") ? 409 : 400;
-    jsonErrorResponse(res, statusCode, message, statusCode === 409 ? "conflict_error" : "invalid_request_error", {
-      status: "failed",
-    });
-  }
-}
-
-async function handleJobsDashboard(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const html = renderJobsDashboardHtml([] as Array<{
-    id: string;
-    goal: string;
-    mode?: string;
-    status: string;
-  }>, {
-    dataUrl: "/jobs/data",
-  });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(html);
-}
-
-async function handleGoalsDashboard(_req: IncomingMessage, res: ServerResponse, routeBasePath = "/v1/goals"): Promise<void> {
-  const html = renderGoalsDashboardHtml(buildListedGoalsResponse(routeBasePath), {
-    dataUrl: routeBasePath === "/goals" ? "/goals/data" : "/v1/goals/data",
-  });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(html);
-}
-
-async function handleBrowserListGoals(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  jsonResponse(res, 200, {
-    object: "list",
-    data: buildListedGoalsResponse("/goals"),
-  });
-}
-
-async function handleGoalTimeline(_req: IncomingMessage, res: ServerResponse, goalId: string, routeBasePath = "/v1/goals"): Promise<void> {
-  const record = readGoal(goalId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Goal not found: ${goalId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const html = renderGoalTimelineHtml(record, readGoalEvents(goalId), {
-    routeBasePath,
-    apiBasePath: routeBasePath === "/goals" ? "/v1/goals" : routeBasePath,
-  });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(html);
-}
-
-async function handleBrowserListJobs(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url || "/", "http://localhost");
-  const pageResult = parseNonNegativeIntegerParam(url.searchParams.get("page"), "page");
-  if (!pageResult.ok) {
-    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pageSizeResult = parseNonNegativeIntegerParam(url.searchParams.get("page_size"), "page_size");
-  if (!pageSizeResult.ok) {
-    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  jsonResponse(res, 200, buildListedJobsPageResponse("/jobs", {
-    page: Math.max(pageResult.value ?? 1, 1),
-    pageSize: Math.min(Math.max(pageSizeResult.value ?? 50, 1), 100),
-    status: url.searchParams.get("status"),
-    route: url.searchParams.get("route"),
-    query: url.searchParams.get("q"),
-  }));
-}
-
-async function handleCreateJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<CreateJobRequest>(req);
-  const rawGoal = typeof body.goal === "string" ? body.goal.trim() : "";
-  const normalizedGoal = normalizeDaoRunGoal(rawGoal);
-  const goal = normalizedGoal.goal;
-  if (!goal) {
-    jsonResponse(res, 400, {
-      error: {
-        message: "`goal` must be a non-empty string.",
-        type: "invalid_request_error",
-      },
-    });
-    return;
-  }
-
-  if (body.mode !== undefined && body.mode !== "task" && body.mode !== "team") {
-    jsonResponse(res, 400, {
-      error: {
-        message: "`mode` must be either \"task\" or \"team\".",
-        type: "invalid_request_error",
-      },
-    });
-    return;
-  }
-
-  const modelRoute = typeof body.model_route === "string" && body.model_route.trim()
-    ? body.model_route.trim()
-    : undefined;
-  const requestedMode = body.mode === "team" ? "team" : "task";
-  if (requestedMode === "team" && body.policy?.approval_mode === "always" && body.policy.async !== true) {
-    jsonResponse(res, 400, {
-      error: {
-        message: 'team approval_mode "always" requires policy.async=true so the job can wait for /approve.',
-        type: "invalid_request_error",
-      },
-    });
-    return;
-  }
-  if (body.policy?.async === true) {
-    const fixedIds: FixedTaskIds = {
-      jobId: `job_${randomUUID()}`,
-      planId: `plan_${randomUUID()}`,
-      taskRunId: `taskrun_${randomUUID()}`,
-    };
-    const executionPromise = executeJobByMode(requestedMode, goal, modelRoute, {
-      requirePlannerCircuit: true,
-      fixedIds,
-      approvalMode: body.policy?.approval_mode,
-    });
-    void executionPromise.catch(() => {
-      // Failure state is already persisted inside executeTaskGoal.
-    });
-    const record = readJobRecord(fixedIds.jobId);
-
-    jsonResponse(res, 202, {
-      object: "job",
-      job_id: fixedIds.jobId,
-      status: record?.job.status ?? "running",
-      accepted: true,
-      goal_sanitized: normalizedGoal.sanitized,
-      goal_sanitized_reason: normalizedGoal.reason,
-      stream_url: `/v1/jobs/${fixedIds.jobId}/stream`,
-      events_url: `/v1/jobs/${fixedIds.jobId}/events`,
-      timeline_url: `/v1/jobs/${fixedIds.jobId}/timeline`,
-      ...(record ? buildJobResponse(record) as Record<string, unknown> : {
-        job: {
-          id: fixedIds.jobId,
-          goal,
-          mode: requestedMode,
-          status: "running",
-          verified: false,
-          output: "Running...",
-        },
-      }),
-    });
-    return;
-  }
-
-  const result = await executeJobByMode(requestedMode, goal, modelRoute, {
-    requirePlannerCircuit: true,
-    approvalMode: body.policy?.approval_mode,
-  });
-  const record = readJobRecord(result.job.id);
-
-  jsonResponse(res, 201, {
-    object: "job",
-    job_id: result.job.id,
-    goal_sanitized: normalizedGoal.sanitized,
-    goal_sanitized_reason: normalizedGoal.reason,
-    resolved_model: result.resolvedModel,
-    log_path: result.logPath,
-    workflow: buildWorkflowPayload(result),
-    ...(record ? buildJobResponse(record) as Record<string, unknown> : {
-      job: result.job,
-      plan: result.plan,
-      taskRuns: result.taskRuns,
-      artifacts: result.artifacts,
-      control: {},
-    }),
-  });
-}
-
-async function handleGetJob(
-  _req: IncomingMessage,
-  res: ServerResponse,
-  jobId: string,
-  routeBasePath = "/v1/jobs",
-): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  jsonResponse(res, 200, buildJobResponse(record, routeBasePath));
-}
-
-async function handleGetJobArtifacts(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  jsonResponse(res, 200, {
-    job_id: jobId,
-    count: record.artifacts.length,
-    artifacts: record.artifacts,
-  });
-}
-
-async function handleGetJobSteps(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  const steps = buildStepList(record);
-  jsonResponse(res, 200, {
-    job_id: jobId,
-    count: steps.length,
-    workflow_summary: buildWorkflowSummary(record),
-    steps,
-  });
-}
-
-async function handleGetJobRuntimeProfile(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  const config = loadConfig();
-  const runtimeProfile = buildRuntimeProfile(config);
-  jsonResponse(res, 200, {
-    job_id: jobId,
-    generated_at: new Date().toISOString(),
-    diagnostics_summary: {
-      dependency_warnings: runtimeProfile.diagnostics.dependencyChecks.filter((check) => check.status === "warning").length,
-      dependency_checks: runtimeProfile.diagnostics.dependencyChecks.length,
-    },
-    runtime_profile: runtimeProfile,
-  });
-}
-
-async function handleGetJobEvents(
-  req: IncomingMessage,
-  res: ServerResponse,
-  jobId: string,
-  routeBasePath = "/v1/jobs",
-): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  const url = new URL(req.url ?? "/", "http://127.0.0.1");
-  const sinceSeqRaw = url.searchParams.get("since_seq");
-  const seqRaw = url.searchParams.get("seq");
-  const limitRaw = url.searchParams.get("limit");
-  const pageRaw = url.searchParams.get("page");
-  const pageSizeRaw = url.searchParams.get("page_size");
-  const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
-  if (!sinceSeqResult.ok) {
-    jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const seqResult = parseNonNegativeIntegerParam(seqRaw, "seq");
-  if (!seqResult.ok) {
-    jsonErrorResponse(res, 400, seqResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const limitResult = parseNonNegativeIntegerParam(limitRaw, "limit");
-  if (!limitResult.ok) {
-    jsonErrorResponse(res, 400, limitResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pageResult = parseNonNegativeIntegerParam(pageRaw, "page");
-  if (!pageResult.ok) {
-    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pageSizeResult = parseNonNegativeIntegerParam(pageSizeRaw, "page_size");
-  if (!pageSizeResult.ok) {
-    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const sinceSeq = sinceSeqResult.value;
-  const seq = seqResult.value;
-  const limit = limitResult.value;
-  const requestedPage = pageResult.value;
-  const requestedPageSize = pageSizeResult.value;
-  const eventQuery = readJobEventQuery(url);
-
-  const fullEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
-  const filteredEvents = filterJobEvents(fullEvents, {
-    sinceSeq,
-    seq,
-    types: parseStringSetParam(url, "type"),
-    statuses: parseStringSetParam(url, "status"),
-    agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
-    phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
-    taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
-  });
-  const pageSize = Number.isFinite(requestedPageSize)
-    ? Math.max(1, requestedPageSize as number)
-    : Number.isFinite(limit)
-      ? Math.max(1, limit as number)
-      : filteredEvents.length || 1;
-  const page = Math.max(1, requestedPage ?? 1);
-  const offset = (page - 1) * pageSize;
-  const pageEvents = filteredEvents.slice(offset, offset + pageSize);
-  const events = Number.isFinite(limit) && !Number.isFinite(requestedPage)
-    ? filteredEvents.slice(0, limit as number)
-    : pageEvents;
-  jsonResponse(res, 200, {
-    job_id: jobId,
-    count: events.length,
-    total: filteredEvents.length,
-    filters: {
-      type: [...parseStringSetParam(url, "type")],
-      status: [...parseStringSetParam(url, "status")],
-      agent: eventQuery.agent ?? null,
-      phase: eventQuery.phase ?? null,
-      task_run_id: eventQuery.taskRunId ?? null,
-      seq: seq ?? null,
-      since_seq: sinceSeq ?? null,
-    },
-    pagination: {
-      page,
-      page_size: pageSize,
-      total: filteredEvents.length,
-      total_pages: Math.max(1, Math.ceil(filteredEvents.length / pageSize)),
-    },
-    snapshot: buildEventSnapshot(record, fullEvents, routeBasePath),
-    events,
-  });
-}
-
-async function handleJobStream(
-  _req: IncomingMessage,
-  res: ServerResponse,
-  jobId: string,
-  routeBasePath = "/v1/jobs",
-): Promise<void> {
-  // Verify job exists
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  const url = new URL(_req.url ?? "/", "http://127.0.0.1");
-  const sinceSeqRaw = url.searchParams.get("since_seq");
-  const seqRaw = url.searchParams.get("seq");
-  const pageRaw = url.searchParams.get("page");
-  const pageSizeRaw = url.searchParams.get("page_size");
-  const lastEventIdRaw = getHeaderValue(_req, "last-event-id");
-  const sinceSeqResult = parseNonNegativeIntegerParam(sinceSeqRaw, "since_seq");
-  if (!sinceSeqResult.ok) {
-    jsonErrorResponse(res, 400, sinceSeqResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const seqResult = parseNonNegativeIntegerParam(seqRaw, "seq");
-  if (!seqResult.ok) {
-    jsonErrorResponse(res, 400, seqResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pageResult = parseNonNegativeIntegerParam(pageRaw, "page");
-  if (!pageResult.ok) {
-    jsonErrorResponse(res, 400, pageResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const pageSizeResult = parseNonNegativeIntegerParam(pageSizeRaw, "page_size");
-  if (!pageSizeResult.ok) {
-    jsonErrorResponse(res, 400, pageSizeResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const lastEventIdResult = parseNonNegativeIntegerParam(lastEventIdRaw, "Last-Event-ID");
-  if (!lastEventIdResult.ok) {
-    jsonErrorResponse(res, 400, lastEventIdResult.message, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  const requestedSinceSeq = sinceSeqResult.value;
-  const requestedLastEventId = lastEventIdResult.value;
-  const replayCursor = Number.isFinite(requestedSinceSeq)
-    ? requestedSinceSeq as number
-    : Number.isFinite(requestedLastEventId)
-      ? requestedLastEventId as number
-      : undefined;
-  const eventQuery = readJobEventQuery(url);
-
-  // Load existing events from disk
-  const existingEvents = mergeJobEvents(record, loadEventsFromDisk(jobId));
-  const replaySource = replayCursor !== undefined
-    ? existingEvents
-    : (existingEvents.length > 0 ? existingEvents : getEvents(jobId));
-  const filteredReplayEvents = filterJobEvents(replaySource, {
-    types: parseStringSetParam(url, "type"),
-    statuses: parseStringSetParam(url, "status"),
-    agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
-    phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
-    taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
-    seq: seqResult.value,
-    sinceSeq: replayCursor,
-  });
-  const streamPageSize = Number.isFinite(pageSizeResult.value) ? Math.max(1, pageSizeResult.value as number) : filteredReplayEvents.length || 1;
-  const streamPage = Math.max(1, pageResult.value ?? 1);
-  const replayEvents = Number.isFinite(pageResult.value) || Number.isFinite(pageSizeResult.value)
-    ? filteredReplayEvents.slice((streamPage - 1) * streamPageSize, streamPage * streamPageSize)
-    : filteredReplayEvents;
-
-  // Set SSE headers
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-
-  // Send initial snapshot
-  const snapshot = buildEventSnapshot(record, existingEvents, routeBasePath);
-  if (snapshot) {
-    sseWriteEvent(res, "job.snapshot", JSON.stringify({
-      ...snapshot,
-      replay: {
-        ...(isObjectRecord(snapshot.replay) ? snapshot.replay : {}),
-        resumed_from_seq: replayCursor ?? null,
-        replayed_count: replayEvents.length,
-        filtered_count: filteredReplayEvents.length,
-        page: streamPage,
-        page_size: streamPageSize,
-        filters: {
-          type: [...parseStringSetParam(url, "type")],
-          status: [...parseStringSetParam(url, "status")],
-          agent: eventQuery.agent ?? null,
-          phase: eventQuery.phase ?? null,
-          task_run_id: eventQuery.taskRunId ?? null,
-          seq: seqResult.value ?? null,
-          since_seq: replayCursor ?? null,
-        },
-      },
-    }));
-    if (isObjectRecord(snapshot.follow) && typeof snapshot.follow.type === "string") {
-      sseWriteEvent(res, "job.redirect", JSON.stringify(snapshot.follow));
-    }
-  }
-
-  // Send replay events
-  for (const event of replayEvents) {
-    sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
-  }
-
-  // Subscribe to new events
-  const unsubscribe = subscribe(jobId, (event) => {
-    try {
-      if (filterJobEvents([event], {
-        types: parseStringSetParam(url, "type"),
-        statuses: parseStringSetParam(url, "status"),
-        agents: eventQuery.agent ? new Set([eventQuery.agent]) : undefined,
-        phases: eventQuery.phase ? new Set([eventQuery.phase]) : undefined,
-        taskRunIds: eventQuery.taskRunId ? new Set([eventQuery.taskRunId]) : undefined,
-        seq: seqResult.value,
-      }).length === 0) {
-        return;
-      }
-      sseWriteEvent(res, "job.event", JSON.stringify(event), event.seq);
-      if (event.type === "job.resumed" && isObjectRecord(event.meta) && typeof event.meta.resumed_to_job_id === "string") {
-        const follow = buildResumeFollowTarget(jobId, event.meta.resumed_to_job_id, routeBasePath);
-        if (follow) {
-          sseWriteEvent(res, "job.redirect", JSON.stringify(follow), event.seq);
-        }
-      }
-      if (isRecoveryLifecycleEvent(event.type)) {
-        const latestRecord = readJobRecord(jobId);
-        const latestEvents = latestRecord ? mergeJobEvents(latestRecord, loadEventsFromDisk(jobId)) : null;
-        const latestSnapshot = latestRecord && latestEvents ? buildEventSnapshot(latestRecord, latestEvents, routeBasePath) : null;
-        if (latestSnapshot) {
-          sseWriteEvent(res, "job.snapshot", JSON.stringify({
-            ...latestSnapshot,
-            replay: {
-              ...(isObjectRecord(latestSnapshot.replay) ? latestSnapshot.replay : {}),
-              resumed_from_seq: replayCursor ?? null,
-              replayed_count: replayEvents.length,
-            },
-          }), event.seq);
-        }
-      }
-    } catch {
-      // Client disconnected
-      unsubscribe();
-    }
-  });
-
-  // Heartbeat every 30 seconds
-  const heartbeat = setInterval(() => {
-    try {
-      sseWriteEvent(res, "heartbeat", JSON.stringify({ time: new Date().toISOString() }));
-    } catch {
-      clearInterval(heartbeat);
-      unsubscribe();
-    }
-  }, 30_000);
-  heartbeat.unref?.();
-
-  // Auto-cleanup after 10 minutes (SSE connections shouldn't last forever)
-  const maxDuration = 10 * 60 * 1000;
-  const timeout = setTimeout(() => {
-    clearInterval(heartbeat);
-    unsubscribe();
-    try {
-      res.end();
-    } catch {
-      // Ignore
-    }
-  }, maxDuration);
-  timeout.unref?.();
-
-  // Clear timeout if response ends normally
-  const originalEnd = res.end.bind(res);
-  res.end = function (...args: Parameters<typeof originalEnd>) {
-    clearTimeout(timeout);
-    clearInterval(heartbeat);
-    unsubscribe();
-    return originalEnd(...args);
-  } as typeof res.end;
-}
-
-async function handleCancelJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const active = getActiveJobSession(jobId);
-  const interrupted = cancelActiveJobSession(jobId, `Run cancelled via API for job ${jobId}.`);
-  const cancelledAt = new Date().toISOString();
-  const updated = updateStoredJobRecord(jobId, (record) => ({
-    ...record,
-    savedAt: cancelledAt,
-    job: {
-      ...record.job,
-      status: "cancelled",
-      output: "Run cancelled.",
-    },
-    control: {
-      ...record.control,
-      cancellationRequestedAt: cancelledAt,
-      cancelledAt,
-    },
-  }));
-  if (!updated) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-  appendEvent(createLifecycleEvent({
-    jobId,
-    seq: getNextSeq(jobId),
-    time: updated.control?.cancelledAt ?? new Date().toISOString(),
-    type: "job.cancelled",
-    title: "Job cancelled",
-    summary: "Cancellation was requested for this job.",
-    status: "blocked",
-    meta: {
-      active: Boolean(active),
-      interrupted,
-      cancellation_requested_at: updated.control?.cancellationRequestedAt ?? null,
-    },
-  }));
-  jsonResponse(res, 200, {
-    ok: true,
-    job_id: jobId,
-    active: Boolean(active),
-    interrupted,
-    control: updated.control ?? {},
-  });
-}
-
-async function handleRetryJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  const retryResult = await executeJobByMode(record.job.mode, record.job.goal, undefined, {
-    requirePlannerCircuit: false,
-  });
-  updateJobControlState(jobId, {
-    retriedAt: new Date().toISOString(),
-    retriedToJobId: retryResult.job.id,
-  });
-  const retriedRecord = updateJobControlState(retryResult.job.id, {
-    retryOf: jobId,
-  });
-  appendEvent(createLifecycleEvent({
-    jobId,
-    seq: getNextSeq(jobId),
-    time: new Date().toISOString(),
-    type: "job.retried",
-    title: "Job retried",
-    summary: `A retry job was created: ${retryResult.job.id}.`,
-    status: "success",
-    meta: {
-      retried_to_job_id: retryResult.job.id,
-    },
-  }));
-
-  jsonResponse(res, 200, {
-    ok: true,
-    retried_from: jobId,
-    job: retryResult.job,
-    plan: retryResult.plan,
-    taskRuns: retryResult.taskRuns,
-    artifacts: retryResult.artifacts,
-    control: retriedRecord?.control ?? { retryOf: jobId },
-  });
-}
-
-async function handleJobTimeline(
-  _req: IncomingMessage,
-  res: ServerResponse,
-  jobId: string,
-  routeBasePath = "/v1/jobs",
-): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonResponse(res, 404, {
-      error: {
-        message: `Job not found: ${jobId}`,
-        type: "not_found_error",
-      },
-    });
-    return;
-  }
-
-  // Load events from disk
-  const events = loadEventsFromDisk(jobId);
-  const timelineEvents = events.length > 0 ? events : buildJobEvents(record);
-
-  // Render timeline HTML
-  const html = renderTimelineHtml(
-    jobId,
-    timelineEvents,
-    record.job.goal,
-    record.job.status,
-    buildWorkflowSummary(record) as {
-      current_task?: { title?: string; status?: string } | null;
-      awaiting_approval_task?: { title?: string; status?: string } | null;
-      task_counts?: Record<string, number>;
-    },
-    buildEventSnapshot(record, timelineEvents, routeBasePath) as {
-      follow?: { type?: string; job_id?: string; job_url?: string; timeline_url?: string; stream_url?: string; events_url?: string } | null;
-      actions?: Array<{ id?: string; label?: string; kind?: string; href?: string; method?: string; emphasis?: string }>;
-      recovery?: { auto_resume_failed_at?: string | null; auto_resume_failure_message?: string | null } | null;
-    },
-    { routeBasePath },
-  );
-
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(html);
-}
-
-async function handleApproveJob(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const body = await readJsonBody<{ approval_id?: string; decision?: string; note?: string }>(req);
-  if (!body.approval_id || !body.decision) {
-    jsonErrorResponse(res, 400, "approval_id and decision are required.", "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-  if (body.decision !== "approved" && body.decision !== "denied") {
-    jsonErrorResponse(res, 400, 'decision must be "approved" or "denied".', "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  const updated = resolveApprovalRequest(jobId, body.approval_id, body.decision, body.note);
-  if (!updated) {
-    jsonErrorResponse(res, 400, `Approval not found: ${body.approval_id}`, "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  const signaled = resolvePendingApproval(jobId, body.decision);
-  appendEvent(createLifecycleEvent({
-    jobId,
-    seq: getNextSeq(jobId),
-    time: new Date().toISOString(),
-    type: body.decision === "approved" ? "approval.approved" : "approval.denied",
-    title: body.decision === "approved" ? "Approval granted" : "Approval denied",
-    summary: body.decision === "approved"
-      ? "A pending approval request was approved."
-      : "A pending approval request was denied.",
-    status: body.decision === "approved" ? "success" : "blocked",
-    phase: "approval",
-    meta: {
-      approval_id: body.approval_id,
-      note: body.note ?? "",
-      signaled,
-    },
-  }));
-
-  jsonResponse(res, 200, {
-    ok: true,
-    job_id: jobId,
-    approval_id: body.approval_id,
-    decision: body.decision,
-    signaled,
-    control: updated.control ?? {},
-  });
-}
-
-async function handleResumeJob(_req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
-  const record = readJobRecord(jobId);
-  if (!record) {
-    jsonErrorResponse(res, 404, `Job not found: ${jobId}`, "not_found_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  if (record.job.status === "completed") {
-    jsonErrorResponse(res, 400, "Cannot resume a completed job.", "invalid_request_error", {
-      status: "failed",
-    });
-    return;
-  }
-
-  if (record.job.status === "awaiting_approval" || record.control?.pendingApprovalId) {
-    jsonErrorResponse(res, 409, "Job is awaiting approval. Resolve it through /approve instead of /resume.", "conflict_error", {
-      status: "blocked",
-    });
-    return;
-  }
-
-  const active = getActiveJobSession(jobId);
-  if (active) {
-    jsonErrorResponse(res, 409, "Job is currently running.", "conflict_error", {
-      status: "blocked",
-    });
-    return;
-  }
-
-  const resumeResult = await executeJobByMode(record.job.mode, record.job.goal, undefined, {
-    requirePlannerCircuit: false,
-  });
-  updateJobControlState(jobId, {
-    resumedAt: new Date().toISOString(),
-    resumedToJobId: resumeResult.job.id,
-  });
-  const resumedRecord = updateJobControlState(resumeResult.job.id, {
-    resumeOf: jobId,
-  });
-  appendEvent(createLifecycleEvent({
-    jobId,
-    seq: getNextSeq(jobId),
-    time: new Date().toISOString(),
-    type: "job.resumed",
-    title: "Job resumed",
-    summary: `A resumed job was created: ${resumeResult.job.id}.`,
-    status: "success",
-    meta: {
-      resumed_to_job_id: resumeResult.job.id,
-    },
-  }));
-
-  jsonResponse(res, 200, {
-    ok: true,
-    resumed_from: jobId,
-    job: resumeResult.job,
-    plan: resumeResult.plan,
-    taskRuns: resumeResult.taskRuns,
-    artifacts: resumeResult.artifacts,
-    control: resumedRecord?.control ?? { resumeOf: jobId },
-  });
-}
-
-async function handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<ChatCompletionRequest>(req);
-  const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
-  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
-  const mirrorProgressToContent = body.stream && !toolMode && shouldMirrorProgressToContent(body.include_progress_updates);
-  let requestJobId: string | null = null;
-  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
-
-  if (toolMode) {
-    if (extractLatestOpenAIWriteToolCompletion(body.messages)) {
-      jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
-      return;
-    }
-    if (extractLatestOpenAIResearchReadCompletion(body.messages)) {
-      jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
-      return;
-    }
-
-    const overrides: import("./providers/openai-compatible.js").CompletionOverrides = {};
-    if (body.temperature !== undefined) overrides.temperature = body.temperature;
-    if (body.max_tokens !== undefined) overrides.maxTokens = body.max_tokens;
-    if (body.top_p !== undefined) overrides.topP = body.top_p;
-    if (body.stop !== undefined) overrides.stop = body.stop;
-    if (body.tool_choice !== undefined) overrides.toolChoice = body.tool_choice;
-    const toolResult = await runToolMode(normalizeOpenAIToolMessages(body.messages || []), body.model, body.tools, overrides);
-
-    if (!body.stream) {
-      if (toolResult.toolCalls.length > 0) {
-        jsonResponse(res, 200, buildToolChatCompletionResponse(toolResult.resolvedModel, toolResult.toolCalls));
-      } else {
-        jsonResponse(res, 200, buildChatCompletionResponse(toolResult.resolvedModel, summarizeToolResultContent(toolResult.content) || toolResult.content));
-      }
-      return;
-    }
-
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    const streamId = `chatcmpl-${Date.now()}`;
-    sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, { role: "assistant", content: "" }, null));
-    if (toolResult.toolCalls.length > 0) {
-      for (let i = 0; i < toolResult.toolCalls.length; i++) {
-        sseWrite(res, buildToolChatCompletionChunk(toolResult.resolvedModel, streamId, toolResult.toolCalls[i], null, i));
-      }
-      sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, {}, "tool_calls"));
-    } else {
-      const finalText = summarizeToolResultContent(toolResult.content) || toolResult.content;
-      for (const chunk of splitContentForStreaming(finalText)) {
-        sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, { content: chunk }, null));
-      }
-      sseWrite(res, buildChatCompletionChunk(toolResult.resolvedModel, streamId, {}, "stop"));
-    }
-    if (includeWorkflowEvents) {
-      sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", {
-        job: null,
-        plan: null,
-        taskRuns: [],
-        artifacts: [],
-      }, {
-        mode: "tool",
-        model: toolResult.resolvedModel,
-        toolCalls: toolResult.toolCalls,
-        content: toolResult.content,
-      }));
-    }
-    res.end("data: [DONE]\n\n");
-    return;
-  }
-
-  // For streaming, set up SSE headers first so events can be sent in real-time
-  if (body.stream) {
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    const streamId = `chatcmpl-${Date.now()}`;
-    sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { role: "assistant", content: "" }, null));
-
-    const onEvent: OrchestratorEventCallback | undefined = includeWorkflowEvents
-      ? (event) => {
-          try {
-            sseWriteEvent(res, event.type, JSON.stringify({
-              type: event.type,
-              step: event.step,
-              ...event.data,
-            }));
-          } catch {
-            // Ignore write errors (client may have disconnected)
-          }
-        }
-      : undefined;
-    let emittedProgressChunks = false;
-    let pendingToolAggregation: ProgressAggregationState | null = null;
-    const writeProgressText = (progressText: string) => {
-      emittedProgressChunks = true;
-      for (const chunk of splitContentForStreaming(progressText)) {
-        sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { content: chunk }, null));
-      }
-    };
-    const flushPendingToolAggregation = () => {
-      if (!pendingToolAggregation) {
-        return;
-      }
-      const progressText = buildAggregatedToolResult(pendingToolAggregation);
-      pendingToolAggregation = null;
-      if (!progressText) {
-        return;
-      }
-      writeProgressText(progressText);
-    };
-    const emitProgressChunk = (event: OrchestratorEvent) => {
-      if (!mirrorProgressToContent) {
-        return;
-      }
-
-      if (event.type === "workflow.tool.start") {
-        const tool = typeof event.data.tool === "string" ? event.data.tool : "tool";
-        if (!shouldAggregateToolProgress(tool)) {
-          flushPendingToolAggregation();
-          const progressText = formatProgressUpdate(event);
-          if (progressText) {
-            writeProgressText(progressText);
-          }
-          return;
-        }
-
-        if (!pendingToolAggregation || pendingToolAggregation.tool !== tool || pendingToolAggregation.step !== event.step) {
-          flushPendingToolAggregation();
-          pendingToolAggregation = createProgressAggregationState(tool, event.step);
-          pendingToolAggregation.startCount = 1;
-          writeProgressText(buildAggregatedToolStart(tool));
-          return;
-        }
-
-        pendingToolAggregation.startCount += 1;
-        return;
-      }
-
-      if (event.type === "workflow.tool.result") {
-        const tool = typeof event.data.tool === "string" ? event.data.tool : "tool";
-        if (!shouldAggregateToolProgress(tool)) {
-          flushPendingToolAggregation();
-          const progressText = formatProgressUpdate(event);
-          if (progressText) {
-            writeProgressText(progressText);
-          }
-          return;
-        }
-
-        if (!pendingToolAggregation || pendingToolAggregation.tool !== tool || pendingToolAggregation.step !== event.step) {
-          flushPendingToolAggregation();
-          pendingToolAggregation = createProgressAggregationState(tool, event.step);
-        }
-        accumulateToolProgressResult(pendingToolAggregation, event);
-        return;
-      }
-
-      flushPendingToolAggregation();
-      const progressText = formatProgressUpdate(event);
-      if (!progressText) {
-        return;
-      }
-      writeProgressText(progressText);
-    };
-    const combinedOnEvent: OrchestratorEventCallback | undefined = (event) => {
-      emitProgressChunk(event);
-      onEvent?.(event);
-    };
-
-    try {
-      const resultForModel = await runTaskFromMessagesWithRegistration(
-        normalizeChatMessages(body.messages || []),
-        body.model,
-        combinedOnEvent,
-        (jobId) => { requestJobId = jobId; },
-      );
-      const requestedModel = resultForModel.resolvedModel;
-      const workflow = buildWorkflowPayload(resultForModel);
-      flushPendingToolAggregation();
-
-      if (mirrorProgressToContent && emittedProgressChunks) {
-        sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: "\n[最终结论]\n" }, null));
-      }
-      const chunks = splitContentForStreaming(resultForModel.content);
-      for (const chunk of chunks) {
-        sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, { content: chunk }, null));
-      }
-
-      sseWrite(res, buildChatCompletionChunk(requestedModel, streamId, {}, "stop"));
-      if (includeWorkflowEvents) {
-        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
-          mode: "task",
-          model: requestedModel,
-          status: resultForModel.job.status,
-        }));
-      }
-      res.end("data: [DONE]\n\n");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      sseWrite(res, buildChatCompletionChunk("dual-agent-orchestrator", streamId, { content: `Error: ${message}` }, "stop"));
-      if (includeWorkflowEvents) {
-        sseWriteEvent(res, "workflow.failed", buildWorkflowEvent("workflow.failed", {}, {
-          mode: "task",
-          error: message,
-        }));
-      }
-      res.end("data: [DONE]\n\n");
-    } finally {
-      detachRequestAbort();
-    }
-    return;
-  }
-
-  // Non-streaming path
-  try {
-    const resultForModel = await runTaskFromMessagesWithRegistration(
-      normalizeChatMessages(body.messages || []),
-      body.model,
-      undefined,
-      (jobId) => { requestJobId = jobId; },
-    ).catch((error) => { throw error; });
-    const requestedModel = resultForModel.resolvedModel;
-    const workflow = buildWorkflowPayload(resultForModel);
-    jsonResponse(res, 200, buildChatCompletionResponse(requestedModel, resultForModel.content, workflow));
-  } finally {
-    detachRequestAbort();
-  }
-}
-
-function buildResponsesOutput(content: string): unknown[] {
-  return [
-    {
-      id: `msg_${Date.now()}`,
-      type: "message",
-      role: "assistant",
-      content: [
-        {
-          type: "output_text",
-          text: content,
-          annotations: [],
-        },
-      ],
-    },
-  ];
-}
-
-function buildResponsesResponse(model: string, content: string, workflow?: unknown): unknown {
-  return {
-    id: `resp_${Date.now()}`,
-    object: "response",
-    created_at: Math.floor(Date.now() / 1000),
-    status: "completed",
-    model,
-    output: buildResponsesOutput(content),
-    output_text: content,
-    error: null,
-    workflow,
-  };
-}
-
-async function handleResponses(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<ResponsesRequest>(req);
-  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
-  const messages = normalizeResponsesInput(body.input, body.instructions);
-  let requestJobId: string | null = null;
-  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
-  const result = await runTaskFromMessagesWithRegistration(messages, body.model, undefined, (jobId) => {
-    requestJobId = jobId;
-  });
-  const workflow = buildWorkflowPayload(result);
-
-  if (!body.stream) {
-    try {
-      jsonResponse(res, 200, buildResponsesResponse(result.resolvedModel, result.content, workflow));
-    } finally {
-      detachRequestAbort();
-    }
-    return;
-  }
-
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-
-  const responseId = `resp_${Date.now()}`;
-  sseWrite(res, JSON.stringify({ type: "response.created", response: { id: responseId, model: result.resolvedModel, status: "in_progress" } }));
-  for (const chunk of splitContentForStreaming(result.content)) {
-    sseWrite(res, JSON.stringify({ type: "response.output_text.delta", delta: chunk }));
-  }
-  sseWrite(res, JSON.stringify({ type: "response.completed", response: { id: responseId, model: result.resolvedModel, status: "completed" } }));
-  if (includeWorkflowEvents) {
-    sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
-      mode: "task",
-      model: result.resolvedModel,
-      status: result.job.status,
-    }));
-  }
-  try {
-    res.end("data: [DONE]\n\n");
-  } finally {
-    detachRequestAbort();
-  }
-}
-
-function buildAnthropicMessageResponse(model: string, content: string, workflow?: unknown): unknown {
-  return {
-    id: `msg_${Date.now()}`,
-    type: "message",
-    role: "assistant",
-    model,
-    content: [
-      {
-        type: "text",
-        text: content,
-      },
-    ],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: 0,
-      output_tokens: 0,
-    },
-    workflow,
-  };
-}
-
-async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJsonBody<AnthropicMessagesRequest>(req);
-  const messages = normalizeAnthropicMessages(body.messages, body.system);
-  const requestedToolMode = Array.isArray(body.tools) && body.tools.length > 0;
-  const hasToolHistory = hasAnthropicToolHistory(body.messages);
-  const toolMode = requestedToolMode && hasToolHistory;
-  const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
-  let requestJobId: string | null = null;
-  const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
-
-  if (requestedToolMode && !hasToolHistory) {
-    const result = await runTaskFromMessagesWithRegistration(messages, body.model, undefined, (jobId) => {
-      requestJobId = jobId;
-    });
-    const workflow = buildWorkflowPayload(result);
-
-    if (!body.stream) {
-      try {
-        jsonResponse(res, 200, buildAnthropicMessageResponse(result.resolvedModel, summarizeToolResultContent(result.content) || result.content, workflow));
-      } finally {
-        detachRequestAbort();
-      }
-      return;
-    }
-
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    const messageId = `msg_${Date.now()}`;
-    res.write(`event: message_start\n`);
-    sseWrite(res, JSON.stringify({
-      type: "message_start",
-      message: {
-        id: messageId,
-        type: "message",
-        role: "assistant",
-        model: result.resolvedModel,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    }));
-    res.write(`event: content_block_start\n`);
-    sseWrite(res, JSON.stringify({
-      type: "content_block_start",
-      index: 0,
-      content_block: { type: "text", text: "" },
-    }));
-    for (const chunk of splitContentForStreaming(summarizeToolResultContent(result.content) || result.content)) {
-      res.write(`event: content_block_delta\n`);
-      sseWrite(res, JSON.stringify({
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text: chunk },
-      }));
-    }
-    res.write(`event: content_block_stop\n`);
-    sseWrite(res, JSON.stringify({ type: "content_block_stop", index: 0 }));
-    res.write(`event: message_delta\n`);
-    sseWrite(res, JSON.stringify({
-      type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
-      usage: { output_tokens: 0 },
-    }));
-    if (includeWorkflowEvents) {
-      sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
-        mode: "task",
-        model: result.resolvedModel,
-        status: result.job.status,
-      }));
-    }
-    try {
-      res.write(`event: message_stop\n`);
-      sseWrite(res, JSON.stringify({ type: "message_stop" }));
-      res.end();
-    } finally {
-      detachRequestAbort();
-    }
-    return;
-  }
-
-  detachRequestAbort();
-
-  if (toolMode) {
-    if (extractLatestAnthropicWriteToolCompletion(body.messages)) {
-      jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
-      return;
-    }
-    if (extractLatestAnthropicResearchReadCompletion(body.messages)) {
-      jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
-      return;
-    }
-
-    const anthropicTools = body.tools ?? [];
-    const convertedTools = anthropicTools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name || "",
-        description: tool.description || "",
-        parameters: tool.input_schema || {},
-      },
-    }));
-    const toolResult = await runToolMode(normalizeAnthropicToolMessages(body.messages, body.system), body.model, convertedTools);
-
-    if (!body.stream) {
-      if (toolResult.toolCalls.length > 0) {
-        jsonResponse(res, 200, {
-          id: `msg_${Date.now()}`,
-          type: "message",
-          role: "assistant",
-          model: toolResult.resolvedModel,
-          content: toolResult.toolCalls.map((call) => ({
-            type: "tool_use",
-            id: call.id,
-            name: call.name,
-            input: safeParseToolInput(call.arguments),
-          })),
-          stop_reason: "tool_use",
-          stop_sequence: null,
-          usage: {
-            input_tokens: 0,
-            output_tokens: 0,
-          },
-        });
-      } else {
-        const finalText = summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
-        jsonResponse(res, 200, buildAnthropicMessageResponse(toolResult.resolvedModel, finalText));
-      }
-      return;
-    }
-
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    const messageId = `msg_${Date.now()}`;
-    res.write(`event: message_start\n`);
-    sseWrite(res, JSON.stringify({
-      type: "message_start",
-      message: {
-        id: messageId,
-        type: "message",
-        role: "assistant",
-        model: toolResult.resolvedModel,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    }));
-
-    if (toolResult.toolCalls.length > 0) {
-      for (const call of toolResult.toolCalls) {
-        res.write(`event: content_block_start\n`);
-        sseWrite(res, JSON.stringify({
-          type: "content_block_start",
-          index: 0,
-          content_block: {
-            type: "tool_use",
-            id: call.id,
-            name: call.name,
-            input: {},
-          },
-        }));
-        res.write(`event: content_block_delta\n`);
-        sseWrite(res, JSON.stringify({
-          type: "content_block_delta",
-          index: 0,
-          delta: {
-            type: "input_json_delta",
-            partial_json: call.arguments,
-          },
-        }));
-        res.write(`event: content_block_stop\n`);
-        sseWrite(res, JSON.stringify({ type: "content_block_stop", index: 0 }));
-      }
-
-      res.write(`event: message_delta\n`);
-      sseWrite(res, JSON.stringify({
-        type: "message_delta",
-        delta: { stop_reason: "tool_use", stop_sequence: null },
-        usage: { output_tokens: 0 },
-      }));
-      if (includeWorkflowEvents) {
-        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", {
-          job: null,
-          plan: null,
-          taskRuns: [],
-          artifacts: [],
-        }, {
-          mode: "tool",
-          model: toolResult.resolvedModel,
-          toolCalls: toolResult.toolCalls,
-          content: toolResult.content,
-        }));
-      }
-    } else {
-      const result = await runTaskFromMessages(messages, body.model);
-      const workflow = buildWorkflowPayload(result);
-      res.write(`event: content_block_start\n`);
-      sseWrite(res, JSON.stringify({
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" },
-      }));
-      const finalText = summarizeToolResultContent(result.content) || result.content || summarizeToolResultContent(toolResult.content) || "Tool work completed. Please summarize and finish without further tool calls.";
-      for (const chunk of splitContentForStreaming(finalText)) {
-        res.write(`event: content_block_delta\n`);
-        sseWrite(res, JSON.stringify({
-          type: "content_block_delta",
-          index: 0,
-          delta: {
-            type: "text_delta",
-            text: chunk,
-          },
-        }));
-      }
-      res.write(`event: content_block_stop\n`);
-      sseWrite(res, JSON.stringify({ type: "content_block_stop", index: 0 }));
-      res.write(`event: message_delta\n`);
-      sseWrite(res, JSON.stringify({
-        type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { output_tokens: 0 },
-      }));
-      if (includeWorkflowEvents) {
-        sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
-          mode: "task",
-          model: result.resolvedModel,
-          status: result.job.status,
-        }));
-      }
-    }
-    res.write(`event: message_stop\n`);
-    sseWrite(res, JSON.stringify({ type: "message_stop" }));
-    res.end();
-    return;
-  }
-
-  const result = await runTaskFromMessages(messages, body.model);
-  const workflow = buildWorkflowPayload(result);
-
-  if (!body.stream) {
-    jsonResponse(res, 200, buildAnthropicMessageResponse(result.resolvedModel, summarizeToolResultContent(result.content) || result.content, workflow));
-    return;
-  }
-
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-
-  const messageId = `msg_${Date.now()}`;
-  res.write(`event: message_start\n`);
-  sseWrite(res, JSON.stringify({
-    type: "message_start",
-    message: {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      model: result.resolvedModel,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    },
-  }));
-  res.write(`event: content_block_start\n`);
-  sseWrite(res, JSON.stringify({
-    type: "content_block_start",
-    index: 0,
-    content_block: { type: "text", text: "" },
-  }));
-  for (const chunk of splitContentForStreaming(summarizeToolResultContent(result.content) || result.content)) {
-    res.write(`event: content_block_delta\n`);
-    sseWrite(res, JSON.stringify({
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text: chunk },
-    }));
-  }
-  res.write(`event: content_block_stop\n`);
-  sseWrite(res, JSON.stringify({ type: "content_block_stop", index: 0 }));
-  res.write(`event: message_delta\n`);
-  sseWrite(res, JSON.stringify({
-    type: "message_delta",
-    delta: { stop_reason: "end_turn", stop_sequence: null },
-    usage: { output_tokens: 0 },
-    workflow,
-  }));
-  res.write(`event: message_stop\n`);
-  sseWrite(res, JSON.stringify({ type: "message_stop" }));
-  if (includeWorkflowEvents) {
-    sseWriteEvent(res, "workflow.completed", buildWorkflowEvent("workflow.completed", workflow, {
-      mode: "task",
-      model: result.resolvedModel,
-      status: result.job.status,
-    }));
-  }
-  res.end();
-}
 
 export async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";

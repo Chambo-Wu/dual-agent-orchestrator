@@ -70,9 +70,9 @@ npm run serve:restart:9898
 | 2026-05-28 | Goal Mode 与 Skill 基础层规划 | Goal mode 执行规划、任务拆解方向、skill-aware planner / install 设计收口、旧任务清理。 |
 | 2026-05-29 | Skill 自进化 v1 控制面 | outcome capture、reflection record、proposal generator、auditor gate、deployment validation、decision / rollback、Ops summary、SKILL.md 结构治理、dynamic risk 基础。 |
 | 2026-05-30 | Runtime Replay Validation checkpoint | deterministic isolated manifest replay、replay job events、candidate workflow materialization、manual `stage=executed` validation report、自动 pipeline runtime replay opt-in、readiness / auto-accept gate 更新。 |
-| 2026-06-13 | dao-run 鲁棒性与桌面端基础 | 修复 dao-run CLI 静默失败问题（服务不可达时现退出 1 并输出可执行指引）、添加 PreToolUse hook 保护 CLAUDE.md 不被覆盖、修复 restart-serve-9898.ps1 构建竞态。新增 Electron 桌面端基础、skill auditor 风险分层、skill evolution 与 workflow 系统的全面测试覆盖。 |
+| 2026-06-13 | dao-run 鲁棒性与桌面端基础 | 修复 dao-run CLI 静默失败、添加 PreToolUse hook 保护 CLAUDE.md、修复构建竞态。新增 Electron 桌面端基础、skill auditor 风险分层、全面测试覆盖。 |
 | 2026-06-13b | 代码库优化与治理加固 | 从 index.ts 提取 CLI/Doctor（减少 576 行）、修复 crossFileConsistency 精度、改进 auditor capability matching 增加 token-level 回退、添加 insufficient_evidence reasonCode、对齐 CLAUDE.md 与实现、清理 docs/（26 份归档，新增开发者指南）、扩展 E2E 测试、添加 agents/README 与 timeline.ts 重构说明。构建通过，223/223 单元测试全绿。 |
-
+| 2026-06-13c | 架构拆分：路由层四模块化 | 提取 `src/server/skill-evolution-routes.ts`（715行/13 handler）、`goal-routes.ts`（452行/11 handler）、`job-routes.ts`（1052行/17 handler）、`chat-routes.ts`（821行/3 handler+7 builder）。index.ts 7531→5586行。构建通过，223/223 测试全绿。 |
 系统围绕两个模型角色构建：
 
 - `planner`：更强的规划模型，负责理解目标、拆解步骤、审计进展、决定重试，并生成最终答案
@@ -113,9 +113,16 @@ npm run serve:restart:9898
 - `src/tools.ts`：本地工具与搜索 / 抓取 / 文件执行
 - `src/workflow-runtime.ts`：workflow 执行与 replan 流程
 - `src/workflow-plan.ts`：workflow plan schema 解析与校验
-- `src/index.ts`：HTTP API、chat adapter、job 控制面、浏览器路由（CLI/Doctor 已提取至 `src/cli/`）
-- `src/cli/entry.ts`：CLI 入口（main、server、task/team/dao-run 执行器）
-- `src/cli/doctor.ts`：配置诊断（doctor report、config checks）
+- `src/index.ts`：HTTP 路由装配 + 核心执行（5586行）
+- `src/server/`：路由模块
+  - `shared.ts`：共享 HTTP 工具
+  - `skill-evolution-routes.ts`：Skill Evolution API（715行）
+  - `goal-routes.ts`：Goal CRUD（452行）
+  - `job-routes.ts`：Job CRUD + Stream（1052行）
+  - `chat-routes.ts`：Chat/Responses/Messages（821行）
+- `src/cli/`：CLI 入口
+  - `entry.ts`：main、server、task/team/dao-run 执行器
+  - `doctor.ts`：配置诊断
 - `src/goals-dashboard.ts`：goal dashboard 渲染
 - `runtime/jobs/`：持久化 job 记录
 - `runtime/logs/`：每次运行的 JSONL 日志
