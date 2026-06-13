@@ -313,7 +313,8 @@ export interface SkillDeploymentValidationReport {
       | "silent_bypass"
       | "candidate_not_verified"
       | "baseline_regression"
-      | "insufficient_improvement";
+      | "insufficient_improvement"
+      | "insufficient_evidence";
     autoAcceptReady: boolean;
     details: string[];
   };

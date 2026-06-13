@@ -222,6 +222,17 @@ function normalizeSearchText(value: string | undefined): string {
   return (value ?? "").toLowerCase().replace(/[^a-z0-9_.-]+/g, " ").trim();
 }
 
+type MatchResult = "exact" | "approximate" | "none";
+
+function jaccardSimilarity(a: string, b: string): number {
+  const tokensA = new Set(a.split(/\s+/).filter(Boolean));
+  const tokensB = new Set(b.split(/\s+/).filter(Boolean));
+  if (tokensA.size === 0 && tokensB.size === 0) return 1;
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  const intersection = new Set([...tokensA].filter((t) => tokensB.has(t)));
+  return intersection.size / (tokensA.size + tokensB.size - intersection.size);
+}
+
 function checkManifestMarkdownConsistency(
   candidateManifest: SkillManifest | null,
   candidateMarkdownPath: string,
@@ -246,9 +257,17 @@ function checkManifestMarkdownConsistency(
   );
 }
 
-function textIncludesNormalized(haystack: string, needle: string | undefined): boolean {
+function textIncludesNormalized(
+  haystack: string,
+  needle: string | undefined,
+  allowApproximate = false,
+): MatchResult {
   const normalizedNeedle = normalizeSearchText(needle);
-  return Boolean(normalizedNeedle && haystack.includes(normalizedNeedle));
+  if (!normalizedNeedle) return "none";
+  if (haystack.includes(normalizedNeedle)) return "exact";
+  if (!allowApproximate) return "none";
+  if (jaccardSimilarity(haystack, normalizedNeedle) >= 0.5) return "approximate";
+  return "none";
 }
 
 function checkManifestMarkdownCapabilityConsistency(
@@ -285,13 +304,13 @@ function checkManifestMarkdownCapabilityConsistency(
   const markdown = normalizeSearchText(safeReadText(candidateMarkdownPath));
   const intentsChanged = JSON.stringify(candidateManifest.intents) !== JSON.stringify(installedManifest?.intents ?? []);
   const missingIntents = intentsChanged
-    ? candidateManifest.intents.filter((intent) => !textIncludesNormalized(markdown, intent))
+    ? candidateManifest.intents.filter((intent) => textIncludesNormalized(markdown, intent) !== "exact")
     : [];
   const tools = [...candidateManifest.requiredTools, ...(candidateManifest.optionalTools ?? [])];
   const installedTools = [...(installedManifest?.requiredTools ?? []), ...(installedManifest?.optionalTools ?? [])];
   const toolsChanged = JSON.stringify(tools) !== JSON.stringify(installedTools);
   const missingTools = toolsChanged
-    ? tools.filter((tool) => !textIncludesNormalized(markdown, tool))
+    ? tools.filter((tool) => textIncludesNormalized(markdown, tool) !== "exact")
     : [];
   const requiredArtifacts = candidateManifest.verification?.requiredArtifacts ?? [];
   const installedRequiredArtifacts = installedManifest?.verification?.requiredArtifacts ?? [];
@@ -303,16 +322,35 @@ function checkManifestMarkdownCapabilityConsistency(
       !installedRequiredArtifacts.includes(artifact)
       || artifactLabels[artifact] !== installedManifest?.verification?.artifactLabels?.[artifact])
     : [];
-  const missingArtifacts = changedArtifacts.filter((artifact) =>
-    !textIncludesNormalized(markdown, artifact) && !textIncludesNormalized(markdown, artifactLabels[artifact]),
-  );
+  const missingArtifacts: string[] = [];
+  const approximateArtifacts: string[] = [];
+  for (const artifact of changedArtifacts) {
+    const artResult = textIncludesNormalized(markdown, artifact, true);
+    const labelResult = textIncludesNormalized(markdown, artifactLabels[artifact], true);
+    if (artResult === "none" && labelResult === "none") {
+      missingArtifacts.push(artifact);
+    } else if ((artResult === "approximate" && labelResult !== "exact") || (labelResult === "approximate" && artResult !== "exact")) {
+      approximateArtifacts.push(artifact);
+    }
+  }
   const successSignal = candidateManifest.verification?.successSignal;
   const successSignalLabel = candidateManifest.verification?.successSignalLabel;
   const successSignalChanged = successSignal !== installedManifest?.verification?.successSignal
     || successSignalLabel !== installedManifest?.verification?.successSignalLabel;
-  const missingSuccessSignal = successSignalChanged && (successSignal || successSignalLabel)
-    ? !textIncludesNormalized(markdown, successSignal) && !textIncludesNormalized(markdown, successSignalLabel)
-    : false;
+  let missingSuccessSignal = false;
+  let approximateSuccessSignal = false;
+  if (successSignalChanged && (successSignal || successSignalLabel)) {
+    const sigResult = textIncludesNormalized(markdown, successSignal, true);
+    const sigLabelResult = textIncludesNormalized(markdown, successSignalLabel, true);
+    if (sigResult === "none" && sigLabelResult === "none") {
+      missingSuccessSignal = true;
+    } else if (
+      (sigResult === "approximate" && sigLabelResult !== "exact")
+      || (sigLabelResult === "approximate" && sigResult !== "exact")
+    ) {
+      approximateSuccessSignal = true;
+    }
+  }
 
   const missing: string[] = [
     ...missingIntents.map((item) => `intent:${item}`),
@@ -321,12 +359,29 @@ function checkManifestMarkdownCapabilityConsistency(
     ...(missingSuccessSignal ? ["success_signal"] : []),
   ];
 
+  const approximate: string[] = [
+    ...approximateArtifacts.map((item) => `artifact:${item} (approximate_match)`),
+    ...(approximateSuccessSignal ? ["success_signal (approximate_match)"] : []),
+  ];
+
+  const hasIssues = missing.length > 0;
+  const detailParts: string[] = [];
+  if (!hasIssues) {
+    detailParts.push("Candidate SKILL.md reflects the manifest intents, tool requirements, and verification evidence contract.");
+    if (approximate.length > 0) {
+      detailParts.push(`Approximate token matches used: ${approximate.join(", ")}.`);
+    }
+  } else {
+    detailParts.push(`Candidate SKILL.md is missing manifest capability signals: ${missing.join(", ")}.`);
+    if (approximate.length > 0) {
+      detailParts.push(`Approximate token matches used: ${approximate.join(", ")}.`);
+    }
+  }
+
   return buildCheck(
     "manifest_markdown_capability_consistent",
-    missing.length === 0,
-    missing.length === 0
-      ? "Candidate SKILL.md reflects the manifest intents, tool requirements, and verification evidence contract."
-      : `Candidate SKILL.md is missing manifest capability signals: ${missing.join(", ")}.`,
+    !hasIssues,
+    detailParts.join(" "),
   );
 }
 

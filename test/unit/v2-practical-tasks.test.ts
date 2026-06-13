@@ -185,9 +185,8 @@ test("Task1: quality metadata tier=regression-risk for skill_defect with silent 
   assert.equal(proposal.qualitySummary?.tier, "regression-risk",
     "skill_defect with silent bypass should be regression-risk");
   assert.equal(proposal.qualitySummary?.fixtureClass, "skill_defect");
-  // patch_body on skill_defect -> manifest_stable (not manifest_verification_only,
-  // which only applies when recommendedAction === "patch_verification")
-  assert.equal(proposal.qualitySummary?.crossFileConsistency, "manifest_stable");
+  // patch_body on skill_defect with verification signals -> needs_audit (body+verification concerns)
+  assert.equal(proposal.qualitySummary?.crossFileConsistency, "needs_audit");
   assert.ok(proposal.qualitySummary?.reasons.some((r) => r.includes("failure evidence")),
     "Should explain why tier is regression-risk");
 });

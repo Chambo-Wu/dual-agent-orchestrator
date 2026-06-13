@@ -1,3 +1,12 @@
+// Timeline rendering module (130KB — pending refactoring).
+// Structure:
+//   lines 1-154   : UI state management (reduceTimelineUiState, URL encode/decode)
+//   lines 156-2344: HTML generation (renderTimelineHtml + template helpers)
+//   lines 2346+   : Utility functions (escapeHtml, formatTime, DAG panels, etc.)
+// Refactoring direction: extract HTML template fragments into a separate
+// module (e.g. src/timeline-templates.ts) so the core render logic stays
+// in this file at a manageable size.
+
 import { getFailureCategoryLabel, getFailureCategoryTitle } from "./failure-classification.js";
 import type { WorkflowUiEvent } from "./workflow-ui-events.js";
 

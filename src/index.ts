@@ -74,6 +74,9 @@ import {
   updateSkillEvolutionProposal,
 } from "./skill-evolution-store.js";
 
+import { main, parseTeamCliArgs } from "./cli/entry.js";
+import { buildDoctorReport } from "./cli/doctor.js";
+
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 const DEFAULT_API_KEY = "dual-agent-local";
 const PLANNER_FAILURE_THRESHOLD = 3;
@@ -240,7 +243,7 @@ interface AnthropicMessagesRequest {
   stop_sequences?: string[];
 }
 
-interface ExposedModel {
+export interface ExposedModel {
   id: string;
   object: "model";
   owned_by: string;
@@ -409,7 +412,7 @@ function resolveSkillEvolutionSummary(record: StoredJobRecord): Record<string, u
   };
 }
 
-function assertHealthyExecutorSelection(
+export function assertHealthyExecutorSelection(
   healthSelection: Awaited<ReturnType<typeof buildHealthyExecutorRuntimeConfig>>,
 ): void {
   if (healthSelection.healthyExecutorIds.length > 0) {
@@ -511,7 +514,7 @@ function resolveRegisteredRoleAgent(config: OrchestratorConfig | undefined, role
   return agent ? { id: agent.id, role: agent.role, model: agent.model.model } : undefined;
 }
 
-function resolveTeamAgents(config: OrchestratorConfig, envValue = process.env.TEAM_AGENTS): TeamAgent[] {
+export function resolveTeamAgents(config: OrchestratorConfig, envValue = process.env.TEAM_AGENTS): TeamAgent[] {
   const envAgents = parseTeamAgentsEnv(envValue);
   if (envAgents.length > 0) {
     return envAgents;
@@ -2074,7 +2077,7 @@ function updateActiveTaskJobSnapshot(jobId: string, taskRunId: string, event: Wo
   });
 }
 
-function getServerApiKey(): string {
+export function getServerApiKey(): string {
   return process.env.DUAL_AGENT_API_KEY?.trim() || process.env.API_KEY?.trim() || DEFAULT_API_KEY;
 }
 
@@ -2089,7 +2092,7 @@ function getDefaultExposedModel(config: OrchestratorConfig): ExposedModel {
   };
 }
 
-function getExposedModels(config: OrchestratorConfig): ExposedModel[] {
+export function getExposedModels(config: OrchestratorConfig): ExposedModel[] {
   const raw = process.env.DUAL_AGENT_MODELS?.trim();
   if (!raw) {
     return [getDefaultExposedModel(config)];
@@ -4411,7 +4414,7 @@ function mergeJobEvents(record: StoredJobRecord, persistedEvents: WorkflowUiEven
     .map((event, index) => ({ ...event, seq: index + 1 }));
 }
 
-async function recoverInterruptedJobs(
+export async function recoverInterruptedJobs(
   autoResumeConcurrency = DEFAULT_AUTO_RESUME_CONCURRENCY,
   options?: {
     jobIds?: string[];
@@ -8024,7 +8027,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   res.end();
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? "GET";
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
@@ -8394,581 +8397,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 }
 
-function getPort(args: string[]): number {
-  const explicitPort = args[1] ? Number(args[1]) : Number(process.env.PORT ?? "9898");
-  return Number.isFinite(explicitPort) && explicitPort > 0 ? explicitPort : 9898;
-}
-
-function parseDaoRunCliArgs(args: string[]): { goal: string; port: number } {
-  const portFlagIndex = args.findIndex((arg) => arg === "--port" || arg === "-p");
-  const port = portFlagIndex >= 0 && args[portFlagIndex + 1]
-    ? Number(args[portFlagIndex + 1])
-    : Number(process.env.PORT ?? "9898");
-  const goalArgs = portFlagIndex >= 0
-    ? args.filter((arg, index) => index !== portFlagIndex && index !== portFlagIndex + 1)
-    : args;
-  return {
-    goal: goalArgs.join(" ").trim(),
-    port: Number.isFinite(port) && port > 0 ? port : 9898,
-  };
-}
-
-function parseTeamCliArgs(args: string[]): { goal: string; planOnly: boolean } {
-  const planOnly = args[0] === "plan" || args.includes("--plan-only");
-  const goalArgs = args
-    .filter((arg, index) => !(index === 0 && arg === "plan") && arg !== "--plan-only" && arg !== "--");
-  return {
-    goal: goalArgs.join(" ").trim(),
-    planOnly,
-  };
-}
-
-function runConfigValidation(configPath?: string): void {
-  const resolvedPath = configPath?.trim() || "config/config.yml";
-  const config = loadConfig(resolvedPath);
-  const routing = loadTaskRoutingConfig(config.taskRoutingPath);
-
-  console.log(JSON.stringify({
-    ok: true,
-    config_path: resolvedPath,
-    planner_model: config.planner.model,
-    executor_model: config.executor.model,
-    executor_candidates: config.modelRouting.executorCandidates,
-    task_routing_path: config.taskRoutingPath,
-    auto_resume_concurrency: config.policy.autoResumeConcurrency,
-    route_types: routing.map((route) => route.type),
-  }, null, 2));
-}
-
-type DoctorCheck = {
-  name: string;
-  ok: boolean;
-  summary: string;
-  detail?: unknown;
-};
-
-type DoctorRecommendation = {
-  category:
-    | "configuration"
-    | "routing"
-    | "network"
-    | "filesystem"
-    | "search"
-    | "runtime";
-  severity: "info" | "warning";
-  message: string;
-  suggested_action: string;
-  related_checks: string[];
-};
-
-function maskSecret(value: string): string {
-  if (!value) {
-    return "";
-  }
-  if (value.length <= 6) {
-    return `${value.slice(0, 1)}***`;
-  }
-  return `${value.slice(0, 3)}***${value.slice(-2)}`;
-}
-
-function buildModelConfigCheck(
-  name: "planner_model_config" | "executor_model_config",
-  label: "planner" | "executor",
-  config: OrchestratorConfig["planner"] | OrchestratorConfig["executor"],
-): DoctorCheck {
-  const urlLooksLocal = /^(https?:\/\/)(127\.0\.0\.1|localhost)/i.test(config.baseUrl);
-  return {
-    name,
-    ok: Boolean(config.baseUrl && config.apiKey && config.model),
-    summary: `${label} model config is ready${urlLooksLocal ? " (local endpoint)." : "."}`,
-    detail: {
-      base_url: config.baseUrl,
-      api_key_present: Boolean(config.apiKey),
-      api_key_preview: config.apiKey ? maskSecret(config.apiKey) : "",
-      model: config.model,
-      timeout_ms: config.timeoutMs,
-      max_tokens: config.maxTokens,
-      temperature: config.temperature,
-      endpoint_scope: urlLooksLocal ? "local" : "remote",
-    },
-  };
-}
-
-function buildTaskRoutingCheck(taskRoutingPath: string | undefined, routing: RoutePolicy[]): DoctorCheck {
-  const routesWithPreferredTools = routing.filter((route) => route.preferredTools.length > 0).length;
-  const routesRequiringEvidence = routing.filter((route) => route.requireEvidenceBeforeFinal).length;
-  return {
-    name: "task_routing_summary",
-    ok: routing.length > 0,
-    summary: `Task routing loaded ${routing.length} route types.`,
-    detail: {
-      task_routing_path: taskRoutingPath ?? "config/task-routing.yml",
-      route_count: routing.length,
-      route_types: routing.map((route) => route.type),
-      routes_with_preferred_tools: routesWithPreferredTools,
-      routes_requiring_evidence: routesRequiringEvidence,
-    },
-  };
-}
-
-function buildSearchProviderCheck(config: OrchestratorConfig): DoctorCheck {
-  if (!config.search) {
-    return {
-      name: "search_provider_readiness",
-      ok: false,
-      summary: "Search provider is not configured.",
-      detail: {
-        provider: null,
-        fallback_enabled: false,
-      },
-    };
-  }
-
-  const providerConfig = config.search.providers[config.search.provider];
-  const providerKindsRequiringApiKey = new Set(["serpapi", "bing_api", "google_cse"]);
-  const providerKindsRequiringSection = new Set(["bing_html", "searxng", "serpapi", "bing_api", "google_cse", "mcp"]);
-  const sectionPresent = config.search.provider === "url_template" || providerKindsRequiringSection.has(config.search.provider)
-    ? Boolean(providerConfig)
-    : true;
-  const apiKeyRequired = providerKindsRequiringApiKey.has(config.search.provider);
-  const apiKeyPresent = !apiKeyRequired || Boolean(config.search.apiKey);
-  const ok = sectionPresent && apiKeyPresent;
-
-  return {
-    name: "search_provider_readiness",
-    ok,
-    summary: ok
-      ? `Search provider "${config.search.provider}" is ready.`
-      : `Search provider "${config.search.provider}" is only partially configured.`,
-    detail: {
-      provider: config.search.provider,
-      provider_section_present: sectionPresent,
-      api_key_required: apiKeyRequired,
-      api_key_present: Boolean(config.search.apiKey),
-      api_key_preview: config.search.apiKey ? maskSecret(config.search.apiKey) : "",
-      fallback_enabled: config.search.fallbackEnabled,
-      timeout_ms: config.search.timeoutMs,
-      provider_config_keys: providerConfig ? Object.keys(providerConfig) : [],
-    },
-  };
-}
-
-function buildDoctorRecommendations(checks: DoctorCheck[]): DoctorRecommendation[] {
-  const recommendations: DoctorRecommendation[] = [];
-  const find = (name: string) => checks.find((check) => check.name === name);
-
-  const configLoad = find("config_load");
-  if (configLoad && !configLoad.ok) {
-    recommendations.push({
-      category: "configuration",
-      severity: "warning",
-      message: "Configuration failed to load.",
-      suggested_action: "Fix the reported config schema errors, then rerun `npm run doctor` or `npm run config:validate`.",
-      related_checks: ["config_load"],
-    });
-    return recommendations;
-  }
-
-  if ((find("planner_model_config") && !find("planner_model_config")!.ok) || (find("executor_model_config") && !find("executor_model_config")!.ok)) {
-    recommendations.push({
-      category: "configuration",
-      severity: "warning",
-      message: "Planner or executor model configuration is incomplete.",
-      suggested_action: "Verify base URLs, model names, and API key env vars for both planner and executor.",
-      related_checks: ["planner_model_config", "executor_model_config"],
-    });
-  }
-
-  if (find("task_routing_load") && !find("task_routing_load")!.ok) {
-    recommendations.push({
-      category: "routing",
-      severity: "warning",
-      message: "Task routing config could not be loaded.",
-      suggested_action: "Fix the task-routing YAML or fall back to the default `config/task-routing.yml` layout.",
-      related_checks: ["task_routing_load", "task_routing_summary"],
-    });
-  }
-
-  if (find("proxy_health") && !find("proxy_health")!.ok) {
-    recommendations.push({
-      category: "network",
-      severity: "warning",
-      message: "Proxy configuration looks degraded.",
-      suggested_action: "Check `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, especially local placeholders or dead ports.",
-      related_checks: ["proxy_health", "runtime_profile"],
-    });
-  }
-
-  if ((find("workspace_writable") && !find("workspace_writable")!.ok) || (find("runtime_writable") && !find("runtime_writable")!.ok)) {
-    recommendations.push({
-      category: "filesystem",
-      severity: "warning",
-      message: "One or more writable roots are not writable.",
-      suggested_action: "Check directory permissions and confirm the workspace/runtime roots are writable by this process.",
-      related_checks: ["workspace_writable", "runtime_writable"],
-    });
-  }
-
-  if (find("search_provider_readiness") && !find("search_provider_readiness")!.ok) {
-    recommendations.push({
-      category: "search",
-      severity: "warning",
-      message: "Search provider is only partially configured.",
-      suggested_action: "Add the active provider section and required API key, or switch to a provider that is already configured.",
-      related_checks: ["search_provider_readiness"],
-    });
-  }
-
-  if (recommendations.length === 0) {
-    recommendations.push({
-      category: "runtime",
-      severity: "info",
-      message: "No critical doctor issues were detected.",
-      suggested_action: "Use `/v1/jobs/:id/runtime-profile`, `/events`, and `/timeline` when you need job-specific diagnostics.",
-      related_checks: checks.filter((check) => check.ok).map((check) => check.name),
-    });
-  }
-
-  return recommendations;
-}
-
-function runWritableCheck(targetDir: string, label: string): DoctorCheck {
-  try {
-    if (!existsSync(targetDir)) {
-      mkdirSync(targetDir, { recursive: true });
-    }
-    const probePath = join(targetDir, `.doctor-write-check-${process.pid}-${Date.now()}.tmp`);
-    writeFileSync(probePath, "ok", "utf8");
-    unlinkSync(probePath);
-    return {
-      name: `${label}_writable`,
-      ok: true,
-      summary: `${label} is writable.`,
-      detail: { path: targetDir },
-    };
-  } catch (error) {
-    return {
-      name: `${label}_writable`,
-      ok: false,
-      summary: `${label} is not writable.`,
-      detail: {
-        path: targetDir,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    };
-  }
-}
-
-function buildDoctorReport(configPath?: string): Record<string, unknown> {
-  ensureRuntimeDirectories();
-  const resolvedPath = configPath?.trim() || "config/config.yml";
-  const checks: DoctorCheck[] = [];
-
-  try {
-    const config = loadConfig(resolvedPath);
-    checks.push({
-      name: "config_load",
-      ok: true,
-      summary: "Configuration loaded successfully.",
-        detail: {
-          planner_model: config.planner.model,
-          executor_model: config.executor.model,
-          auto_resume_concurrency: config.policy.autoResumeConcurrency,
-        },
-      });
-    checks.push(buildModelConfigCheck("planner_model_config", "planner", config.planner));
-    checks.push(buildModelConfigCheck("executor_model_config", "executor", config.executor));
-    checks.push({
-      name: "executor_candidate_queue",
-      ok: config.modelRouting.executorCandidates.length > 0,
-      summary: config.modelRouting.executorCandidates.length > 0
-        ? `Executor candidate queue contains ${config.modelRouting.executorCandidates.length} model(s).`
-        : "Executor candidate queue is empty.",
-      detail: {
-        executor_candidates: config.modelRouting.executorCandidates,
-        candidate_count: config.modelRouting.executorCandidates.length,
-      },
-    });
-
-    const routing = loadTaskRoutingConfig(config.taskRoutingPath);
-    checks.push({
-      name: "task_routing_load",
-      ok: true,
-      summary: "Task routing config loaded successfully.",
-      detail: {
-        task_routing_path: config.taskRoutingPath,
-        route_types: routing.map((route) => route.type),
-      },
-    });
-    checks.push(buildTaskRoutingCheck(config.taskRoutingPath, routing));
-
-    const runtimeProfile = buildRuntimeProfile(config);
-    checks.push({
-      name: "runtime_profile",
-      ok: true,
-      summary: "Runtime profile generated successfully.",
-      detail: runtimeProfile,
-    });
-
-    checks.push({
-      name: "proxy_health",
-      ok: runtimeProfile.network.proxyHealth === "ok",
-      summary: runtimeProfile.network.proxyHealth === "ok"
-        ? "Proxy health looks normal."
-        : "Proxy configuration looks degraded.",
-      detail: runtimeProfile.network,
-    });
-
-    checks.push(runWritableCheck(WORKSPACE_ROOT, "workspace"));
-    checks.push(runWritableCheck(RUNTIME_ROOT, "runtime"));
-    checks.push(runWritableCheck(ARTIFACTS_ROOT, "artifacts"));
-
-    checks.push(buildSearchProviderCheck(config));
-
-    return {
-      ok: checks.every((check) => check.ok),
-      generated_at: new Date().toISOString(),
-      config_path: resolvedPath,
-      diagnostic_taxonomy: {
-        failure_categories: listFailureCategories(),
-      },
-      summary: {
-        passed: checks.filter((check) => check.ok).length,
-        failed: checks.filter((check) => !check.ok).length,
-        total: checks.length,
-      },
-      recommendations: buildDoctorRecommendations(checks),
-      checks,
-    };
-  } catch (error) {
-    checks.push({
-      name: "config_load",
-      ok: false,
-      summary: "Configuration failed to load.",
-      detail: {
-        error: error instanceof Error ? error.message : String(error),
-      },
-    });
-    return {
-      ok: false,
-      generated_at: new Date().toISOString(),
-      config_path: resolvedPath,
-      diagnostic_taxonomy: {
-        failure_categories: listFailureCategories(),
-      },
-      summary: {
-        passed: checks.filter((check) => check.ok).length,
-        failed: checks.filter((check) => !check.ok).length,
-        total: checks.length,
-      },
-      recommendations: buildDoctorRecommendations(checks),
-      checks,
-    };
-  }
-}
-
-function runDoctor(configPath?: string): void {
-  console.log(JSON.stringify(buildDoctorReport(configPath), null, 2));
-}
-
-async function runDaoRunCli(goal: string, port = 9898): Promise<void> {
-  const trimmedGoal = goal.trim();
-  if (!trimmedGoal) {
-    throw new Error("Usage: node dist/index.js dao-run \"your task here\"");
-  }
-  const jobsUrl = `http://127.0.0.1:${port}/v1/jobs`;
-  let response: Response;
-  try {
-    response = await fetch(jobsUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${getServerApiKey()}`,
-        "Content-Type": "application/json; charset=utf-8",
-      },
-      body: JSON.stringify({
-        goal: trimmedGoal,
-        mode: "task",
-        policy: {
-          async: true,
-        },
-      }),
-    });
-  } catch (error) {
-    // Service unreachable (e.g. ECONNREFUSED surfaces as "fetch failed"). Emit actionable
-    // guidance on stdout so the caller never mistakes a down service for a completed job,
-    // then fail loudly so the exit code is non-zero.
-    const detail = error instanceof Error ? error.message : String(error);
-    console.log([
-      "## DAO Run Blocked",
-      "",
-      "- **Route**: service_job (NOT started)",
-      `- **Reason**: DAO service is not reachable at ${jobsUrl} (${detail}).`,
-      "- **Action**: Start the service with `npm run serve:restart:9898`, then re-run this command.",
-      "- **Do not** answer the task locally, fabricate a job id, or edit repository files.",
-    ].join("\n"));
-    throw new Error(`DAO service not reachable at http://127.0.0.1:${port}. Start it with: npm run serve:restart:9898`);
-  }
-  const payload = await response.json() as {
-    job_id?: string;
-    status?: string;
-    timeline_url?: string;
-    error?: { message?: string };
-  };
-  if (!response.ok || !payload.job_id) {
-    throw new Error(payload.error?.message ?? `DAO service returned HTTP ${response.status}`);
-  }
-  console.log([
-    "## DAO Run Summary",
-    "",
-    "- **Route**: service_job",
-    `- **Job**: ${payload.job_id}`,
-    `- **Timeline**: http://127.0.0.1:${port}${payload.timeline_url ?? `/v1/jobs/${payload.job_id}/timeline`}`,
-    `- **Status**: ${payload.status ?? "running"}`,
-    "- **CTA**: Open the timeline URL.",
-  ].join("\n"));
-}
-
-async function runCliTask(task: string): Promise<void> {
-  const baseConfig = loadConfig();
-  const healthSelection = await buildHealthyExecutorRuntimeConfig(baseConfig);
-  assertHealthyExecutorSelection(healthSelection);
-  configureSearchTools(healthSelection.config.search);
-  const intentRoute = await detectIntentRoute({
-    config: healthSelection.config,
-    userGoal: task,
-    allowPlannerFallback: true,
-  });
-
-  if (shouldDispatchToTeam(intentRoute)) {
-    await runCliTeam(task);
-    return;
-  }
-
-  const logger = createRunLogger(task);
-  const result = await dispatchTaskIntentRoute(healthSelection.config, task, intentRoute, logger);
-  console.error(`Run log: ${logger.logPath}`);
-  console.log(JSON.stringify({
-    status: result.status,
-    output: result.output,
-    verified: result.verified,
-    executorHistory: result.executorHistory,
-    job: result.job,
-    plan: result.plan,
-    taskRuns: result.taskRuns,
-    artifacts: result.artifacts,
-    model_health: healthSelection.results,
-  }, null, 2));
-}
-
-async function runCliTeam(goal: string, options: { planOnly?: boolean } = {}): Promise<void> {
-  const config = loadConfig();
-  const healthSelection = await buildHealthyExecutorRuntimeConfig(config);
-  assertHealthyExecutorSelection(healthSelection);
-  configureSearchTools(healthSelection.config.search);
-  const logger = createRunLogger(goal);
-  const tracer = new Tracer(logger);
-  const startedAt = new Date().toISOString();
-
-  const teamAgents = resolveTeamAgents(healthSelection.config);
-
-  const result = await runTeam(healthSelection.config, goal, teamAgents, logger, tracer, { planOnly: options.planOnly });
-
-  // Export dashboard
-  const dashData = buildDashboardData(
-    logger.runId,
-    goal,
-    result.tasks,
-    tracer.getEvents(),
-    startedAt,
-    result.job.intentRoute ?? {
-      kind: "goal",
-      reason: "team CLI mode selected",
-      source: "heuristic",
-    },
-  );
-  const jsonPath = exportDashboardJson(dashData);
-  const htmlPath = exportDashboardHtml(dashData);
-  console.error(`Run log: ${logger.logPath}`);
-  console.error(`Dashboard JSON: ${jsonPath}`);
-  console.error(`Dashboard HTML: ${htmlPath}`);
-
-  console.log(JSON.stringify({
-    goal: result.goal,
-    finalAnswer: result.finalAnswer,
-    taskResults: Object.fromEntries(result.taskResults),
-    memorySummary: result.memorySummary,
-    job: result.job,
-    plan: result.plan,
-    taskRuns: result.taskRuns,
-    artifacts: result.artifacts,
-    model_health: healthSelection.results,
-    traceSummary: tracer.getSummary(),
-  }, null, 2));
-}
-
-function runServer(port: number): void {
-  ensureRuntimeDirectories();
-  const config = loadConfig();
-  configureSearchTools(config.search);
-  const recoveryPromise = recoverInterruptedJobs(config.policy.autoResumeConcurrency);
-  const server = createServer((req, res) => {
-    void handleRequest(req, res);
-  });
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`Dual Agent Orchestrator API listening on http://127.0.0.1:${port}`);
-    console.log(`API key: ${getServerApiKey()}`);
-    console.log(`Models: ${getExposedModels(config).map((model) => model.id).join(", ")}`);
-    void recoveryPromise
-      .then((recoveredJobIds) => {
-        if (recoveredJobIds.length > 0) {
-          console.log(`Recovered interrupted jobs after restart: ${recoveredJobIds.join(", ")}`);
-        }
-      })
-      .catch((error) => {
-        console.error(`Failed to recover interrupted jobs after restart: ${error instanceof Error ? error.message : String(error)}`);
-      });
-  });
-}
-
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  if (args[0] === "config" && args[1] === "validate") {
-    runConfigValidation(args[2]);
-    return;
-  }
-
-  if (args[0] === "doctor") {
-    runDoctor(args[1]);
-    return;
-  }
-
-  if (args[0] === "serve") {
-    runServer(getPort(args));
-    return;
-  }
-
-  if (args[0] === "dao-run") {
-    const parsed = parseDaoRunCliArgs(args.slice(1));
-    await runDaoRunCli(parsed.goal, parsed.port);
-    return;
-  }
-
-  if (args[0] === "team") {
-    const { goal, planOnly } = parseTeamCliArgs(args.slice(1));
-    if (!goal) {
-      throw new Error("Usage: node dist/index.js team [plan|--plan-only] \"your multi-agent goal here\"");
-    }
-    await runCliTeam(goal, { planOnly });
-    return;
-  }
-
-  const userGoal = args.join(" ").trim();
-  if (!userGoal) {
-    throw new Error("Usage: node dist/index.js \"your task here\" OR node dist/index.js serve [port] OR node dist/index.js team [plan|--plan-only] \"goal\" OR node dist/index.js config validate [path] OR node dist/index.js doctor [path]");
-  }
-
-  await runCliTask(userGoal);
-}
 
 const entryHref = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
 if (import.meta.url === entryHref) {

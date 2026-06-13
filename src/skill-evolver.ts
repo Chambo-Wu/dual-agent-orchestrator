@@ -175,6 +175,18 @@ function buildProposalQualitySummary(
     reasons.push("Mixed patch scope requires explicit audit before validation.");
   }
 
+  const bodyScopeKinds = new Set(["body_only", "body_and_appendix"]);
+  if (
+    crossFileConsistency !== "needs_audit" &&
+    bodyScopeKinds.has(diffSummary.scope) &&
+    (reflection.reflectionKind === "skill_defect" ||
+      reflection.evidence.failedCheckNames.length > 0 ||
+      reflection.evidence.silentBypassSignal)
+  ) {
+    crossFileConsistency = "needs_audit";
+    reasons.push("Body-scope patch with verification concerns requires cross-file audit before validation.");
+  }
+
   return {
     tier,
     reasons,

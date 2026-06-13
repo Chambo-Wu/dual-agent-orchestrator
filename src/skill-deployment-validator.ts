@@ -684,6 +684,8 @@ export function validateSkillEvolutionProposal(input: {
         ? "candidate_not_verified"
       : !candidateVerified
         ? "candidate_not_verified"
+        : baselineFailedChecks.length === 0 && candidateFailedChecks.length === 0
+          ? "insufficient_evidence"
         : baselineVerified && candidateFailedChecks.length > baselineFailedChecks.length
           ? "baseline_regression"
           : !baselineVerified && candidateFailedChecks.length >= baselineFailedChecks.length
@@ -699,6 +701,8 @@ export function validateSkillEvolutionProposal(input: {
         ? "Candidate proposal failed validation because its patch scope crosses the shared Proposal Generator policy boundary."
       : !markdownSectionPolicy.policyReady
         ? "Candidate proposal failed validation because its markdown section changes miss or cross the shared Proposal Generator policy."
+      : reasonCode === "insufficient_evidence"
+        ? "Candidate proposal failed validation because neither baseline nor candidate has meaningful check results to compare."
       : baselineVerified
         ? "Candidate proposal failed validation because it does not preserve the verified baseline quality."
       : "Candidate proposal failed validation because it does not show enough improvement over the baseline.";

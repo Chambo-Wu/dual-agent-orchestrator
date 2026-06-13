@@ -195,3 +195,60 @@ test("demo smoke covers health, dashboards, skills, and a goal run-next path", a
     }
   });
 });
+
+test("job lifecycle smoke covers create, get, events, timeline, cancel", async () => {
+  await withLocalProbeServer(async (baseUrl) => {
+    // 1. Create a job
+    const createRes = await request("POST", `${baseUrl}/jobs`, {
+      goal: "Write a markdown file named test-e2e.md with a single line 'hello e2e'",
+      mode: "task",
+    });
+    assert.equal(createRes.statusCode, 201);
+    const created = JSON.parse(createRes.body);
+    assert.ok(created.id, "job should have an id");
+    const jobId: string = created.id;
+
+    // 2. Get the job
+    const getRes = await request("GET", `${baseUrl}/jobs/${jobId}`);
+    assert.equal(getRes.statusCode, 200);
+    const job = JSON.parse(getRes.body);
+    assert.equal(job.id, jobId);
+    assert.ok(["pending", "running", "completed", "failed"].includes(job.status), `unexpected job status: ${job.status}`);
+
+    // 3. Get job events (should return array or object with events)
+    const eventsRes = await request("GET", `${baseUrl}/jobs/${jobId}/events`);
+    assert.equal(eventsRes.statusCode, 200);
+    const events = JSON.parse(eventsRes.body);
+    assert.ok(Array.isArray(events) || events.events, "events should be accessible");
+
+    // 4. Get job timeline (HTML)
+    const timelineRes = await request("GET", `${baseUrl}/jobs/${jobId}/timeline`);
+    assert.equal(timelineRes.statusCode, 200);
+    assert.ok(timelineRes.body.includes("<!DOCTYPE html>") || timelineRes.body.includes("<html"), "timeline should return HTML");
+
+    // 5. Cancel the job
+    const cancelRes = await request("POST", `${baseUrl}/jobs/${jobId}/cancel`);
+    assert.ok([200, 409].includes(cancelRes.statusCode), `cancel should return 200 or 409, got ${cancelRes.statusCode}`);
+  });
+});
+
+test("job list endpoint returns paginated results", async () => {
+  await withLocalProbeServer(async (baseUrl) => {
+    const res = await request("GET", `${baseUrl}/jobs`);
+    assert.equal(res.statusCode, 200);
+    const list = JSON.parse(res.body);
+    assert.ok(Array.isArray(list), "job list should be an array");
+  });
+});
+
+test("dashboard endpoints return HTML", async () => {
+  const res = await request("GET", "/jobs/dashboard");
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.body.includes("<!DOCTYPE html>") || res.body.includes("<html"), "jobs dashboard should return HTML");
+});
+
+test("goals dashboard returns HTML", async () => {
+  const res = await request("GET", "/goals/dashboard");
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.body.includes("<!DOCTYPE html>") || res.body.includes("<html"), "goals dashboard should return HTML");
+});

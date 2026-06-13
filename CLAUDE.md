@@ -162,27 +162,27 @@ Each agent reads specific context:
 
 ## Integration with Dual Agent Orchestrator Services
 
-The original Dual Agent Orchestrator services remain available via MCP:
+The Dual Agent Orchestrator service (run via `npm run serve` on port 9898) exposes a full REST API:
 
-### Available MCP Tools
+### Available API Endpoints
 
-1. **skill_evolution**: Track and improve skill performance
-   - `create_skill_reflection`: Record task outcomes
-   - `create_skill_proposal`: Propose skill improvements
-   - `audit_skill_proposal`: Review proposals
+1. **Skill Evolution**: Track and improve skill performance
+   - `POST /v1/skills/:id/reflections` — Record task outcomes
+   - `POST /v1/skills/:id/proposals` — Propose skill improvements
+   - `POST /v1/skill-evolution/proposals/:id/audit` — Review proposals
 
-2. **workflow_management**: Manage complex workflows
-   - `create_job`: Create async job
-   - `get_job_status`: Check job progress
-   - `get_job_events`: Stream job events
+2. **Workflow Management**: Manage complex workflows
+   - `POST /v1/jobs` — Create async job
+   - `GET /v1/jobs/:id` — Check job progress
+   - `GET /v1/jobs/:id/events` — Stream job events
 
-3. **observation**: Monitor system health
-   - `get_health`: System health check
-   - `get_ops_summary`: Operational summary
+3. **Observation**: Monitor system health
+   - `GET /health` — System health check
+   - `GET /v1/skill-evolution/ops` — Operational summary
 
-### When to Use MCP Tools
+### When to Use Service API
 
-Use MCP tools when:
+Use the service API when:
 - Task requires async execution (long-running)
 - Need to track skill evolution over time
 - Want to leverage existing workflow definitions
@@ -195,13 +195,19 @@ Use native Claude Code agents when:
 
 ## Model Routing Strategy
 
-| Task Complexity | Model Tier | Use Case |
-|-----------------|------------|----------|
-| Trivial | Haiku | Classification, simple transforms |
-| Simple | Sonnet | Single-step implementation |
-| Medium | Sonnet | Multi-step implementation |
-| Complex | Opus | Architecture, planning, verification |
-| Critical | Opus | Security, correctness verification |
+Model selection follows the configured `planner`/`executor`/`models` routing in `config/config.yml`.
+The runtime supports multi-model candidate pools with health checks and lazy warmup.
+
+| Task Complexity | Routing | Notes |
+|-----------------|---------|-------|
+| Trivial | Single executor call | No planner needed |
+| Simple | Direct executor | Single-step implementation |
+| Medium | Planner + executor | Multi-step with sequencing |
+| Complex | Planner + workers + verifier | Parallel execution, verification gates |
+| Critical | Planner + verifier gate | Mandatory evidence-based validation |
+
+Rather than hardcoding model tiers (Haiku/Sonnet/Opus), the system uses the configured model routing:
+see `config.example.config.yml` and the `model_routing` section of README.md.
 
 ## Quality Gates
 
