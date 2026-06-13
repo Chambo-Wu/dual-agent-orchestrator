@@ -72,6 +72,7 @@ npm run serve:restart:9898
 | 2026-05-28 | Goal Mode 与 Skill 基础层规划 | Goal mode 执行规划、任务拆解方向、skill-aware planner / install 设计收口、旧任务清理。 |
 | 2026-05-29 | Skill 自进化 v1 控制面 | outcome capture、reflection record、proposal generator、auditor gate、deployment validation、decision / rollback、Ops summary、SKILL.md 结构治理、dynamic risk 基础。 |
 | 2026-05-30 | Runtime Replay Validation checkpoint | deterministic isolated manifest replay、replay job events、candidate workflow materialization、manual `stage=executed` validation report、自动 pipeline runtime replay opt-in、readiness / auto-accept gate 更新。 |
+| 2026-06-13 | dao-run 鲁棒性与桌面端基础 | 修复 dao-run CLI 静默失败问题（服务不可达时现退出 1 并输出可执行指引）、添加 PreToolUse hook 保护 CLAUDE.md 不被覆盖、修复 restart-serve-9898.ps1 构建竞态。新增 Electron 桌面端基础、skill auditor 风险分层、skill evolution 与 workflow 系统的全面测试覆盖。 |
 
 ## 概览
 

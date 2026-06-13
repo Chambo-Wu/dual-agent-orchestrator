@@ -94,6 +94,7 @@ The skill-evolution path is now partially productized rather than just a design 
 | 2026-05-28 | Goal Mode and skill foundation planning | Goal-mode execution planning, task decomposition direction, skill-aware planner/install design consolidation, and older task cleanup. |
 | 2026-05-29 | Skill Evolution v1 control plane | Outcome capture, reflection records, proposal generation, auditor gate, deployment validation, decision/rollback records, Ops summaries, SKILL.md structure governance, and dynamic risk foundations. |
 | 2026-05-30 | Runtime replay validation checkpoint | Deterministic isolated manifest replay, replay job events, candidate workflow materialization, manual `stage=executed` validation reports, opt-in auto-pipeline runtime replay, and updated readiness/auto-accept gates. |
+| 2026-06-13 | dao-run robustness and desktop foundation | Fixed dao-run CLI silent failure (service-down now exits 1 with actionable guidance), added PreToolUse hook to protect CLAUDE.md from being overwritten, fixed restart-serve-9898.ps1 build race condition. Added Electron desktop app foundation, skill auditor with risk tiering, and comprehensive test coverage for skill evolution and workflow systems. |
 
 ## Terminology
 
