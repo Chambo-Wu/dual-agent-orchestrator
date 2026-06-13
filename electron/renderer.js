@@ -4,6 +4,7 @@ const titles = {
   jobs: ["Jobs Dashboard", "查看任务历史、时间线、事件、artifact 与恢复动作。"],
   goals: ["Goals Dashboard", "管理 GoalMode 的计划、run-next、retry、resume 与 review。"],
   skills: ["Skill Evolution Ops", "查看 proposal queue、accepted history、rollback guide 与运营指标。"],
+  "skill-create": ["新增 Skill", "填写少量字段，生成本项目可识别的 SKILL.md 与 skill.json。"],
   health: ["运行健康", "查看模型健康、服务日志与当前配置路径。"],
 };
 
@@ -248,6 +249,44 @@ async function submitTask(event) {
   if (jobId) connectJobStream(jobId);
 }
 
+async function submitSkill(event) {
+  event.preventDefault();
+  $("#skill-create-status").textContent = "generating";
+  $("#skill-create-summary").textContent = "";
+  $("#skill-create-json").textContent = "";
+  const input = {
+    id: $("#skill-id").value,
+    title: $("#skill-title").value,
+    description: $("#skill-description").value,
+    intent: $("#skill-intent").value,
+    keywords: $("#skill-keywords").value,
+    procedure: $("#skill-procedure").value,
+    requiredTools: $("#skill-tools").value,
+    envVars: $("#skill-env-vars").value,
+    allowShell: $("#skill-allow-shell").checked,
+    runtimeEntry: $("#skill-runtime-entry").value,
+    sourceNotes: $("#skill-source-notes").value,
+    overwrite: $("#skill-overwrite").checked,
+  };
+  const result = await window.desktop.createSkill(input);
+  if (!result.ok) {
+    $("#skill-create-status").textContent = "failed";
+    $("#skill-create-summary").textContent = result.error || "Skill generation failed.";
+    $("#skill-create-json").textContent = JSON.stringify(result, null, 2);
+    return;
+  }
+  $("#skill-create-status").textContent = "created";
+  $("#skill-create-summary").textContent = [
+    `Skill: ${result.skillId}`,
+    `Directory: ${result.directory}`,
+    `Manifest: ${result.files?.manifest || ""}`,
+    `Markdown: ${result.files?.markdown || ""}`,
+    "",
+    "Next: restart or refresh the service, then check /v1/skills or Skill Ops.",
+  ].join("\n");
+  $("#skill-create-json").textContent = JSON.stringify(result.manifest, null, 2);
+}
+
 async function loadHealth() {
   const result = await window.desktop.apiRequest("/health");
   const roles = result.body?.runtime?.team_agents?.roles || [];
@@ -278,6 +317,7 @@ function openCurrentExternal() {
     jobs: `${base}/jobs/dashboard`,
     goals: `${base}/goals/dashboard`,
     skills: `${base}/skill-evolution/ops`,
+    "skill-create": `${base}/v1/skills`,
     health: `${base}/health`,
   };
   window.desktop.openExternal(urls[currentView]);
@@ -286,6 +326,7 @@ function openCurrentExternal() {
 function bindEvents() {
   $$(".nav-item").forEach((item) => item.addEventListener("click", () => setView(item.dataset.view)));
   $("#task-form").addEventListener("submit", submitTask);
+  $("#skill-form").addEventListener("submit", submitSkill);
   $("#task-route").addEventListener("change", () => {
     appState.activeRouteId = $("#task-route").value;
     $("#route-pill").textContent = appState.activeRouteId;

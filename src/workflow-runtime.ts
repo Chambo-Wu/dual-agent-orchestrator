@@ -3,7 +3,7 @@ import type { RunLogger } from "./logger.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import type { ApprovalRequest, Artifact, OrchestratorConfig, PlannerOutput, RegisteredAgent, RoutePolicy, RunOptions, RunTaskResult, TaskRun, VerificationCheck, VerificationResult, WorkflowPlan, WorkflowTaskSpec } from "./types.js";
 import { createJobRecord, createPlanRecord, createTaskRunRecord, collectArtifactsFromExecutorHistory } from "./workflow-contract.js";
-import { assessWorkflowExecutionSupport, validateWorkflowPlan } from "./workflow-plan.js";
+import { assessWorkflowExecutionSupport, repairWorkflowPlan, validateWorkflowPlan } from "./workflow-plan.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { RUNTIME_ROOT, WORKSPACE_ROOT } from "./paths.js";
 import { createModelVerifier, DEFAULT_VERIFIERS, runVerifiers, verificationPassed as verificationResultPassed, type VerificationContext, type Verifier } from "./verification.js";
@@ -867,7 +867,7 @@ async function maybeReplanWorkflow(
   });
 
   const replanGoal = buildWorkflowReplanPrompt(goal, plan, failedTask, outcome, state.replanCount);
-  const planner = await runtimeDeps.runPlannerStep(
+  let planner = await runtimeDeps.runPlannerStep(
     config,
     replanGoal,
     buildSyntheticFailureHistory(failedTask, outcome),
@@ -900,13 +900,39 @@ async function maybeReplanWorkflow(
     return undefined;
   }
 
-  const validation = validateWorkflowPlan(planner.workflow_plan, TOOL_DEFINITIONS);
-  const support = validation.valid ? assessWorkflowExecutionSupport(planner.workflow_plan) : undefined;
+  let replacementPlan = planner.workflow_plan;
+  const repair = repairWorkflowPlan(replacementPlan);
+  if (repair.changed) {
+    replacementPlan = repair.plan;
+    logger?.log("workflow.replan.repaired", {
+      workflow_id: plan.id,
+      replacement_workflow_id: replacementPlan.id,
+      task_id: failedTask.id,
+      warnings: repair.warnings,
+    });
+    options?.onEvent?.({
+      type: "workflow.replan.repaired",
+      step,
+      data: {
+        workflow_id: plan.id,
+        replacement_workflow_id: replacementPlan.id,
+        task_id: failedTask.id,
+        warnings: repair.warnings,
+      },
+    });
+    planner = {
+      ...planner,
+      workflow_plan: replacementPlan,
+    };
+  }
+
+  const validation = validateWorkflowPlan(replacementPlan, TOOL_DEFINITIONS);
+  const support = validation.valid ? assessWorkflowExecutionSupport(replacementPlan) : undefined;
   if (!validation.valid || support?.supported === false) {
     const issues = validation.valid ? support?.issues ?? [] : validation.issues;
     logger?.log("workflow.replan.rejected", {
       workflow_id: plan.id,
-      replacement_workflow_id: planner.workflow_plan.id,
+      replacement_workflow_id: replacementPlan.id,
       task_id: failedTask.id,
       issues,
     });
@@ -915,7 +941,7 @@ async function maybeReplanWorkflow(
       step,
       data: {
         workflow_id: plan.id,
-        replacement_workflow_id: planner.workflow_plan.id,
+        replacement_workflow_id: replacementPlan.id,
         task_id: failedTask.id,
         issues,
       },
@@ -925,7 +951,7 @@ async function maybeReplanWorkflow(
 
   logger?.log("workflow.replan.accepted", {
     workflow_id: plan.id,
-    replacement_workflow_id: planner.workflow_plan.id,
+    replacement_workflow_id: replacementPlan.id,
     task_id: failedTask.id,
     replan_count: state.replanCount,
   });
@@ -934,10 +960,10 @@ async function maybeReplanWorkflow(
     step,
     data: {
       workflow_id: plan.id,
-      replacement_workflow_id: planner.workflow_plan.id,
+      replacement_workflow_id: replacementPlan.id,
       task_id: failedTask.id,
       replan_count: state.replanCount,
-      task_count: planner.workflow_plan.tasks.length,
+      task_count: replacementPlan.tasks.length,
     },
   });
   options?.onEvent?.({
@@ -945,7 +971,7 @@ async function maybeReplanWorkflow(
     step,
     data: {
       workflow_id: plan.id,
-      replacement_workflow_id: planner.workflow_plan.id,
+      replacement_workflow_id: replacementPlan.id,
       task_id: failedTask.id,
       replan_count: state.replanCount,
     },
@@ -965,16 +991,16 @@ async function maybeReplanWorkflow(
         kind: archivedOutcome.task.kind,
         role: archivedOutcome.task.role,
         workflow_id: plan.id,
-        replacement_workflow_id: planner.workflow_plan.id,
+        replacement_workflow_id: replacementPlan.id,
       },
     });
   }
-  const archivedTaskRuns = buildArchivedTaskRuns(plan, archivedOutcomeMap.values(), planner.workflow_plan.id);
+  const archivedTaskRuns = buildArchivedTaskRuns(plan, archivedOutcomeMap.values(), replacementPlan.id);
   state.archivedTaskRuns.push(...archivedTaskRuns);
   state.archivedArtifacts.push(...archivedTaskRuns.flatMap((taskRun) => taskRun.artifacts));
   state.replanHistory.push({
     supersededWorkflowId: plan.id,
-    replacementWorkflowId: planner.workflow_plan.id,
+    replacementWorkflowId: replacementPlan.id,
     failedTaskId: failedTask.id,
     failedTaskTitle: failedTask.title,
   });
@@ -982,7 +1008,7 @@ async function maybeReplanWorkflow(
   return await runWorkflowPlan(
     config,
     goal,
-    planner.workflow_plan,
+    replacementPlan,
     routePolicy,
     logger,
     runtimeDeps,
@@ -1002,6 +1028,22 @@ export async function runWorkflowPlan(
   state: WorkflowRuntimeState = { replanCount: 0, archivedTaskRuns: [], archivedArtifacts: [], replanHistory: [] },
 ): Promise<RunTaskResult> {
   const runtimeDeps = mergeRuntimeDeps(deps);
+  const repair = repairWorkflowPlan(plan);
+  if (repair.changed) {
+    logger?.log("workflow.plan.repaired", {
+      workflow_id: repair.plan.id,
+      warnings: repair.warnings,
+    });
+    options?.onEvent?.({
+      type: "workflow.plan.repaired",
+      step: 0,
+      data: {
+        workflow_id: repair.plan.id,
+        warnings: repair.warnings,
+      },
+    });
+    plan = repair.plan;
+  }
   const taskLookup = buildTaskLookup(plan);
   const fallbackOverrides = new Map<string, WorkflowTaskOverride>();
   const consumedFallbackTaskIds = new Set<string>();

@@ -744,6 +744,82 @@ test("job create endpoint supports async start for realtime clients", async () =
   }
 });
 
+test("job create endpoint sanitizes Claude dao-run command wrapper goals", async () => {
+  const expectedGoal = "研究一下多agent的api项目有哪些？目前的项目是否算是创新";
+  __testables.setTaskExecutorForTests(async (goal, _model, _requirePlannerCircuit, context) => {
+    assert.equal(goal, expectedGoal);
+    const taskRun = createTaskRunRecord({
+      id: context?.taskRunId,
+      title: "Sanitized DAO Run",
+      description: goal,
+      status: "completed",
+      verified: true,
+      output: "sanitized job done",
+      attempts: 1,
+      artifacts: [],
+    });
+    const plan = createPlanRecord({
+      id: context?.planId,
+      goal,
+      mode: "task",
+      taskRunIds: [taskRun.id],
+    });
+    const job = createJobRecord({
+      id: context?.jobId,
+      goal,
+      mode: "task",
+      status: "completed",
+      verified: true,
+      output: "sanitized job done",
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    });
+    return {
+      content: "sanitized job done",
+      logPath: "runtime/logs/sanitized-dao-run.jsonl",
+      resolvedModel: "dual-agent-orchestrator",
+      job,
+      plan,
+      taskRuns: [taskRun],
+      artifacts: [],
+    };
+  });
+
+  try {
+    const wrappedGoal = [
+      "<system-reminder>",
+      "Contents of D:\\Android\\dual-agent-orchestrator\\CLAUDE.md",
+      "</system-reminder>",
+      "<command-message>dao-run</command-message>",
+      "<command-name>/dao-run</command-name>",
+      `<command-args>${expectedGoal}</command-args>`,
+      "# DAO Run",
+      `Execute this exact flow for \`${expectedGoal}\`:`,
+    ].join("\n");
+    const res = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedJsonRequest("/v1/jobs", {
+      goal: wrappedGoal,
+      mode: "task",
+      model_route: "dual-agent-orchestrator",
+    }), res);
+    const body = JSON.parse(res.body) as {
+      job_id: string;
+      goal_sanitized: boolean;
+      goal_sanitized_reason: string;
+      job: { goal: string; output: string };
+    };
+
+    assert.equal(res.statusCode, 201);
+    assert.equal(body.goal_sanitized, true);
+    assert.equal(body.goal_sanitized_reason, "claude_command_args");
+    assert.equal(body.job.goal, expectedGoal);
+    assert.equal(body.job.output, "sanitized job done");
+  } finally {
+    __testables.setTaskExecutorForTests(null);
+  }
+});
+
 test("job create endpoint persists a running record before slow task execution finishes", async () => {
   let unblock!: () => void;
   const gate = new Promise<void>((resolve) => {

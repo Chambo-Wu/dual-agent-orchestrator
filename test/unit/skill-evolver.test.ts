@@ -616,6 +616,10 @@ test("generated proposal includes diff, rationale, and control-plane summaries",
   assert.equal(proposal.rationaleSummary?.evidenceHighlights.includes("Failed checks: artifact_presence"), true);
   assert.equal(proposal.rationaleSummary?.evidenceHighlights.includes("Missing requirements: file_excerpt"), true);
   assert.equal(proposal.rationaleSummary?.evidenceHighlights.includes("Silent bypass signal detected."), true);
+  assert.equal(proposal.qualitySummary?.tier, "regression-risk");
+  assert.equal(proposal.qualitySummary?.fixtureClass, "skill_defect");
+  assert.equal(proposal.qualitySummary?.crossFileConsistency, "manifest_verification_only");
+  assert.equal(proposal.qualitySummary?.reasons.some((reason) => reason.includes("failure evidence")), true);
   assert.equal(proposal.controlPlaneSummary?.title, "find.code_symbol: skill_defect");
   assert.equal(proposal.controlPlaneSummary?.rationaleHeadline, "Verification wording should explain the required artifact more clearly.");
   assert.equal(proposal.controlPlaneSummary?.changedFiles.length, 2);
@@ -705,6 +709,9 @@ test("generated proposal diffSummary maps reflection kinds to credible changed s
 
     assert.equal(proposal.diffSummary?.scope, fixture.expectedScope, `${fixture.reflectionKind} scope`);
     assert.deepEqual(proposal.diffSummary?.changedSections, fixture.expectedSections, `${fixture.reflectionKind} changedSections`);
+    assert.equal(proposal.qualitySummary?.fixtureClass, fixture.reflectionKind, `${fixture.reflectionKind} quality fixture class`);
+    assert.equal(typeof proposal.qualitySummary?.tier, "string", `${fixture.reflectionKind} quality tier`);
+    assert.equal(Array.isArray(proposal.qualitySummary?.reasons), true, `${fixture.reflectionKind} quality reasons`);
     assert.deepEqual(proposal.diffSummary?.changedFiles, [
       {
         path: "skills/find.code_symbol/SKILL.md",

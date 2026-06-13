@@ -431,6 +431,18 @@ function readOptionalEnum<T extends string>(
   return value as T;
 }
 
+function readOptionalStringArray(section: Record<string, unknown>, path: string, key: string, fallback: string[], issues: ValidationIssue[]): string[] {
+  const value = section[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    pushIssue(issues, `${path}.${key}`, "must be an array of non-empty strings");
+    return fallback;
+  }
+  return value.map((item) => item.trim());
+}
+
 function validateSearchSection(root: Record<string, unknown>, issues: ValidationIssue[]): SearchConfig | undefined {
   const searchRaw = root.search;
   if (searchRaw === undefined) return undefined;
@@ -554,6 +566,8 @@ function validateSkillEvolutionSection(root: Record<string, unknown>, issues: Va
           medium: "auto_validate",
           high: "auto_propose",
         },
+        dynamicWindowHours: 24,
+        lowRiskPilotSkills: [],
       },
     };
   }
@@ -576,6 +590,8 @@ function validateSkillEvolutionSection(root: Record<string, unknown>, issues: Va
           medium: "auto_validate",
           high: "auto_propose",
         },
+        dynamicWindowHours: 24,
+        lowRiskPilotSkills: [],
       },
     };
   }
@@ -633,6 +649,21 @@ function validateSkillEvolutionSection(root: Record<string, unknown>, issues: Va
           issues,
         ),
       },
+      dynamicWindowHours: readOptionalNumber(
+        riskTieringSection,
+        "skill_evolution.risk_tiering",
+        "dynamic_window_hours",
+        24,
+        issues,
+        { integer: true, min: 1, max: 168 },
+      ),
+      lowRiskPilotSkills: readOptionalStringArray(
+        riskTieringSection,
+        "skill_evolution.risk_tiering",
+        "low_risk_pilot_skills",
+        [],
+        issues,
+      ),
     },
   };
 }

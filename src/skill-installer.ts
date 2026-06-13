@@ -2,13 +2,13 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { resolve } from "node:path";
 import type { InstalledSkillRecord, SkillInstallResult, SkillManifest } from "./skill-types.js";
 import type { OrchestratorConfig } from "./types.js";
-import { PROJECT_ROOT } from "./paths.js";
+import { resolveRuntimeAwarePath } from "./paths.js";
 import { validateSkillManifestShape } from "./skill-manifest-schema.js";
 
 const INSTALLED_REGISTRY_FILENAME = "installed.json";
 
 function resolveConfiguredPath(pathText: string): string {
-  return resolve(PROJECT_ROOT, pathText);
+  return resolveRuntimeAwarePath(pathText);
 }
 
 function installedRegistryPath(config: OrchestratorConfig): string {

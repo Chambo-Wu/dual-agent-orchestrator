@@ -15,7 +15,7 @@ import { compressJsonOutput } from "./compress.js";
 import { buildSingleTaskContract } from "./workflow-contract.js";
 import { mergeRuntimeDeps, type RuntimeDeps } from "./runtime/deps.js";
 import { buildRuntimeProfile } from "./runtime/profile.js";
-import { buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, validateWorkflowPlan, assessWorkflowExecutionSupport } from "./workflow-plan.js";
+import { buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, repairWorkflowPlan, validateWorkflowPlan, assessWorkflowExecutionSupport } from "./workflow-plan.js";
 import { runWorkflowPlan } from "./workflow-runtime.js";
 import { getExecutorDecisionText, getExecutorDisplaySummary, getPlannerDecisionText } from "./output-contract.js";
 import { listBuiltinSkills, matchSkills } from "./skill-registry.js";
@@ -520,10 +520,26 @@ function applyWorkflowMilestoneAFallback(
     };
   }
 
-  const validation = validateWorkflowPlan(planner.workflow_plan, TOOL_DEFINITIONS);
-  emitWorkflowPlanEvents(planner.workflow_plan, validation, stepNumber, logger, options);
+  let workflowPlan = planner.workflow_plan;
+  const repair = repairWorkflowPlan(workflowPlan);
+  if (repair.changed) {
+    workflowPlan = repair.plan;
+    planner = {
+      ...planner,
+      workflow_plan: workflowPlan,
+      audit: {
+        ...planner.audit,
+        notes: planner.audit.notes
+          ? `${planner.audit.notes} Workflow plan repaired: ${repair.warnings.join("; ")}.`
+          : `Workflow plan repaired: ${repair.warnings.join("; ")}.`,
+      },
+    };
+  }
 
-  const fallbackRequest = buildWorkflowFallbackExecutorRequest(planner.workflow_plan);
+  const validation = validateWorkflowPlan(workflowPlan, TOOL_DEFINITIONS);
+  emitWorkflowPlanEvents(workflowPlan, validation, stepNumber, logger, options, repair.warnings);
+
+  const fallbackRequest = buildWorkflowFallbackExecutorRequest(workflowPlan);
   if (!validation.valid || !fallbackRequest) {
     const validationNotes = validation.issues.length > 0
       ? validation.issues.join("; ")
@@ -543,7 +559,7 @@ function applyWorkflowMilestoneAFallback(
 
   logger?.log("workflow.plan.degraded", {
     step: stepNumber,
-    workflow_id: planner.workflow_plan.id,
+    workflow_id: workflowPlan.id,
     fallback_executor_request: fallbackRequest,
   });
 
@@ -570,6 +586,7 @@ function emitWorkflowPlanEvents(
   stepNumber: number,
   logger?: RunLogger,
   options?: RunOptions,
+  repairWarnings: string[] = [],
 ): void {
   logger?.log("workflow.plan.created", {
     step: stepNumber,
@@ -584,8 +601,25 @@ function emitWorkflowPlanEvents(
       summary: plan.summary,
       task_count: plan.tasks.length,
       finish_mode: plan.finish_when.mode,
+      repair_warnings: repairWarnings,
     },
   });
+
+  if (repairWarnings.length > 0) {
+    logger?.log("workflow.plan.repaired", {
+      step: stepNumber,
+      workflow_id: plan.id,
+      warnings: repairWarnings,
+    });
+    options?.onEvent?.({
+      type: "workflow.plan.repaired",
+      step: stepNumber,
+      data: {
+        workflow_id: plan.id,
+        warnings: repairWarnings,
+      },
+    });
+  }
 
   if (validation.valid) {
     logger?.log("workflow.plan.validated", {

@@ -43,7 +43,7 @@ export function resolveCandidateReplayBuiltinDir(proposal: SkillEvolutionProposa
   return {
     candidateRoot,
     builtinDirAbsolute,
-    builtinDirRelative: normalizePath(relative(PROJECT_ROOT, builtinDirAbsolute)),
+    builtinDirRelative: normalizePath(builtinDirAbsolute),
     targetFile,
   };
 }

@@ -83,6 +83,12 @@ export interface SkillEvolutionProposal {
     rationaleHeadline: string;
     changedFiles: string[];
   };
+  qualitySummary?: {
+    tier: "safe" | "useful" | "regression-risk";
+    reasons: string[];
+    fixtureClass: SkillReflectionKind;
+    crossFileConsistency: "manifest_stable" | "manifest_verification_only" | "needs_audit";
+  };
   patchSummary: string;
   patchText: string;
   candidateDir: string;
@@ -111,6 +117,13 @@ export interface SkillAuditReport {
     name: string;
     passed: boolean;
     detail: string;
+  }>;
+  failureCategories?: string[];
+  remediationHints?: Array<{
+    check: string;
+    category: string;
+    evidence: string;
+    hint: string;
   }>;
   summary: string;
   createdAt: string;
@@ -281,6 +294,17 @@ export interface SkillDeploymentValidationReport {
     baselineArtifactCount: number;
     candidateFailedChecks: string[];
     baselineFailedChecks: string[];
+  };
+  resultTaxonomy: {
+    category:
+      | "passed"
+      | "setup_failed"
+      | "candidate_failed"
+      | "baseline_failed"
+      | "inconclusive"
+      | "regression";
+    reason: string;
+    retryable: boolean;
   };
   decision: {
     reasonCode:

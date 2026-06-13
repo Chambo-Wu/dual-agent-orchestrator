@@ -213,6 +213,8 @@ skill_evolution:
     low_ceiling: "auto_accept"
     medium_ceiling: "auto_audit"
     high_ceiling: "auto_propose"
+    dynamic_window_hours: 12
+    low_risk_pilot_skills: ["find.official_sources"]
 policy:
   auto_resume_concurrency: 3
 `);
@@ -234,6 +236,8 @@ policy:
       medium: "auto_audit",
       high: "auto_propose",
     });
+    assert.equal(config.skillEvolution.riskTiering.dynamicWindowHours, 12);
+    assert.deepEqual(config.skillEvolution.riskTiering.lowRiskPilotSkills, ["find.official_sources"]);
   } finally {
     rmSync(dirname(path), { recursive: true, force: true });
   }
@@ -358,6 +362,8 @@ skill_evolution:
     low_ceiling: "auto_accept"
     medium_ceiling: "auto_validate"
     high_ceiling: "auto_propose"
+    dynamic_window_hours: 12
+    low_risk_pilot_skills: ["find.official_sources"]
 policy:
   auto_resume_concurrency: 3
 `);
@@ -378,6 +384,8 @@ policy:
           enabled?: boolean;
           default_tier?: string;
           automation_ceilings?: Record<string, string>;
+          dynamic_window_hours?: number;
+          low_risk_pilot_skills?: string[];
         };
         proposal_count?: number;
       };
@@ -397,6 +405,8 @@ policy:
       medium: "auto_validate",
       high: "auto_propose",
     });
+    assert.equal(health.skill_evolution?.risk_tiering?.dynamic_window_hours, 12);
+    assert.deepEqual(health.skill_evolution?.risk_tiering?.low_risk_pilot_skills, ["find.official_sources"]);
     assert.equal(typeof health.skill_evolution?.proposal_count, "number");
   } finally {
     rmSync(dirname(path), { recursive: true, force: true });

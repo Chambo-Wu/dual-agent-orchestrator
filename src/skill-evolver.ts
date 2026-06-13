@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { join, relative } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { WORKSPACE_ROOT } from "./paths.js";
 import type { OrchestratorConfig } from "./types.js";
 import type { SkillEvolutionProposal, SkillReflectionRecord } from "./skill-evolution-types.js";
@@ -146,6 +146,43 @@ function buildProposalControlPlaneSummary(
   };
 }
 
+function buildProposalQualitySummary(
+  reflection: SkillReflectionRecord,
+  diffSummary: NonNullable<SkillEvolutionProposal["diffSummary"]>,
+): NonNullable<SkillEvolutionProposal["qualitySummary"]> {
+  const reasons: string[] = [];
+  let tier: NonNullable<SkillEvolutionProposal["qualitySummary"]>["tier"] = "safe";
+  let crossFileConsistency: NonNullable<SkillEvolutionProposal["qualitySummary"]>["crossFileConsistency"] = "manifest_stable";
+
+  if (reflection.reflectionKind === "skill_defect" || reflection.reflectionKind === "optimization") {
+    tier = "useful";
+    reasons.push("Reflection indicates a reusable improvement to core skill behavior.");
+  } else {
+    reasons.push("Proposal keeps changes scoped to low-risk scenario guidance.");
+  }
+
+  if (reflection.evidence.silentBypassSignal || reflection.evidence.failedCheckNames.length > 0) {
+    tier = "regression-risk";
+    reasons.push("Reflection includes failure evidence that requires auditor and validation scrutiny.");
+  }
+
+  if (reflection.recommendedAction === "patch_verification") {
+    crossFileConsistency = "manifest_verification_only";
+    reasons.push("Manifest changes must stay within the verification whitelist.");
+  } else if (diffSummary.scope === "mixed") {
+    crossFileConsistency = "needs_audit";
+    tier = "regression-risk";
+    reasons.push("Mixed patch scope requires explicit audit before validation.");
+  }
+
+  return {
+    tier,
+    reasons,
+    fixtureClass: reflection.reflectionKind,
+    crossFileConsistency,
+  };
+}
+
 function buildProposalTargetFiles(
   skillId: string,
   config: OrchestratorConfig,
@@ -154,7 +191,9 @@ function buildProposalTargetFiles(
   const baseLocation = manifest?.install?.location?.trim().length
     ? manifest.install.location
     : join(config.skills.builtinDir, skillId);
-  const baseAbsolutePath = join(WORKSPACE_ROOT, baseLocation);
+  const baseAbsolutePath = isAbsolute(baseLocation)
+    ? resolve(baseLocation)
+    : resolve(WORKSPACE_ROOT, baseLocation);
   const relativeBasePath = relative(WORKSPACE_ROOT, baseAbsolutePath);
   if (!relativeBasePath || relativeBasePath.startsWith("..")) {
     throw new Error(`Skill ${skillId} resolves outside the workspace and cannot be evolved safely.`);
@@ -343,6 +382,7 @@ export function generateSkillEvolutionProposal(input: {
   const diffSummary = buildProposalDiffSummary(reflection, targetFiles);
   const rationaleSummary = buildProposalRationaleSummary(reflection);
   const controlPlaneSummary = buildProposalControlPlaneSummary(reflection.skillId, diffSummary, rationaleSummary);
+  const qualitySummary = buildProposalQualitySummary(reflection, diffSummary);
   return {
     id: proposalId,
     skillId: reflection.skillId,
@@ -352,6 +392,7 @@ export function generateSkillEvolutionProposal(input: {
     diffSummary,
     rationaleSummary,
     controlPlaneSummary,
+    qualitySummary,
     patchSummary: `${reflection.skillId}: ${reflection.reflectionKind} -> ${reflection.recommendedAction}`,
     patchText: buildProposalPatchText(reflection),
     candidateDir,

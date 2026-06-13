@@ -1,5 +1,9 @@
 # 【历史归档】项目说明：deepseek-v4
 
+> 文档状态：旧版模型说明快照。
+>
+> 本文保留 2026 年 5 月早期对项目骨架的描述，不代表当前项目状态。当前项目已从 planner/executor MVP 骨架演进为包含 job / workflow / goal / skill evolution 控制面的 Agent Workflow Runtime。请以 `README.md`、`Readme-CN.md` 与 `docs/文档索引-导航页-20260529.md` 作为当前入口。
+
 ● 这是 Dual Agent Orchestrator，一个将 Planner（规划器）+ Executor（执行器）模式实现为可运行骨架的 TypeScript 项目。
 
   核心设计

@@ -417,6 +417,69 @@ function candidateLooksImproving(
   return changedDescription || changedRemediation || changedRequiredArtifacts || candidateSignalCount > liveSignalCount;
 }
 
+function buildValidationResultTaxonomy(input: {
+  passed: boolean;
+  candidateSelected: boolean;
+  candidateVerified: boolean;
+  baselineVerified: boolean;
+  inputEquivalent: boolean;
+  candidateBindingReady: boolean;
+  runtimePrepared: boolean;
+  runtimeBoundary: SkillDeploymentValidationReport["replay"]["runtimeBoundary"];
+  sameInputReadiness: SkillDeploymentValidationReport["replay"]["sameInputComparison"]["readiness"];
+  candidateFailedChecks: string[];
+  baselineFailedChecks: string[];
+  candidateMissingRequirements: string[];
+}): SkillDeploymentValidationReport["resultTaxonomy"] {
+  if (input.passed) {
+    return {
+      category: "passed",
+      reason: "Candidate passed validation under the current non-regression and improvement contract.",
+      retryable: false,
+    };
+  }
+  if (!input.runtimePrepared || !input.candidateBindingReady || !input.inputEquivalent) {
+    return {
+      category: "setup_failed",
+      reason: "Validation setup is incomplete: candidate runtime binding, runtime preparation, or same-input provenance is missing.",
+      retryable: true,
+    };
+  }
+  if (!input.baselineVerified) {
+    return {
+      category: "baseline_failed",
+      reason: "Baseline evidence is not verified, so candidate improvement cannot be judged cleanly.",
+      retryable: true,
+    };
+  }
+  if (!input.candidateSelected || !input.candidateVerified || input.candidateMissingRequirements.length > 0) {
+    return {
+      category: "candidate_failed",
+      reason: "Candidate failed verification or did not satisfy required evidence.",
+      retryable: true,
+    };
+  }
+  if (input.candidateFailedChecks.length > input.baselineFailedChecks.length) {
+    return {
+      category: "regression",
+      reason: "Candidate introduced more failed checks than the baseline.",
+      retryable: false,
+    };
+  }
+  if (input.sameInputReadiness !== "ready" || !input.runtimeBoundary.trueRuntimeReplayReady) {
+    return {
+      category: "inconclusive",
+      reason: "Validation could not reach ready same-input runtime replay evidence.",
+      retryable: true,
+    };
+  }
+  return {
+    category: "inconclusive",
+    reason: "Validation failed without a more specific result category.",
+    retryable: true,
+  };
+}
+
 export function validateSkillEvolutionProposal(input: {
   proposal: SkillEvolutionProposal;
   reflection: SkillReflectionRecord | null;
@@ -681,6 +744,20 @@ export function validateSkillEvolutionProposal(input: {
     candidateBindingReady: candidateBinding.bindingReady,
     silentBypassSignal,
   });
+  const resultTaxonomy = buildValidationResultTaxonomy({
+    passed,
+    candidateSelected,
+    candidateVerified,
+    baselineVerified,
+    inputEquivalent: inputEquivalence.satisfied,
+    candidateBindingReady: candidateBinding.bindingReady,
+    runtimePrepared: replayRuntime?.runtimeSource.prepared === true,
+    runtimeBoundary,
+    sameInputReadiness: sameInputComparison.readiness,
+    candidateFailedChecks,
+    baselineFailedChecks,
+    candidateMissingRequirements,
+  });
   const stability = buildStabilitySignals({
     baselineSource: baselineSelection.source,
     baselineVerified,
@@ -847,6 +924,7 @@ export function validateSkillEvolutionProposal(input: {
       candidateFailedChecks,
       baselineFailedChecks,
     },
+    resultTaxonomy,
     decision: {
       reasonCode,
       autoAcceptReady: passed

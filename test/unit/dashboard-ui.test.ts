@@ -280,10 +280,20 @@ test("skill evolution ops dashboard renders queue, rollback, stuck, and replay s
       funnel: { proposal_created: 1, accepted: 1 },
       stuck_categories: { dynamic_risk_blocked: 1, manual_accept_required: 1 },
     },
+    filters: {
+      skills: ["find.code_symbol"],
+      statuses: ["validated", "accepted"],
+      risk_tiers: ["high", "low"],
+      queue_states: ["proposal_queue", "accepted_history"],
+      next_actions: ["wait_or_manual_review", "monitor_or_rollback"],
+    },
     proposal_queue: [{
       id: "proposal_ops_1",
       skill_id: "find.code_symbol",
       status: "validated",
+      proposal_url: "/v1/skill-evolution/proposals/proposal_ops_1",
+      audit_url: "/v1/skill-evolution/proposals/proposal_ops_1/audit",
+      validate_url: "/v1/skill-evolution/proposals/proposal_ops_1/validate",
       validation_summary: {
         replay_stability_score: 85,
         replay_stability_level: "stable",
@@ -299,8 +309,12 @@ test("skill evolution ops dashboard renders queue, rollback, stuck, and replay s
         }],
       },
       ops_summary: {
+        queue_state: "proposal_queue",
         funnel_stage: "validation_passed",
         age_bucket: "under_1h",
+        next_action: "wait_or_manual_review",
+        queue_category: "dynamic_risk_blocked",
+        dynamic_risk_tier: "high",
         stuck_state: {
           stuck: true,
           primary_category: "dynamic_risk_blocked",
@@ -314,9 +328,43 @@ test("skill evolution ops dashboard renders queue, rollback, stuck, and replay s
           }],
         },
       },
+      eligibility: {
+        eligible: false,
+        reasons: ["dynamic risk blocks auto-accept"],
+        contract: {
+          state: "blocked",
+          required_action: "manual_review",
+          gates: {
+            proposal_status_validated: true,
+            dynamic_risk_allows_auto_accept: false,
+          },
+        },
+      },
     }],
-    accepted_history: [],
-    rollback_guides: [],
+    accepted_history: [{
+      id: "proposal_accepted_1",
+      skill_id: "find.code_symbol",
+      status: "accepted",
+      rollback_guide_url: "/v1/skill-evolution/proposals/proposal_accepted_1",
+      ops_summary: {
+        queue_state: "accepted_history",
+        funnel_stage: "accepted",
+        next_action: "monitor_or_rollback",
+      },
+      rollback: {
+        proposal_id: "proposal_accepted_1",
+        rollback_available: true,
+        rollback_path: "runtime/skill-evolution/proposal_accepted_1/rollback",
+        guide: ["Restore files", "Re-run validation"],
+      },
+    }],
+    rollback_guides: [{
+      proposal_id: "proposal_accepted_1",
+      skill_id: "find.code_symbol",
+      rollback_available: true,
+      rollback_path: "runtime/skill-evolution/proposal_accepted_1/rollback",
+      guide: ["Restore files"],
+    }],
   }, {
     dataUrl: "/skill-evolution/ops/data",
   });
@@ -328,6 +376,10 @@ test("skill evolution ops dashboard renders queue, rollback, stuck, and replay s
   assert.equal(html.includes("Replay Stability"), true);
   assert.equal(html.includes("Replay Tasks"), true);
   assert.equal(html.includes("Stuck Categories"), true);
+  assert.equal(html.includes("Eligibility Gates"), true);
+  assert.equal(html.includes("Next actions"), true);
+  assert.equal(html.includes("wait_or_manual_review"), true);
+  assert.equal(html.includes("Rollback Guide"), true);
   assert.equal(html.includes("/skill-evolution/ops/data"), true);
   assert.equal(html.includes("proposal_ops_1"), true);
 });

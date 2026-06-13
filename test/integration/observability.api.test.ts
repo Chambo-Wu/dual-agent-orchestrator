@@ -7,6 +7,7 @@ import { join, relative } from "node:path";
 import { persistJobRecord, updateJobControlState } from "../../src/job-store.js";
 import { appendEvent } from "../../src/job-event-bus.js";
 import { __testables } from "../../src/index.js";
+import { RUNTIME_ROOT } from "../../src/paths.js";
 import {
   persistSkillAuditReport,
   persistSkillDeploymentValidationReport,
@@ -281,7 +282,7 @@ test("health payload exposes installed skill observability summary", () => {
 });
 
 test("skills list endpoint exposes install control metadata", async () => {
-  rmSync("runtime/skills", { recursive: true, force: true });
+  rmSync(join(RUNTIME_ROOT, "skills"), { recursive: true, force: true });
   const res = new MockResponse() as unknown as ServerResponse & MockResponse;
   await __testables.handleRequest(buildAuthorizedRequest("/v1/skills"), res);
   const body = JSON.parse(res.body) as {
@@ -303,7 +304,7 @@ test("skills list endpoint exposes install control metadata", async () => {
 test("skills install endpoint records explicit installs", async () => {
   const defaultConfig = buildMinimalConfig();
   try {
-    rmSync("runtime/skills", { recursive: true, force: true });
+    rmSync(join(RUNTIME_ROOT, "skills"), { recursive: true, force: true });
     const res = new MockResponse() as unknown as ServerResponse & MockResponse;
     await __testables.handleRequest(buildAuthorizedJsonRequest("POST", "/v1/skills/install", {
       skill_id: "find.code_symbol",
@@ -334,7 +335,7 @@ test("skills install endpoint records explicit installs", async () => {
     assert.equal(health.skills?.installed?.some((skill) => skill.skill_id === "find.code_symbol" && skill.explicit_install === true), true);
   } finally {
     rmSync(defaultConfig.skills.installDir, { recursive: true, force: true });
-    rmSync("runtime/skills", { recursive: true, force: true });
+    rmSync(join(RUNTIME_ROOT, "skills"), { recursive: true, force: true });
   }
 });
 
@@ -646,7 +647,7 @@ test("skill evolution auto pipeline validates but does not accept without true r
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -665,14 +666,14 @@ test("skill evolution auto pipeline validates but does not accept without true r
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
   config.skillEvolution.autoReflect = true;
   config.skillEvolution.autoPropose = true;
   config.skillEvolution.autoAudit = true;
   config.skillEvolution.autoValidate = true;
   config.skillEvolution.autoAccept = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -758,7 +759,7 @@ test("skill evolution auto pipeline can opt into deterministic runtime replay va
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -775,7 +776,7 @@ test("skill evolution auto pipeline can opt into deterministic runtime replay va
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
   config.skillEvolution.autoReflect = true;
   config.skillEvolution.autoPropose = true;
@@ -783,7 +784,7 @@ test("skill evolution auto pipeline can opt into deterministic runtime replay va
   config.skillEvolution.autoValidate = true;
   config.skillEvolution.autoAccept = false;
   config.skillEvolution.runtimeReplayInAutoPipeline = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -974,6 +975,103 @@ test("skill evolution auto-accept helper blocks low-risk flaky validated proposa
   assert.equal(allowed, false);
 });
 
+test("skill evolution low-risk pilot can auto-validate without enabling global auto_validate", async () => {
+  mkdirSync(join(process.cwd(), "runtime"), { recursive: true });
+  const tempRoot = mkdtempSync(join(process.cwd(), "runtime", "dao-skill-low-risk-pilot-"));
+  const builtinRoot = join(tempRoot, "skills");
+  const skillDir = join(builtinRoot, "find.code_symbol");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(join(skillDir, "skill.json"), JSON.stringify({
+    id: "find.code_symbol",
+    version: "0.1.0",
+    title: "Research Symbol Discovery",
+    description: "Find repository symbols for low-risk research tasks.",
+    intents: ["research"],
+    keywords: ["research", "symbol", "source"],
+    requiredTools: ["list_files", "read_file"],
+    install: {
+      source: "builtin",
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
+    },
+    activation: {
+      mode: "intent_match",
+      priority: 100,
+    },
+    execution: {
+      strategy: "workflow_template",
+      templateId: "find_official_sources_v1",
+    },
+    verification: {
+      requiredArtifacts: ["symbol_hits"],
+      successSignal: "at_least_one_relevant_entrypoint",
+    },
+  }, null, 2), "utf8");
+
+  const config = buildMinimalConfig();
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
+  config.skillEvolution.enabled = true;
+  config.skillEvolution.autoReflect = true;
+  config.skillEvolution.autoPropose = true;
+  config.skillEvolution.autoAudit = true;
+  config.skillEvolution.autoValidate = false;
+  config.skillEvolution.autoAccept = false;
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.riskTiering.enabled = true;
+  config.skillEvolution.riskTiering.defaultTier = "low";
+  config.skillEvolution.riskTiering.automationCeilings.low = "auto_accept";
+  config.skillEvolution.riskTiering.lowRiskPilotSkills = ["find.code_symbol"];
+  __testables.setConfigOverrideForTests(config);
+
+  try {
+    persistObservabilityJob("job_observability_low_risk_pilot", "Use official sources for a research answer");
+    appendEvent(createUiEvent({
+      jobId: "job_observability_low_risk_pilot",
+      seq: 1,
+      type: "planner.decision",
+      title: "Planner selected research skill",
+      summary: "Selected find.official_sources for official source discovery.",
+      status: "success",
+      agent: "planner",
+      meta: {
+        selected_skill: "find.code_symbol",
+        skill_id: "find.code_symbol",
+        skill_action: "use_installed",
+      },
+    }));
+    const recordModule = await import("../../src/job-store.js");
+    const record = recordModule.readJobRecord("job_observability_low_risk_pilot");
+    assert.equal(Boolean(record), true);
+
+    await __testables.runAutomaticSkillEvolutionForRecord(record!, config);
+
+    const proposalsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest("/v1/skill-evolution/proposals"), proposalsRes);
+    const proposalsBody = JSON.parse(proposalsRes.body) as {
+      data?: Array<{
+        skillId?: string;
+        status?: string;
+        validationReportPath?: string;
+      }>;
+    };
+    const proposal = proposalsBody.data?.find((entry) => entry.skillId === "find.code_symbol");
+
+    assert.equal(proposal?.status, "validated");
+    assert.equal(typeof proposal?.validationReportPath, "string");
+
+    const eventsRes = new MockResponse() as unknown as ServerResponse & MockResponse;
+    await __testables.handleRequest(buildAuthorizedRequest("/v1/jobs/job_observability_low_risk_pilot/events"), eventsRes);
+    const eventsBody = JSON.parse(eventsRes.body) as {
+      events: Array<{ type?: string; meta?: { blocked_stage?: string; low_risk_pilot?: boolean } }>;
+    };
+    assert.equal(eventsBody.events.some((event) => event.type === "system.skill_evolution_validation_passed"), true);
+    assert.equal(eventsBody.events.some((event) => event.type === "system.skill_evolution_accepted"), false);
+  } finally {
+    __testables.setConfigOverrideForTests(null);
+    rmSync(tempRoot, { recursive: true, force: true });
+    rmSync(config.skills.installDir, { recursive: true, force: true });
+  }
+});
+
 test("skill evolution auto pipeline blocks high-risk skills at the proposal ceiling when risk tiering is enabled", async () => {
   mkdirSync(join(process.cwd(), "runtime"), { recursive: true });
   const tempRoot = mkdtempSync(join(process.cwd(), "runtime", "dao-skill-auto-evolve-highrisk-ceiling-"));
@@ -991,7 +1089,7 @@ test("skill evolution auto pipeline blocks high-risk skills at the proposal ceil
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -1004,14 +1102,14 @@ test("skill evolution auto pipeline blocks high-risk skills at the proposal ceil
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
   config.skillEvolution.autoReflect = true;
   config.skillEvolution.autoPropose = true;
   config.skillEvolution.autoAudit = true;
   config.skillEvolution.autoValidate = true;
   config.skillEvolution.autoAccept = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   config.skillEvolution.riskTiering.enabled = true;
   config.skillEvolution.riskTiering.defaultTier = "low";
   config.skillEvolution.riskTiering.automationCeilings.high = "auto_propose";
@@ -1101,7 +1199,7 @@ test("skill evolution auto pipeline applies dynamic ceiling before audit after r
     requiredTools: ["list_files", "read_file"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -1114,14 +1212,14 @@ test("skill evolution auto pipeline applies dynamic ceiling before audit after r
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
   config.skillEvolution.autoReflect = true;
   config.skillEvolution.autoPropose = true;
   config.skillEvolution.autoAudit = true;
   config.skillEvolution.autoValidate = true;
   config.skillEvolution.autoAccept = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   config.skillEvolution.riskTiering.enabled = true;
   config.skillEvolution.riskTiering.defaultTier = "low";
   config.skillEvolution.riskTiering.automationCeilings.low = "auto_accept";
@@ -1239,7 +1337,7 @@ test("skill evolution auto pipeline keeps medium-tier skills validated but not a
     requiredTools: ["list_files", "read_file"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -1252,14 +1350,14 @@ test("skill evolution auto pipeline keeps medium-tier skills validated but not a
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
   config.skillEvolution.autoReflect = true;
   config.skillEvolution.autoPropose = true;
   config.skillEvolution.autoAudit = true;
   config.skillEvolution.autoValidate = true;
   config.skillEvolution.autoAccept = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   config.skillEvolution.riskTiering.enabled = true;
   config.skillEvolution.riskTiering.defaultTier = "medium";
   config.skillEvolution.riskTiering.automationCeilings.medium = "auto_validate";
@@ -1456,7 +1554,7 @@ test("skill propose endpoint scaffolds candidate SKILL.md when the live skill ha
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -1469,9 +1567,9 @@ test("skill propose endpoint scaffolds candidate SKILL.md when the live skill ha
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -1758,6 +1856,13 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
       eligibility?: Record<string, number>;
       stuck_count?: number;
     };
+    filters?: {
+      skills?: string[];
+      statuses?: string[];
+      risk_tiers?: string[];
+      queue_states?: string[];
+      next_actions?: string[];
+    };
     data?: Array<{
       id?: string;
       skillId?: string;
@@ -1767,6 +1872,8 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
         queue_state?: string;
         funnel_stage?: string;
         age_bucket?: string;
+        next_action?: string;
+        queue_category?: string;
         actionable?: boolean;
         auto_accept_eligible?: boolean;
         dynamic_risk_tier?: string;
@@ -1782,6 +1889,11 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
       eligibility?: {
         eligible?: boolean;
         reasons?: string[];
+        contract?: {
+          state?: string;
+          gates?: Record<string, boolean>;
+          required_action?: string;
+        };
       };
     }>;
   };
@@ -1798,6 +1910,8 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
       queue_state?: string;
       funnel_stage?: string;
       age_bucket?: string;
+      next_action?: string;
+      queue_category?: string;
       actionable?: boolean;
       auto_accept_eligible?: boolean;
       dynamic_risk_tier?: string;
@@ -1813,6 +1927,11 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
     eligibility?: {
       eligible?: boolean;
       reasons?: string[];
+      contract?: {
+        state?: string;
+        gates?: Record<string, boolean>;
+        required_action?: string;
+      };
     };
     rollback_guide?: Record<string, unknown> | null;
   };
@@ -1828,16 +1947,25 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
   assert.equal(typeof listBody.summary?.dynamic_risk?.low, "number");
   assert.equal(typeof listBody.summary?.eligibility?.blocked, "number");
   assert.equal(typeof listBody.summary?.stuck_count, "number");
+  assert.equal(listBody.filters?.skills?.includes("find.code_symbol"), true);
+  assert.equal(Array.isArray(listBody.filters?.statuses), true);
+  assert.equal(Array.isArray(listBody.filters?.risk_tiers), true);
+  assert.equal(Array.isArray(listBody.filters?.queue_states), true);
+  assert.equal(Array.isArray(listBody.filters?.next_actions), true);
   assert.equal(listedProposal?.skillId, "find.code_symbol");
   assert.equal(listedProposal?.ops_summary?.queue_state, "proposal_queue");
   assert.equal(listedProposal?.ops_summary?.funnel_stage, "proposal_created");
   assert.equal(listedProposal?.ops_summary?.age_bucket, "under_1h");
+  assert.equal(typeof listedProposal?.ops_summary?.next_action, "string");
+  assert.equal(typeof listedProposal?.ops_summary?.queue_category, "string");
   assert.equal(listedProposal?.ops_summary?.actionable, true);
   assert.equal(listedProposal?.ops_summary?.auto_accept_eligible, false);
   assert.equal(typeof listedProposal?.ops_summary?.dynamic_risk_tier, "string");
   assert.equal(typeof listedProposal?.ops_summary?.stuck_state?.stuck, "boolean");
   assert.equal(typeof listedProposal?.dynamic_risk?.tier, "string");
   assert.equal(listedProposal?.eligibility?.eligible, false);
+  assert.equal(listedProposal?.eligibility?.contract?.state, "pending_validation");
+  assert.equal(listedProposal?.eligibility?.contract?.required_action, "run_validation");
   assert.equal(getRes.statusCode, 200);
   assert.equal(getBody.id, createBody.proposal?.id);
   assert.equal(getBody.skillId, "find.code_symbol");
@@ -1846,12 +1974,16 @@ test("skill evolution proposal control plane lists and fetches persisted proposa
   assert.equal(getBody.validation_summary ?? null, null);
   assert.equal(getBody.ops_summary?.queue_state, "proposal_queue");
   assert.equal(getBody.ops_summary?.funnel_stage, "proposal_created");
+  assert.equal(typeof getBody.ops_summary?.next_action, "string");
+  assert.equal(typeof getBody.ops_summary?.queue_category, "string");
   assert.equal(getBody.ops_summary?.actionable, true);
   assert.equal(getBody.ops_summary?.auto_accept_eligible, false);
   assert.equal(typeof getBody.ops_summary?.dynamic_risk_tier, "string");
   assert.equal(typeof getBody.ops_summary?.stuck_state?.stuck, "boolean");
   assert.equal(typeof getBody.dynamic_risk?.tier, "string");
   assert.equal(getBody.eligibility?.eligible, false);
+  assert.equal(getBody.eligibility?.contract?.state, "pending_validation");
+  assert.equal(getBody.eligibility?.contract?.gates?.proposal_status_validated, false);
   assert.equal(getBody.rollback_guide ?? null, null);
 });
 
@@ -2160,11 +2292,38 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
       cooldown_active?: boolean;
       cooldown_until?: string | null;
       window_hours?: number;
+      failure_clusters?: Array<{
+        category?: string;
+        count?: number;
+        active?: boolean;
+        window_hours?: number;
+        downgrade_stage?: string | null;
+      }>;
+      recovery_policy?: {
+        strategy?: string;
+        window_hours?: number;
+        cooldown_active?: boolean;
+        cooldown_until?: string | null;
+        recovery_condition?: string;
+        restored_ceiling?: string;
+      };
+      gate_summary?: Array<{
+        stage?: string;
+        allowed_by_ceiling?: boolean;
+        allowed_by_config?: boolean;
+        blocked_by_dynamic_risk?: boolean;
+        reason?: string;
+      }>;
       reasons?: string[];
     };
     eligibility?: {
       eligible?: boolean;
       reasons?: string[];
+      contract?: {
+        state?: string;
+        gates?: Record<string, boolean>;
+        required_action?: string;
+      };
     };
     ops_summary?: {
       auto_accept_eligible?: boolean;
@@ -2210,8 +2369,33 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
   assert.equal(getBody.dynamic_risk?.cooldown_active, true);
   assert.equal(typeof getBody.dynamic_risk?.cooldown_until, "string");
   assert.equal(getBody.dynamic_risk?.window_hours, 24);
+  assert.equal(getBody.dynamic_risk?.failure_clusters?.some((cluster) =>
+    cluster.category === "validation_failure"
+    && cluster.active === true
+    && cluster.downgrade_stage === "auto_audit"
+    && cluster.window_hours === 24
+  ), true);
+  assert.equal(getBody.dynamic_risk?.failure_clusters?.some((cluster) =>
+    cluster.category === "replay_instability"
+    && cluster.active === true
+  ), true);
+  assert.equal(getBody.dynamic_risk?.recovery_policy?.strategy, "cooldown_window_clear");
+  assert.equal(getBody.dynamic_risk?.recovery_policy?.cooldown_active, true);
+  assert.equal(getBody.dynamic_risk?.recovery_policy?.window_hours, 24);
+  assert.equal(typeof getBody.dynamic_risk?.recovery_policy?.recovery_condition, "string");
+  assert.equal(getBody.dynamic_risk?.gate_summary?.some((gate) =>
+    gate.stage === "auto_validate"
+    && gate.allowed_by_ceiling === false
+    && gate.blocked_by_dynamic_risk === true
+  ), true);
+  assert.equal(getBody.dynamic_risk?.gate_summary?.some((gate) =>
+    gate.stage === "auto_accept"
+    && gate.allowed_by_ceiling === false
+  ), true);
   assert.equal(getBody.eligibility?.eligible, false);
   assert.equal(getBody.eligibility?.reasons?.some((reason) => reason.includes("dynamic risk")), true);
+  assert.equal(getBody.eligibility?.contract?.state, "blocked");
+  assert.equal(getBody.eligibility?.contract?.gates?.dynamic_risk_allows_auto_accept, false);
   assert.equal(getBody.ops_summary?.auto_accept_eligible, false);
   assert.equal(getBody.ops_summary?.dynamic_risk_tier, "high");
   assert.equal(getBody.ops_summary?.dynamic_risk_cooldown_active, true);
@@ -2219,6 +2403,9 @@ test("skill evolution ops exposes dynamic risk downgrade and eligibility reasons
   assert.equal(getBody.ops_summary?.stuck_state?.stuck, true);
   assert.equal(getBody.ops_summary?.stuck_state?.primary_category, "dynamic_risk_blocked");
   assert.equal(getBody.ops_summary?.stuck_state?.severity, "critical");
+  assert.equal(getBody.ops_summary?.next_action, "wait_or_manual_review");
+  assert.equal(getBody.ops_summary?.queue_category, "dynamic_risk_blocked");
+  assert.equal(getBody.ops_summary?.stuck_state?.next_action, "wait_or_manual_review");
   assert.equal(typeof getBody.ops_summary?.stuck_state?.action_hint, "string");
   assert.equal(getBody.ops_summary?.stuck_state?.categories?.some((item) => item.category === "manual_accept_required"), true);
   assert.equal(opsRes.statusCode, 200);
@@ -2638,6 +2825,8 @@ test("skill evolution proposal validate endpoint passes an improving validated p
   assert.equal(validateBody.validation?.contract?.hardGates?.find((gate) => gate.name === "risk_tier_contract")?.passed, true);
   assert.equal(validateBody.validation?.comparison?.candidateSelected, true);
   assert.equal(validateBody.validation?.comparison?.candidateVerified, true);
+  assert.equal(validateBody.validation?.resultTaxonomy?.category, "passed");
+  assert.equal(validateBody.validation?.resultTaxonomy?.retryable, false);
   assert.equal(validateBody.validation?.decision?.reasonCode, "passed");
   assert.equal(validateBody.validation?.decision?.autoAcceptReady, true);
   assert.equal(validateBody.validation?.replay?.mode, "record_replay");
@@ -2744,6 +2933,8 @@ test("skill evolution proposal validate endpoint passes an improving validated p
   assert.equal(proposalDetailBody.id, proposalId);
   assert.equal(proposalDetailBody.validation_summary?.passed, true);
   assert.equal(proposalDetailBody.validation_summary?.reason_code, "passed");
+  assert.equal(proposalDetailBody.validation_summary?.result_category, "passed");
+  assert.equal(proposalDetailBody.validation_summary?.result_retryable, false);
   assert.equal(proposalDetailBody.validation_summary?.auto_accept_ready, true);
   assert.equal(proposalDetailBody.validation_summary?.isolated_replay, true);
   assert.equal(proposalDetailBody.validation_summary?.same_input_readiness, "ready");
@@ -2897,6 +3088,8 @@ test("skill evolution proposal validate endpoint executes isolated replay agains
   assert.equal(validateBody.proposal?.status, "validation_failed");
   assert.equal(validateBody.validation?.passed, false);
   assert.equal(validateBody.validation?.comparison?.candidateVerified, false);
+  assert.equal(validateBody.validation?.resultTaxonomy?.category, "candidate_failed");
+  assert.equal(validateBody.validation?.resultTaxonomy?.retryable, true);
   assert.equal(validateBody.validation?.decision?.reasonCode, "candidate_not_verified");
   assert.equal(validateBody.validation?.decision?.autoAcceptReady, false);
   assert.equal(validateBody.validation?.replay?.runtimeBoundary?.source, "candidate_runtime_config");
@@ -2952,7 +3145,7 @@ test("skill evolution proposal validate endpoint lets isolated baseline replay o
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -2971,9 +3164,9 @@ test("skill evolution proposal validate endpoint lets isolated baseline replay o
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -3341,7 +3534,7 @@ test("skill evolution proposal validate endpoint reports low-risk summary for re
     requiredTools: ["list_files", "read_file"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -3354,9 +3547,9 @@ test("skill evolution proposal validate endpoint reports low-risk summary for re
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -3444,7 +3637,7 @@ test("skill evolution proposal validate endpoint blocks auto-accept on low-risk 
     requiredTools: ["list_files", "read_file"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -3457,9 +3650,9 @@ test("skill evolution proposal validate endpoint blocks auto-accept on low-risk 
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -3568,7 +3761,7 @@ test("skill evolution proposal validate endpoint fails when candidate changes in
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -3581,9 +3774,9 @@ test("skill evolution proposal validate endpoint fails when candidate changes in
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -3687,7 +3880,7 @@ test("skill evolution proposal accept endpoint records accepted decision", async
     requiredTools: ["list_files", "read_file", "shell_command"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -3700,9 +3893,9 @@ test("skill evolution proposal accept endpoint records accepted decision", async
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -3791,6 +3984,7 @@ test("skill evolution proposal accept endpoint records accepted decision", async
         id?: string;
         skill_id?: string;
         status?: string;
+        rollback_guide_url?: string | null;
         decision?: {
           decision?: string;
           reason?: string | null;
@@ -3828,6 +4022,7 @@ test("skill evolution proposal accept endpoint records accepted decision", async
     assert.equal(opsBody.proposal_queue?.some((item) => item.id === proposalId), false);
     assert.equal(acceptedItem?.skill_id, "find.code_symbol");
     assert.equal(acceptedItem?.status, "accepted");
+    assert.equal(acceptedItem?.rollback_guide_url, `/v1/skill-evolution/proposals/${proposalId}`);
     assert.equal(acceptedItem?.decision?.decision, "accepted");
     assert.equal(acceptedItem?.decision?.reason, "Validated on the low-risk path.");
     assert.equal(typeof acceptedItem?.decision?.created_at, "string");
@@ -3845,6 +4040,7 @@ test("skill evolution proposal accept endpoint records accepted decision", async
       ops_summary?: {
         queue_state?: string;
         funnel_stage?: string;
+        next_action?: string;
         rollback_available?: boolean;
       };
       rollback_guide?: {
@@ -3856,6 +4052,7 @@ test("skill evolution proposal accept endpoint records accepted decision", async
     assert.equal(detailRes.statusCode, 200);
     assert.equal(detailBody.ops_summary?.queue_state, "accepted_history");
     assert.equal(detailBody.ops_summary?.funnel_stage, "accepted");
+    assert.equal(detailBody.ops_summary?.next_action, "monitor_or_rollback");
     assert.equal(detailBody.ops_summary?.rollback_available, true);
     assert.equal(detailBody.rollback_guide?.proposal_id, proposalId);
     assert.equal(detailBody.rollback_guide?.rollback_path, acceptBody.rollback_path);
@@ -3883,7 +4080,7 @@ test("skill evolution proposal accept endpoint preserves live skill files when c
     requiredTools: ["list_files"],
     install: {
       source: "builtin",
-      location: join(relativePathFromProject(tempRoot), "skills", "find.code_symbol").replace(/\\/g, "/"),
+      location: join(tempRoot, "skills", "find.code_symbol").replace(/\\/g, "/"),
     },
     activation: {
       mode: "intent_match",
@@ -3896,9 +4093,9 @@ test("skill evolution proposal accept endpoint preserves live skill files when c
   }, null, 2), "utf8");
 
   const config = buildMinimalConfig();
-  config.skills.builtinDir = join(relativePathFromProject(tempRoot), "skills").replace(/\\/g, "/");
+  config.skills.builtinDir = join(tempRoot, "skills").replace(/\\/g, "/");
   config.skillEvolution.enabled = true;
-  config.skillEvolution.candidateDir = join(relativePathFromProject(tempRoot), "runtime", "skill-evolution").replace(/\\/g, "/");
+  config.skillEvolution.candidateDir = join(tempRoot, "runtime", "skill-evolution").replace(/\\/g, "/");
   __testables.setConfigOverrideForTests(config);
 
   try {
@@ -4117,3 +4314,4 @@ test("job events endpoint exposes standardized skill install lifecycle events", 
   assert.equal(blockedEvent?.summary?.includes("Install blocked for find.code_symbol"), true);
   assert.equal(blockedEvent?.meta?.install_reason, "Skill installation requires skills.auto_install=true.");
 });
+

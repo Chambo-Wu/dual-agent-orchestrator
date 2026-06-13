@@ -67,6 +67,10 @@ function buildMarkdown(title = "test.audit_skill"): string {
     "- Add focused checks when the task asks for audit-sensitive changes.",
     "",
     "## Appendix",
+    "- Intent: coding.",
+    "- Required tools: read_file.",
+    "- Expected artifacts: file_excerpt.",
+    "- Success signal: capture a supporting excerpt.",
     "- Keep verification evidence explicit.",
     "",
   ].join("\n");
@@ -106,6 +110,12 @@ function buildProposal(id: string): SkillEvolutionProposal {
     patchText: "patch",
     candidateDir: AUDITOR_TEST_ROOT,
     createdAt: new Date().toISOString(),
+    qualitySummary: {
+      tier: "safe",
+      reasons: ["test fixture"],
+      fixtureClass: "skill_defect",
+      crossFileConsistency: "manifest_verification_only",
+    },
   };
 }
 
@@ -155,6 +165,13 @@ test("auditor gate v2 rejects forbidden verification contract diffs", () => {
   assert.equal(report.passed, false);
   assert.equal(verificationScope?.passed, false);
   assert.equal(verificationScope?.detail.includes("verification.requiredArtifacts"), true);
+  assert.equal(report.failureCategories?.includes("manifest_contract"), true);
+  assert.equal(report.remediationHints?.some((hint) =>
+    hint.check === "verification_contract_diff_scoped"
+    && hint.category === "manifest_contract"
+    && hint.evidence.includes("verification.requiredArtifacts")
+    && hint.hint.includes("Limit verification changes")
+  ), true);
 });
 
 test("auditor gate v2 rejects manifest and markdown identity drift", () => {
@@ -173,4 +190,146 @@ test("auditor gate v2 rejects manifest and markdown identity drift", () => {
 
   assert.equal(report.passed, false);
   assert.equal(identity?.passed, false);
+  assert.equal(report.remediationHints?.some((hint) =>
+    hint.check === "manifest_markdown_identity_consistent"
+    && hint.category === "manifest_contract"
+    && hint.hint.includes("same skill id or title")
+  ), true);
+});
+
+test("auditor gate v2 rejects manifest and markdown capability drift", () => {
+  const candidateManifest = buildManifest({
+    intents: ["data_analysis"],
+    requiredTools: ["read_file"],
+    optionalTools: ["web_search"],
+    verification: {
+      ...buildManifest().verification,
+      requiredArtifacts: ["chart_summary"],
+      artifactLabels: {
+        chart_summary: "chart summary",
+      },
+      successSignal: "chart_summary_ready",
+      successSignalLabel: "produce a chart summary",
+    },
+  });
+  const { proposal, manifest } = materializeAuditFixture({
+    proposalId: "proposal_auditor_capability_drift",
+    candidateManifest,
+    candidateMarkdown: buildMarkdown(),
+  });
+
+  const report = auditSkillEvolutionProposal({
+    proposal,
+    reflection: buildReflection(),
+    manifest,
+  });
+  const capability = report.checks.find((check) => check.name === "manifest_markdown_capability_consistent");
+
+  assert.equal(report.passed, false);
+  assert.equal(capability?.passed, false);
+  assert.equal(capability?.detail.includes("intent:data_analysis"), true);
+  assert.equal(capability?.detail.includes("tool:web_search"), true);
+  assert.equal(capability?.detail.includes("artifact:chart_summary"), true);
+  assert.equal(capability?.detail.includes("success_signal"), true);
+  assert.equal(report.failureCategories?.includes("manifest_contract"), true);
+  assert.equal(report.remediationHints?.some((hint) =>
+    hint.check === "manifest_markdown_capability_consistent"
+    && hint.evidence.includes("intent:data_analysis")
+    && hint.hint.includes("intent, tools, artifacts")
+  ), true);
+});
+
+test("auditor gate v2 records a manual review reason for high-risk skills", () => {
+  const { proposal, manifest } = materializeAuditFixture({
+    proposalId: "proposal_auditor_high_risk_manual_review_reason",
+    candidateManifest: buildManifest({
+      requiredTools: ["read_file", "shell_command"],
+    }),
+    candidateMarkdown: [
+      "# Skill: test.audit_skill",
+      "",
+      "## Core Procedure",
+      "- Read the relevant source before changing behavior.",
+      "",
+      "## Scenario Extensions",
+      "- Add focused checks when the task asks for audit-sensitive changes.",
+      "",
+      "## Appendix",
+      "- Intent: coding.",
+      "- Required tools: read_file, shell_command.",
+      "- Expected artifacts: file_excerpt.",
+      "- Success signal: capture a supporting excerpt.",
+      "- Keep verification evidence explicit.",
+      "",
+    ].join("\n"),
+  });
+
+  const report = auditSkillEvolutionProposal({
+    proposal,
+    reflection: buildReflection(),
+    manifest,
+  });
+  const manualReview = report.checks.find((check) => check.name === "high_risk_manual_review_reason");
+
+  assert.equal(manualReview?.passed, true);
+  assert.equal(manualReview?.detail.includes("Manual review required for high-risk skill"), true);
+  assert.equal(manualReview?.detail.includes("coding intent"), true);
+  assert.equal(manualReview?.detail.includes("shell_command"), true);
+  assert.equal(report.remediationHints?.some((hint) =>
+    hint.check === "no_tool_scope_escalation"
+    && hint.category === "risk_escalation"
+    && hint.hint.includes("Remove newly added")
+  ), true);
+});
+
+test("auditor gate v2 links verification diffs to proposal quality metadata", () => {
+  const candidateManifest = buildManifest({
+    verification: {
+      ...buildManifest().verification,
+      successSignalLabel: "capture an explicit supporting excerpt",
+    },
+  });
+  const { proposal, manifest } = materializeAuditFixture({
+    proposalId: "proposal_auditor_verification_quality_linkage",
+    candidateManifest,
+    candidateMarkdown: [
+      "# Skill: test.audit_skill",
+      "",
+      "## Core Procedure",
+      "- Read the relevant source before changing behavior.",
+      "",
+      "## Scenario Extensions",
+      "- Add focused checks when the task asks for audit-sensitive changes.",
+      "",
+      "## Appendix",
+      "- Intent: coding.",
+      "- Required tools: read_file.",
+      "- Expected artifacts: file_excerpt.",
+      "- Success signal: capture an explicit supporting excerpt.",
+      "- Keep verification evidence explicit.",
+      "",
+    ].join("\n"),
+  });
+  proposal.qualitySummary = {
+    tier: "safe",
+    reasons: ["incorrect test fixture"],
+    fixtureClass: "skill_defect",
+    crossFileConsistency: "manifest_stable",
+  };
+
+  const report = auditSkillEvolutionProposal({
+    proposal,
+    reflection: buildReflection(),
+    manifest,
+  });
+  const linkage = report.checks.find((check) => check.name === "verification_diff_quality_linked");
+
+  assert.equal(report.passed, false);
+  assert.equal(linkage?.passed, false);
+  assert.equal(linkage?.detail.includes("manifest_stable"), true);
+  assert.equal(report.remediationHints?.some((hint) =>
+    hint.check === "verification_diff_quality_linked"
+    && hint.category === "manifest_contract"
+    && hint.hint.includes("verification diffs")
+  ), true);
 });

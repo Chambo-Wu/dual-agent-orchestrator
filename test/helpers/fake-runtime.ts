@@ -178,6 +178,8 @@ export function buildMinimalConfig(): OrchestratorConfig {
           medium: "auto_validate",
           high: "auto_propose",
         },
+        dynamicWindowHours: 24,
+        lowRiskPilotSkills: [],
       },
     },
     goalMode: {

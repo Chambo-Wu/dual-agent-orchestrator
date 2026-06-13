@@ -155,12 +155,67 @@ function checkVerificationContractDiffScope(candidate: SkillManifest | null, ins
   );
 }
 
+function checkVerificationDiffQualityLinkage(
+  proposal: SkillEvolutionProposal,
+  candidate: SkillManifest | null,
+  installed: SkillManifest | null,
+): SkillAuditReport["checks"][number] {
+  const changedPaths = collectVerificationDiffPaths(candidate, installed);
+  if (changedPaths.length === 0) {
+    return buildCheck(
+      "verification_diff_quality_linked",
+      true,
+      "Candidate manifest does not change verification fields, so proposal quality cross-file metadata does not need verification linkage.",
+    );
+  }
+  if (!proposal.qualitySummary) {
+    return buildCheck(
+      "verification_diff_quality_linked",
+      true,
+      "Proposal quality metadata is unavailable; verification diff quality linkage is skipped for backward compatibility.",
+    );
+  }
+  const consistency = proposal.qualitySummary?.crossFileConsistency ?? null;
+  const linked = consistency === "manifest_verification_only" || consistency === "needs_audit";
+  return buildCheck(
+    "verification_diff_quality_linked",
+    linked,
+    linked
+      ? `Verification diff is linked to proposal quality metadata (${consistency}): ${changedPaths.join(", ")}.`
+      : `Verification diff is not reflected in proposal quality metadata; expected manifest_verification_only or needs_audit but found ${consistency ?? "missing"}. Changed paths: ${changedPaths.join(", ")}.`,
+  );
+}
+
 function inferAuditRiskTier(manifest: SkillManifest | null): "low" | "high" {
   const intents = new Set(manifest?.intents ?? []);
   const tools = new Set([...(manifest?.requiredTools ?? []), ...(manifest?.optionalTools ?? [])]);
   return intents.has("coding") || intents.has("file_ops") || tools.has("shell_command")
     ? "high"
     : "low";
+}
+
+function buildHighRiskManualReviewReason(manifest: SkillManifest | null): string | null {
+  if (inferAuditRiskTier(manifest) !== "high") {
+    return null;
+  }
+  const reasons: string[] = [];
+  const intents = new Set(manifest?.intents ?? []);
+  const tools = new Set([...(manifest?.requiredTools ?? []), ...(manifest?.optionalTools ?? [])]);
+  if (intents.has("coding")) {
+    reasons.push("coding intent can affect repository behavior");
+  }
+  if (intents.has("file_ops")) {
+    reasons.push("file_ops intent can change workspace files");
+  }
+  if (tools.has("shell_command")) {
+    reasons.push("shell_command tool access can execute local commands");
+  }
+  if (manifest?.execution.strategy === "custom_runtime") {
+    reasons.push("custom_runtime execution needs runtime boundary review");
+  }
+  return reasons.length > 0
+    ? `Manual review required for high-risk skill because ${reasons.join("; ")}.`
+    : "Manual review required for high-risk skill before validation or acceptance.";
 }
 
 function normalizeSearchText(value: string | undefined): string {
@@ -191,12 +246,167 @@ function checkManifestMarkdownConsistency(
   );
 }
 
+function textIncludesNormalized(haystack: string, needle: string | undefined): boolean {
+  const normalizedNeedle = normalizeSearchText(needle);
+  return Boolean(normalizedNeedle && haystack.includes(normalizedNeedle));
+}
+
+function checkManifestMarkdownCapabilityConsistency(
+  candidateManifest: SkillManifest | null,
+  installedManifest: SkillManifest | null,
+  candidateMarkdownPath: string,
+): SkillAuditReport["checks"][number] {
+  if (!candidateManifest || !candidateMarkdownPath || !existsSync(candidateMarkdownPath)) {
+    return buildCheck(
+      "manifest_markdown_capability_consistent",
+      true,
+      "Manifest/markdown capability consistency is skipped because one side is unavailable.",
+    );
+  }
+  const capabilityChanged = JSON.stringify({
+    intents: candidateManifest.intents,
+    requiredTools: candidateManifest.requiredTools,
+    optionalTools: candidateManifest.optionalTools ?? [],
+    verification: candidateManifest.verification ?? null,
+  }) !== JSON.stringify({
+    intents: installedManifest?.intents ?? [],
+    requiredTools: installedManifest?.requiredTools ?? [],
+    optionalTools: installedManifest?.optionalTools ?? [],
+    verification: installedManifest?.verification ?? null,
+  });
+  if (!capabilityChanged) {
+    return buildCheck(
+      "manifest_markdown_capability_consistent",
+      true,
+      "Manifest capability fields did not change, so markdown capability drift enforcement is skipped.",
+    );
+  }
+
+  const markdown = normalizeSearchText(safeReadText(candidateMarkdownPath));
+  const intentsChanged = JSON.stringify(candidateManifest.intents) !== JSON.stringify(installedManifest?.intents ?? []);
+  const missingIntents = intentsChanged
+    ? candidateManifest.intents.filter((intent) => !textIncludesNormalized(markdown, intent))
+    : [];
+  const tools = [...candidateManifest.requiredTools, ...(candidateManifest.optionalTools ?? [])];
+  const installedTools = [...(installedManifest?.requiredTools ?? []), ...(installedManifest?.optionalTools ?? [])];
+  const toolsChanged = JSON.stringify(tools) !== JSON.stringify(installedTools);
+  const missingTools = toolsChanged
+    ? tools.filter((tool) => !textIncludesNormalized(markdown, tool))
+    : [];
+  const requiredArtifacts = candidateManifest.verification?.requiredArtifacts ?? [];
+  const installedRequiredArtifacts = installedManifest?.verification?.requiredArtifacts ?? [];
+  const artifactLabels = candidateManifest.verification?.artifactLabels ?? {};
+  const artifactsChanged = JSON.stringify(requiredArtifacts) !== JSON.stringify(installedRequiredArtifacts)
+    || JSON.stringify(artifactLabels) !== JSON.stringify(installedManifest?.verification?.artifactLabels ?? {});
+  const changedArtifacts = artifactsChanged
+    ? requiredArtifacts.filter((artifact) =>
+      !installedRequiredArtifacts.includes(artifact)
+      || artifactLabels[artifact] !== installedManifest?.verification?.artifactLabels?.[artifact])
+    : [];
+  const missingArtifacts = changedArtifacts.filter((artifact) =>
+    !textIncludesNormalized(markdown, artifact) && !textIncludesNormalized(markdown, artifactLabels[artifact]),
+  );
+  const successSignal = candidateManifest.verification?.successSignal;
+  const successSignalLabel = candidateManifest.verification?.successSignalLabel;
+  const successSignalChanged = successSignal !== installedManifest?.verification?.successSignal
+    || successSignalLabel !== installedManifest?.verification?.successSignalLabel;
+  const missingSuccessSignal = successSignalChanged && (successSignal || successSignalLabel)
+    ? !textIncludesNormalized(markdown, successSignal) && !textIncludesNormalized(markdown, successSignalLabel)
+    : false;
+
+  const missing: string[] = [
+    ...missingIntents.map((item) => `intent:${item}`),
+    ...missingTools.map((item) => `tool:${item}`),
+    ...missingArtifacts.map((item) => `artifact:${item}`),
+    ...(missingSuccessSignal ? ["success_signal"] : []),
+  ];
+
+  return buildCheck(
+    "manifest_markdown_capability_consistent",
+    missing.length === 0,
+    missing.length === 0
+      ? "Candidate SKILL.md reflects the manifest intents, tool requirements, and verification evidence contract."
+      : `Candidate SKILL.md is missing manifest capability signals: ${missing.join(", ")}.`,
+  );
+}
+
 function buildSummary(checks: SkillAuditReport["checks"]): string {
   const failed = checks.filter((check) => !check.passed);
   if (failed.length === 0) {
     return "Proposal passed the v1 candidate-aware skill audit checks.";
   }
   return `Proposal failed ${failed.length} audit check(s): ${failed.map((check) => check.name).join(", ")}.`;
+}
+
+function classifyAuditFailure(name: string): string {
+  if (name.includes("manifest") || name.includes("verification_contract") || name.includes("verification_diff")) {
+    return "manifest_contract";
+  }
+  if (name.includes("markdown") || name.includes("section")) {
+    return "markdown_structure";
+  }
+  if (name.includes("tool") || name.includes("install") || name.includes("runtime") || name.includes("risk")) {
+    return "risk_escalation";
+  }
+  if (name.includes("secret") || name.includes("leakage")) {
+    return "safety";
+  }
+  if (name.includes("reflection")) {
+    return "reflection_alignment";
+  }
+  if (name.includes("candidate_files") || name.includes("patch_is")) {
+    return "candidate_materialization";
+  }
+  return "audit_policy";
+}
+
+function buildAuditRemediationHint(check: SkillAuditReport["checks"][number]): string {
+  switch (check.name) {
+    case "candidate_files_present":
+      return "Materialize every target file into the candidate snapshot before re-running audit.";
+    case "manifest_schema_valid":
+      return "Fix candidate skill.json so it satisfies the skill manifest schema.";
+    case "skill_markdown_structure_valid":
+      return "Restore Core Procedure, Scenario Extensions, and Appendix sections in candidate SKILL.md.";
+    case "patch_is_non_empty_and_scoped":
+      return "Keep the proposal limited to the skill's SKILL.md and skill.json, and ensure at least one target changes.";
+    case "no_tool_scope_escalation":
+      return "Remove newly added required or optional tools unless a human explicitly approves a broader risk profile.";
+    case "no_install_source_escalation":
+      return "Keep the candidate install source aligned with the installed skill.";
+    case "no_runtime_strategy_escalation":
+    case "verification_contract_still_executable":
+      return "Avoid introducing custom runtime behavior or verification contracts that the current runtime cannot execute.";
+    case "no_secret_or_task_leakage":
+      return "Remove secrets, bearer tokens, concrete local paths, and task-specific private details from candidate files.";
+    case "manifest_markdown_identity_consistent":
+      return "Update candidate SKILL.md so it names the same skill id or title as skill.json.";
+    case "manifest_markdown_capability_consistent":
+      return "Update candidate SKILL.md so its intent, tools, artifacts, and success signal match skill.json.";
+    case "verification_contract_diff_scoped":
+      return "Limit verification changes to artifact labels, success signal label, and remediation wording.";
+    case "verification_diff_quality_linked":
+      return "Regenerate proposal quality metadata so verification diffs are marked manifest_verification_only or needs_audit.";
+    case "reflection_to_patch_consistency":
+      return "Regenerate the proposal so touched files and verification edits match the source reflection action.";
+    case "markdown_section_patch_policy":
+      return "Move markdown changes into the allowed and preferred sections for the reflection kind.";
+    case "risk_tier_audit_profile":
+      return "For high-risk skills, keep section policy clean and avoid tool-scope expansion before validation.";
+    default:
+      return "Inspect the failed audit detail and regenerate the candidate with a narrower, policy-compliant change.";
+  }
+}
+
+function buildAuditRemediationHints(checks: SkillAuditReport["checks"]): NonNullable<SkillAuditReport["remediationHints"]> {
+  return checks
+    .filter((check) => !check.passed)
+    .map((check) => ({
+      check: check.name,
+      category: classifyAuditFailure(check.name),
+      evidence: check.detail,
+      hint: buildAuditRemediationHint(check),
+    }));
 }
 
 export function auditSkillEvolutionProposal(input: {
@@ -292,7 +502,9 @@ export function auditSkillEvolutionProposal(input: {
 
   const liveManifest = liveManifestPath && existsSync(liveManifestPath) ? safeReadManifest(liveManifestPath) : null;
   checks.push(checkManifestMarkdownConsistency(candidateManifest, candidateMarkdownPath));
+  checks.push(checkManifestMarkdownCapabilityConsistency(candidateManifest, liveManifest ?? manifest, candidateMarkdownPath));
   checks.push(checkVerificationContractDiffScope(candidateManifest, liveManifest ?? manifest));
+  checks.push(checkVerificationDiffQualityLinkage(proposal, candidateManifest, liveManifest ?? manifest));
 
   const sectionPolicy = evaluateSkillMarkdownPatchPolicy({
     reflection,
@@ -328,6 +540,14 @@ export function auditSkillEvolutionProposal(input: {
   ));
 
   const auditRiskTier = inferAuditRiskTier(candidateManifest ?? manifest);
+  const manualReviewReason = buildHighRiskManualReviewReason(candidateManifest ?? manifest);
+  checks.push(buildCheck(
+    "high_risk_manual_review_reason",
+    auditRiskTier === "low" || Boolean(manualReviewReason),
+    auditRiskTier === "low"
+      ? "Low-risk audit profile does not require an explicit manual-review reason."
+      : manualReviewReason ?? "High-risk audit profile is missing a manual-review reason.",
+  ));
   checks.push(buildCheck(
     "risk_tier_audit_profile",
     auditRiskTier === "low" || (sectionPolicy.policyReady && !hasToolScopeEscalation(candidateManifest, manifest)),
@@ -337,10 +557,13 @@ export function auditSkillEvolutionProposal(input: {
   ));
 
   const passed = checks.every((check) => check.passed);
+  const remediationHints = buildAuditRemediationHints(checks);
   return {
     proposalId: proposal.id,
     passed,
     checks,
+    failureCategories: [...new Set(remediationHints.map((hint) => hint.category))],
+    remediationHints,
     summary: buildSummary(checks),
     createdAt: new Date().toISOString(),
   };

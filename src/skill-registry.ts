@@ -2,7 +2,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import type { InstalledSkillRecord, SkillManifest, SkillMatchResult } from "./skill-types.js";
 import type { IntentRouteKind, OrchestratorConfig } from "./types.js";
-import { PROJECT_ROOT } from "./paths.js";
+import { resolveRuntimeAwarePath } from "./paths.js";
 import { getInstalledSkillRecord, listInstalledSkillRecords } from "./skill-installer.js";
 import { validateSkillManifestShape } from "./skill-manifest-schema.js";
 
@@ -84,7 +84,7 @@ function cloneManifest(skill: SkillManifest): SkillManifest {
 }
 
 function resolveConfiguredPath(pathText: string): string {
-  return resolve(PROJECT_ROOT, pathText);
+  return resolveRuntimeAwarePath(pathText);
 }
 
 function getBuiltinSkillsRoot(config?: OrchestratorConfig): string {

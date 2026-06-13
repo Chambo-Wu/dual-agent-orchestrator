@@ -1,9 +1,10 @@
 # 【历史归档】特定说明：deepseek-v4
 
-> 文档状态：特定集成说明
+> 文档状态：特定集成说明，旧版能力快照。
 >
 > 本文面向特定模型接入与一次性项目说明，不是面向读者的主入口文档。
 > 若需了解当前推荐用法、默认端口、控制面接口与兼容行为，请优先阅读 [README](../README.md) 和 [Readme-CN](../Readme-CN.md)。
+> 文中关于 “MVP 骨架 / 不是生产级 agent 系统” 的描述属于早期状态；当前项目已具备 job / workflow / goal / skill evolution 控制面。
 
 ● 这是 Dual Agent Orchestrator，一个将 Planner（规划器）+ Executor（执行器）模式实现为可运行骨架的 TypeScript 项目。
 

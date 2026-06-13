@@ -429,6 +429,19 @@ export const CONFIG_SCHEMA: Record<string, ConfigFieldSchema> = {
     description: "Highest allowed automation stage for high-risk skills",
     default: "auto_propose",
   },
+  "skill_evolution.risk_tiering.dynamic_window_hours": {
+    type: "number",
+    required: false,
+    description: "Recent-history window, in hours, used for dynamic risk failure clusters and cooldown recovery",
+    default: 24,
+    constraints: { integer: true, min: 1, max: 168 },
+  },
+  "skill_evolution.risk_tiering.low_risk_pilot_skills": {
+    type: "string",
+    required: false,
+    description: "Explicit low-risk skill ids allowed to auto-validate as a conservative semi-automation pilot",
+    default: [],
+  },
   "goal_mode.auto_insert_large_checks": {
     type: "boolean",
     required: false,

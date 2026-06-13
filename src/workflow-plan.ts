@@ -34,6 +34,12 @@ export interface WorkflowExecutionSupportResult {
   issues: string[];
 }
 
+export interface WorkflowPlanRepairResult {
+  plan: WorkflowPlan;
+  changed: boolean;
+  warnings: string[];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -282,6 +288,69 @@ export function validateWorkflowPlan(plan: WorkflowPlan, tools: readonly ToolDef
   return {
     valid: issues.length === 0,
     issues,
+  };
+}
+
+function removeVerifierOnlyConstraints(task: WorkflowTaskSpec): { task: WorkflowTaskSpec; warnings: string[] } {
+  if (task.kind === "verify" || !task.constraints) {
+    return { task, warnings: [] };
+  }
+
+  const {
+    verifier_profile: verifierProfile,
+    verifier_agent_id: verifierAgentId,
+    minimum_artifact_count: minimumArtifactCount,
+    required_artifact_type: requiredArtifactType,
+    required_schema: requiredSchema,
+    ...remainingConstraints
+  } = task.constraints;
+  const removedFields = [
+    verifierProfile !== undefined ? "verifier_profile" : undefined,
+    verifierAgentId !== undefined ? "verifier_agent_id" : undefined,
+    minimumArtifactCount !== undefined ? "minimum_artifact_count" : undefined,
+    requiredArtifactType !== undefined ? "required_artifact_type" : undefined,
+    requiredSchema !== undefined ? "required_schema" : undefined,
+  ].filter((field): field is string => Boolean(field));
+
+  if (removedFields.length === 0) {
+    return { task, warnings: [] };
+  }
+
+  const constraints = Object.fromEntries(
+    Object.entries(remainingConstraints).filter(([, value]) => value !== undefined),
+  ) as WorkflowTaskSpec["constraints"];
+  return {
+    task: {
+      ...task,
+      constraints: constraints && Object.keys(constraints).length > 0 ? constraints : undefined,
+    },
+    warnings: [`task ${task.id} is not a verify task; removed verifier-only constraints: ${removedFields.join(", ")}`],
+  };
+}
+
+export function repairWorkflowPlan(plan: WorkflowPlan): WorkflowPlanRepairResult {
+  const warnings: string[] = [];
+  const tasks = plan.tasks.map((task) => {
+    const repaired = removeVerifierOnlyConstraints(task);
+    warnings.push(...repaired.warnings);
+    return repaired.task;
+  });
+
+  if (warnings.length === 0) {
+    return {
+      plan,
+      changed: false,
+      warnings,
+    };
+  }
+
+  return {
+    plan: {
+      ...plan,
+      tasks,
+    },
+    changed: true,
+    warnings,
   };
 }
 

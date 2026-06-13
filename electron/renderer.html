@@ -23,6 +23,7 @@
           <button class="nav-item" data-view="jobs" title="Jobs">≡<span>Jobs</span></button>
           <button class="nav-item" data-view="goals" title="Goals">◎<span>Goals</span></button>
           <button class="nav-item" data-view="skills" title="Skill Ops">◇<span>Skill Ops</span></button>
+          <button class="nav-item" data-view="skill-create" title="New Skill">＋<span>新增 Skill</span></button>
           <button class="nav-item" data-view="health" title="Health">◌<span>健康</span></button>
         </nav>
         <div class="server-card">
@@ -176,6 +177,88 @@
 
         <section id="view-skills" class="view frame-view">
           <iframe id="skills-frame" title="Skill evolution ops"></iframe>
+        </section>
+
+        <section id="view-skill-create" class="view">
+          <div class="workspace-grid">
+            <form id="skill-form" class="panel">
+              <div class="panel-head">
+                <h2>新增 Skill</h2>
+                <span class="pill muted">adapter</span>
+              </div>
+              <div class="split">
+                <label>
+                  <span>Skill ID</span>
+                  <input id="skill-id" placeholder="local_search.searxng">
+                </label>
+                <label>
+                  <span>Intent</span>
+                  <select id="skill-intent">
+                    <option value="research">research</option>
+                    <option value="coding">coding</option>
+                    <option value="find">find</option>
+                    <option value="data_analysis">data_analysis</option>
+                    <option value="file_ops">file_ops</option>
+                    <option value="goal_planning">goal_planning</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>标题</span>
+                <input id="skill-title" placeholder="SearXNG Search">
+              </label>
+              <label>
+                <span>描述</span>
+                <textarea id="skill-description" rows="3" placeholder="Search the web using a local SearXNG instance."></textarea>
+              </label>
+              <label>
+                <span>关键词，用逗号分隔</span>
+                <input id="skill-keywords" placeholder="search, web search, searxng">
+              </label>
+              <label>
+                <span>Core Procedure</span>
+                <textarea id="skill-procedure" rows="6" placeholder="1. Confirm the query and category.&#10;2. Run the local search workflow.&#10;3. Summarize useful sources and gaps."></textarea>
+              </label>
+              <div class="split">
+                <label>
+                  <span>工具，用逗号分隔</span>
+                  <input id="skill-tools" value="read_file">
+                </label>
+                <label>
+                  <span>环境变量，用逗号分隔</span>
+                  <input id="skill-env-vars" placeholder="SEARXNG_URL">
+                </label>
+              </div>
+              <label class="check">
+                <input id="skill-allow-shell" type="checkbox">
+                <span>允许脚本 / shell 运行时</span>
+              </label>
+              <label>
+                <span>Runtime Entry</span>
+                <input id="skill-runtime-entry" placeholder="uv run skills/local_search.searxng/scripts/searxng.py search">
+              </label>
+              <label>
+                <span>来源备注</span>
+                <input id="skill-source-notes" placeholder="Imported from OpenClaw skill; requires local SearXNG.">
+              </label>
+              <div class="form-actions">
+                <label class="check">
+                  <input id="skill-overwrite" type="checkbox">
+                  <span>覆盖同名目录</span>
+                </label>
+                <button type="submit">生成适配</button>
+              </div>
+            </form>
+
+            <section class="panel result-panel">
+              <div class="panel-head">
+                <h2>生成结果</h2>
+                <span id="skill-create-status" class="pill muted">idle</span>
+              </div>
+              <div id="skill-create-summary" class="job-summary"></div>
+              <pre id="skill-create-json" class="event-log"></pre>
+            </section>
+          </div>
         </section>
 
         <section id="view-health" class="view">

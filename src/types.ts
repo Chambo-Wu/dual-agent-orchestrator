@@ -78,6 +78,8 @@ export interface SkillEvolutionConfig {
       medium: "auto_accept" | "auto_validate" | "auto_audit" | "auto_propose" | "auto_reflect";
       high: "auto_accept" | "auto_validate" | "auto_audit" | "auto_propose" | "auto_reflect";
     };
+    dynamicWindowHours: number;
+    lowRiskPilotSkills: string[];
   };
 }
 

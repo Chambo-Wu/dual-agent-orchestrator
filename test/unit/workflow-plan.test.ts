@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assessWorkflowExecutionSupport, buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, validateWorkflowPlan } from "../../src/workflow-plan.js";
+import { assessWorkflowExecutionSupport, buildWorkflowFallbackExecutorRequest, parseWorkflowPlan, repairWorkflowPlan, validateWorkflowPlan } from "../../src/workflow-plan.js";
 import { TOOL_DEFINITIONS } from "../../src/tools.js";
 
 test("workflow plan parses and validates a minimal milestone A plan", () => {
@@ -206,6 +206,63 @@ test("workflow plan validation constrains verifier profile fields to verify task
   assert.equal(validation.issues.some((issue) => issue.includes("defines verifier_profile but is not a verify task")), true);
   assert.equal(validation.issues.some((issue) => issue.includes("defines verifier_agent_id but is not a verify task")), true);
   assert.equal(validation.issues.some((issue) => issue.includes("unsupported verifier_profile")), true);
+});
+
+test("workflow plan repair removes verifier-only constraints from non-verify tasks", () => {
+  const plan = parseWorkflowPlan({
+    id: "wf_repair_verifier_constraints",
+    strategy: "repair_verifier_constraints",
+    summary: "Repair misplaced verifier constraints.",
+    tasks: [
+      {
+        id: "t1",
+        title: "Write report",
+        kind: "write",
+        role: "worker",
+        instruction: "Write report.md.",
+        allowed_tools: ["write_file"],
+        depends_on: [],
+        required: true,
+        constraints: {
+          max_tool_rounds: 3,
+          verifier_profile: "system_and_model",
+          verifier_agent_id: "verifier_a",
+          minimum_artifact_count: 1,
+          required_artifact_type: "file",
+          required_schema: "json",
+        },
+      },
+      {
+        id: "t2",
+        title: "Verify report",
+        kind: "verify",
+        role: "verifier",
+        instruction: "Verify report.md.",
+        allowed_tools: [],
+        depends_on: ["t1"],
+        required: true,
+        constraints: {
+          verifier_profile: "system",
+        },
+      },
+    ],
+    finish_when: {
+      mode: "all_required_tasks_completed",
+    },
+  });
+
+  assert.ok(plan);
+  const repair = repairWorkflowPlan(plan!);
+  assert.equal(repair.changed, true);
+  assert.equal(repair.warnings.some((warning) => warning.includes("removed verifier-only constraints")), true);
+  assert.equal(repair.plan.tasks[0]?.constraints?.max_tool_rounds, 3);
+  assert.equal(repair.plan.tasks[0]?.constraints?.verifier_profile, undefined);
+  assert.equal(repair.plan.tasks[0]?.constraints?.verifier_agent_id, undefined);
+  assert.equal(repair.plan.tasks[1]?.constraints?.verifier_profile, "system");
+
+  const validation = validateWorkflowPlan(repair.plan, TOOL_DEFINITIONS);
+  assert.equal(validation.valid, true);
+  assert.deepEqual(validation.issues, []);
 });
 
 test("workflow execution support allows advanced finish_when modes in milestone C", () => {

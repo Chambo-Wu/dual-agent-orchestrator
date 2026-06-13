@@ -1189,6 +1189,65 @@ test("workflow runtime fails verify tasks when dependency artifacts do not satis
   assert.equal(result.taskRuns[1]?.verificationResult?.checks.some((check) => check.name === "artifact_presence" && check.status === "insufficient"), true);
 });
 
+test("workflow runtime repairs misplaced verifier constraints before validation", async () => {
+  const config = buildMinimalConfig();
+  const routePolicy = buildRoutePolicy();
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+
+  const result = await runWorkflowPlan(
+    config,
+    "Write with misplaced verifier constraints",
+    {
+      id: "wf_repair_misplaced_verifier_constraints",
+      strategy: "write_then_verify",
+      summary: "Write a report and verify it.",
+      tasks: [
+        {
+          id: "t1",
+          title: "Write report",
+          kind: "write",
+          role: "worker",
+          instruction: "Write report.md.",
+          allowed_tools: ["write_file"],
+          depends_on: [],
+          required: true,
+          constraints: {
+            verifier_profile: "system_and_model",
+            verifier_agent_id: "strict_verifier",
+          },
+        },
+      ],
+      finish_when: {
+        mode: "all_required_tasks_completed",
+      },
+    },
+    routePolicy,
+    undefined,
+    createFakeRuntimeDeps({
+      runExecutorStep: async () => ({
+        status: "success",
+        summary: "Wrote report.md",
+        tool_calls_made: [{ tool: "write_file", arguments: { path: "report.md", content: "done" } }],
+        artifacts: [{ type: "file", path: "report.md", content_preview: "done" }],
+        raw_result: "done",
+        source: "native_tool",
+      }),
+    }),
+    {
+      onEvent: (event) => {
+        events.push({ type: event.type, data: event.data });
+      },
+    },
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.taskRuns[0]?.status, "completed");
+  assert.equal(result.taskRuns[0]?.description.includes("Write report.md"), true);
+  assert.equal(result.taskRuns.length, 1);
+  assert.equal(events.some((event) => event.type === "workflow.plan.repaired"), true);
+  assert.equal(result.taskRuns[0]?.output.includes("Wrote report.md"), true);
+});
+
 test("workflow runtime honors retry_policy skip for failed tasks and continues dependents", async () => {
   const config = buildMinimalConfig();
   const routePolicy = buildRoutePolicy();

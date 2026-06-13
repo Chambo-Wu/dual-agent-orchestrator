@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("desktop", {
   stopServer: () => ipcRenderer.invoke("server:stop"),
   restartServer: () => ipcRenderer.invoke("server:restart"),
   apiRequest: (pathname, options) => ipcRenderer.invoke("api:request", pathname, options),
+  createSkill: (input) => ipcRenderer.invoke("skill:create", input),
   openExternal: (url) => ipcRenderer.invoke("open:external", url),
   onServerLog: (handler) => {
     const listener = (_event, line) => handler(line);

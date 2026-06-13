@@ -85,6 +85,26 @@ export function renderSkillEvolutionOpsDashboardHtml(
       gap: 10px;
       margin-bottom: 16px;
     }
+    .filters {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 16px;
+      display: grid;
+      gap: 8px;
+    }
+    .filter-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .filter-label {
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 84px;
+    }
     .metric {
       border: 1px solid var(--border);
       background: var(--panel);
@@ -165,6 +185,11 @@ export function renderSkillEvolutionOpsDashboardHtml(
     .bar-track { height: 8px; background: #0d1117; border-radius: 999px; border: 1px solid var(--border); overflow: hidden; }
     .bar-fill { height: 100%; background: var(--accent); }
     .empty { color: var(--muted); padding: 18px; }
+    .link {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .link:hover { text-decoration: underline; }
     @media (max-width: 900px) {
       main { width: min(100vw - 20px, 760px); padding-top: 16px; }
       header { align-items: flex-start; flex-direction: column; }
@@ -187,6 +212,7 @@ export function renderSkillEvolutionOpsDashboardHtml(
       </div>
     </header>
     <section class="metrics" id="metrics"></section>
+    <section class="filters" id="filters"></section>
     <section class="layout">
       <div class="panel">
         <div class="panel-header">
@@ -212,6 +238,7 @@ export function renderSkillEvolutionOpsDashboardHtml(
     let selectedId = '';
 
     const metrics = document.getElementById('metrics');
+    const filters = document.getElementById('filters');
     const generatedAt = document.getElementById('generated-at');
     const listMeta = document.getElementById('list-meta');
     const tabs = document.getElementById('tabs');
@@ -264,6 +291,22 @@ export function renderSkillEvolutionOpsDashboardHtml(
       metrics.innerHTML = cards.map(([label, value]) => '<div class="metric"><div class="metric-label">' + escapeHtmlClient(label) + '</div><div class="metric-value">' + escapeHtmlClient(count(value)) + '</div></div>').join('');
       generatedAt.textContent = payload.generated_at ? 'Generated ' + new Date(payload.generated_at).toLocaleString() : 'Generated from local control-plane state';
     }
+    function renderFilterChips() {
+      const filterData = payload && payload.filters ? payload.filters : {};
+      const rows = [
+        ['Skills', asArray(filterData.skills)],
+        ['Statuses', asArray(filterData.statuses)],
+        ['Risk tiers', asArray(filterData.risk_tiers)],
+        ['Queue states', asArray(filterData.queue_states)],
+        ['Next actions', asArray(filterData.next_actions)],
+      ];
+      filters.innerHTML = rows.map(([label, values]) => {
+        const chips = values.length > 0
+          ? values.map((value) => '<span class="chip">' + escapeHtmlClient(value) + '</span>').join('')
+          : '<span class="subtle">none</span>';
+        return '<div class="filter-row"><span class="filter-label">' + escapeHtmlClient(label) + '</span>' + chips + '</div>';
+      }).join('');
+    }
     function renderTabs() {
       const tabsData = [
         ['queue', 'Proposal Queue', asArray(payload.proposal_queue).length],
@@ -305,6 +348,7 @@ export function renderSkillEvolutionOpsDashboardHtml(
         + (ops.funnel_stage ? '<span class="chip">' + escapeHtmlClient(ops.funnel_stage) + '</span>' : '')
         + (age ? '<span class="chip ' + statusClass(age) + '">' + escapeHtmlClient(age) + '</span>' : '')
         + (ops.dynamic_risk_tier ? '<span class="chip ' + statusClass(ops.dynamic_risk_tier) + '">risk ' + escapeHtmlClient(ops.dynamic_risk_tier) + '</span>' : '')
+        + (ops.next_action ? '<span class="chip">next ' + escapeHtmlClient(ops.next_action) + '</span>' : '')
         + (stuck ? '<span class="chip warn">stuck</span>' : '')
         + '</div></button>';
     }
@@ -337,6 +381,9 @@ export function renderSkillEvolutionOpsDashboardHtml(
       }
       const ops = item.ops_summary || {};
       const validation = item.validation_summary || {};
+      const eligibility = item.eligibility || {};
+      const eligibilityContract = eligibility.contract || {};
+      const eligibilityGates = eligibilityContract.gates || {};
       const rollback = item.rollback || item;
       const stuckReasons = asArray(readPath(ops, ['stuck_state', 'reasons'], []));
       const stuckCategories = asArray(readPath(ops, ['stuck_state', 'categories'], []));
@@ -353,10 +400,20 @@ export function renderSkillEvolutionOpsDashboardHtml(
         + '<div class="kv-key">Age</div><div class="kv-value">' + escapeHtmlClient(ops.age_bucket || '') + '</div>'
         + '<div class="kv-key">Risk</div><div class="kv-value">' + escapeHtmlClient(ops.dynamic_risk_tier || readPath(item, ['dynamic_risk', 'tier'], '')) + '</div>'
         + '<div class="kv-key">Auto Accept</div><div class="kv-value">' + escapeHtmlClient(String(ops.auto_accept_eligible ?? validation.auto_accept_ready ?? false)) + '</div>'
+        + '<div class="kv-key">Next Action</div><div class="kv-value">' + escapeHtmlClient(ops.next_action || readPath(eligibilityContract, ['required_action'], '')) + '</div>'
+        + '<div class="kv-key">Queue Category</div><div class="kv-value">' + escapeHtmlClient(ops.queue_category || '') + '</div>'
+        + '<div class="kv-key">Eligibility</div><div class="kv-value">' + escapeHtmlClient(readPath(eligibilityContract, ['state'], eligibility.eligible === true ? 'eligible' : 'blocked')) + '</div>'
         + '<div class="kv-key">Replay Stability</div><div class="kv-value">' + escapeHtmlClient(validation.replay_stability_score ?? 'n/a') + '</div>'
         + '<div class="kv-key">Rollback</div><div class="kv-value">' + escapeHtmlClient(rollback.rollback_available === true ? rollback.rollback_path || 'available' : 'not available') + '</div>'
         + '</div>'
+        + '<div class="section"><h3>Links</h3><div class="subtle">'
+        + (item.proposal_url ? '<a class="link" href="' + escapeHtmlClient(item.proposal_url) + '">Proposal</a> ' : '')
+        + (item.audit_url ? '<a class="link" href="' + escapeHtmlClient(item.audit_url) + '">Audit</a> ' : '')
+        + (item.validate_url ? '<a class="link" href="' + escapeHtmlClient(item.validate_url) + '">Validate</a> ' : '')
+        + (item.rollback_guide_url ? '<a class="link" href="' + escapeHtmlClient(item.rollback_guide_url) + '">Rollback Guide</a>' : '')
+        + '</div></div>'
         + '<div class="section"><h3>Change</h3><div class="subtle">' + escapeHtmlClient(item.change_summary || item.patch_summary || 'No change summary') + '</div></div>'
+        + '<div class="section"><h3>Eligibility Gates</h3><div class="subtle">' + escapeHtmlClient(Object.entries(eligibilityGates).map(([key, value]) => key + ':' + String(value)).join(' | ') || 'No eligibility gate summary.') + '</div></div>'
         + '<div class="section"><h3>Blockers</h3><div class="subtle">' + escapeHtmlClient([...stuckReasons, ...eligibilityReasons].join(' | ') || 'No blocker reasons recorded.') + '</div></div>'
         + '<div class="section"><h3>Stuck Categories</h3><div class="subtle">' + escapeHtmlClient(categorySummary || 'No stuck category recorded.') + '</div></div>'
         + '<div class="section"><h3>Validation</h3><div class="subtle">' + escapeHtmlClient(validation.replay_headline || validation.reason_code || 'No validation summary') + '</div></div>'
@@ -365,6 +422,7 @@ export function renderSkillEvolutionOpsDashboardHtml(
     }
     function render() {
       renderMetrics();
+      renderFilterChips();
       renderTabs();
       renderList();
       renderDetail();

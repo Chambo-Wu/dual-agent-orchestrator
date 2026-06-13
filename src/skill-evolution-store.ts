@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { PROJECT_ROOT } from "./paths.js";
+import { PROJECT_ROOT, resolveRuntimeAwarePath } from "./paths.js";
 import { buildCandidateManifestContent, buildStructuredSkillMarkdownCandidate } from "./skill-evolver.js";
 import type {
   SkillAuditReport,
@@ -12,27 +12,27 @@ import type {
 import type { SkillManifest } from "./skill-types.js";
 
 function reflectionsRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "reflections");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "reflections");
 }
 
 function proposalsRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "proposals");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "proposals");
 }
 
 function auditsRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "audits");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "audits");
 }
 
 function validationsRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "validations");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "validations");
 }
 
 function acceptedRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "accepted");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "accepted");
 }
 
 function rejectedRoot(candidateDir = "runtime/skill-evolution"): string {
-  return resolve(PROJECT_ROOT, candidateDir, "rejected");
+  return resolve(resolveRuntimeAwarePath(candidateDir), "rejected");
 }
 
 function skillReflectionsDir(skillId: string, candidateDir = "runtime/skill-evolution"): string {

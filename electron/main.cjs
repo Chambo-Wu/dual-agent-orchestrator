@@ -193,6 +193,147 @@ function writeState(state) {
   return withDesktopMetadata(normalized);
 }
 
+function createSkillFromWizard(input = {}) {
+  const skillId = sanitizeSkillId(input.id);
+  if (!skillId) {
+    return { ok: false, error: "Skill ID must use lowercase letters, numbers, dot, underscore, or dash." };
+  }
+  const title = stringValue(input.title) || skillId;
+  const description = stringValue(input.description);
+  if (!description) {
+    return { ok: false, error: "Description is required." };
+  }
+  const intent = ["find", "research", "coding", "data_analysis", "file_ops", "goal_planning"].includes(input.intent)
+    ? input.intent
+    : "research";
+  const keywords = csv(input.keywords).length > 0 ? csv(input.keywords) : [skillId, title.toLowerCase()];
+  const requestedTools = Array.isArray(input.requiredTools)
+    ? input.requiredTools.filter((tool) => typeof tool === "string" && tool.trim()).map((tool) => tool.trim())
+    : csv(input.requiredTools);
+  const allowShell = Boolean(input.allowShell);
+  const requiredTools = [...new Set([
+    ...requestedTools,
+    ...(allowShell ? ["shell_command"] : []),
+    "read_file",
+  ])];
+  const runtimeEntry = stringValue(input.runtimeEntry);
+  const execution = allowShell && runtimeEntry
+    ? { strategy: "custom_runtime", runtimeEntry }
+    : { strategy: "prompt_template" };
+  const manifest = {
+    id: skillId,
+    version: stringValue(input.version) || "0.1.0",
+    title,
+    description,
+    intents: [intent],
+    keywords,
+    requiredTools,
+    install: {
+      source: "builtin",
+      location: `skills/${skillId}`,
+    },
+    activation: {
+      mode: "intent_match",
+      priority: Number.isFinite(Number(input.priority)) ? Number(input.priority) : 50,
+    },
+    execution,
+    verification: {
+      requiredArtifacts: ["output_summary"],
+      successSignal: "non_empty_output_summary",
+      artifactLabels: {
+        output_summary: "non-empty output summary",
+      },
+      successSignalLabel: "produce a non-empty output summary",
+      remediation: {
+        insufficient: "Collect the required evidence or output summary, then rerun skill verification.",
+        failed: "Review the skill instructions, replace weak evidence, and confirm the output summary before continuing.",
+      },
+    },
+  };
+
+  const skillsRoot = path.resolve(PROJECT_ROOT, "skills");
+  const targetDir = path.resolve(skillsRoot, skillId);
+  if (!targetDir.startsWith(`${skillsRoot}${path.sep}`)) {
+    return { ok: false, error: "Resolved skill path escapes the skills directory." };
+  }
+  if (existsSync(targetDir) && !input.overwrite) {
+    return { ok: false, error: `Skill directory already exists: ${targetDir}` };
+  }
+
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(path.join(targetDir, "skill.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  writeFileSync(path.join(targetDir, "SKILL.md"), buildSkillMarkdown({
+    skillId,
+    title,
+    description,
+    intent,
+    keywords,
+    requiredTools,
+    runtimeEntry,
+    sourceNotes: stringValue(input.sourceNotes),
+    procedure: stringValue(input.procedure),
+    envVars: csv(input.envVars),
+  }), "utf8");
+
+  return {
+    ok: true,
+    skillId,
+    directory: targetDir,
+    manifest,
+    files: {
+      manifest: path.join(targetDir, "skill.json"),
+      markdown: path.join(targetDir, "SKILL.md"),
+    },
+  };
+}
+
+function sanitizeSkillId(value) {
+  const normalized = stringValue(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return /^[a-z0-9][a-z0-9._-]*$/.test(normalized) ? normalized : "";
+}
+
+function buildSkillMarkdown(input) {
+  const procedure = input.procedure || [
+    `Use this skill when the user request matches ${input.title}.`,
+    "Collect the minimum evidence or context needed for the task.",
+    "Run only the tools required by the manifest and preserve relevant outputs.",
+    "Summarize the result with enough detail for verification.",
+  ].map((line, index) => `${index + 1}. ${line}`).join("\n");
+  const envSection = input.envVars.length > 0
+    ? `\n- Required environment variables: ${input.envVars.join(", ")}.`
+    : "";
+  const runtimeSection = input.runtimeEntry
+    ? `\n- Runtime entry: \`${input.runtimeEntry}\`.`
+    : "";
+  const sourceSection = input.sourceNotes
+    ? `\n- Source notes: ${input.sourceNotes}`
+    : "";
+  return `# Skill: ${input.skillId}
+
+## Core Procedure
+
+${procedure}
+
+## Scenario Extensions
+
+- For uncertain matches, ask the planner to keep this skill as optional rather than forcing activation.
+- For external or script-backed workflows, confirm that required local services and environment variables are available before relying on the result.
+- If the skill cannot gather enough evidence, report the gap instead of fabricating a completed result.
+
+## Appendix
+
+- Intent: ${input.intent}.
+- Keywords: ${input.keywords.join(", ")}.
+- Required tools: ${input.requiredTools.join(", ")}.${runtimeSection}${envSection}${sourceSection}
+- Expected artifacts: output_summary.
+- Success signal: produce a non-empty output summary.
+- Remediation: collect stronger evidence, rerun the relevant command or workflow, and update the output summary before continuing.
+`;
+}
+
 function withDesktopMetadata(state) {
   return {
     ...state,
@@ -665,3 +806,4 @@ ipcMain.handle("server:stop", () => ({ result: stopServer(), status: getServerSt
 ipcMain.handle("server:restart", () => ({ result: restartServer(), status: getServerStatus() }));
 ipcMain.handle("api:request", (_event, pathname, options) => apiRequest(pathname, options));
 ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
+ipcMain.handle("skill:create", (_event, input) => createSkillFromWizard(input));

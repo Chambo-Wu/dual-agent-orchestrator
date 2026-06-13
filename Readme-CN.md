@@ -41,6 +41,16 @@ English documentation: [README.md](./README.md)
 - verifier 角色接入验证主链
 - approval gate、resume / retry、可恢复控制面
 
+## Claude Code 入口
+
+`/dao-run <任务>` 与 `/dao-exec <任务>` 是 Claude Code 里的薄入口，目标是把任务交给本地 `/v1/jobs` 控制面，而不是让 Claude Code 把它当成本地文件编辑任务。命令会通过 `node dist/index.js dao-run "<任务>"` 创建 async job，并返回 job id 与 timeline CTA。
+
+如果服务未启动，先运行：
+
+```powershell
+npm run serve:restart:9898
+```
+
 ## Skill 自进化成熟度
 
 当前仓库中的 Skill 自进化能力已经从 v1 控制面基础能力，推进到 V2 的产品化、治理与自动化边界收口。
