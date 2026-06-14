@@ -72,7 +72,7 @@ Agent 层：  Claude Code CLI 入口（/dao-run、/dao-exec）
 ## 架构一览
 
 ```
-src/index.ts (144行 — CLI/export 聚合 + 路由入口转发)
+src/index.ts (约140行 — CLI/export 聚合 + 路由入口转发)
 └── src/server/
     ├── router.ts                  HTTP 路由装配
     ├── shared.ts                  共享 HTTP 工具
@@ -98,7 +98,8 @@ src/index.ts (144行 — CLI/export 聚合 + 路由入口转发)
 ├── src/job-response.ts       Job response / workflow event 聚合
 ├── src/server-response.ts    Health / workflow payload
 ├── src/chat-message-utils.ts Chat/Tool/Anthropic 消息归一化
-└── src/progress-updates.ts   流式进度聚合
+├── src/progress-updates.ts   流式进度聚合
+└── src/api-types.ts          Chat/Responses/Anthropic 请求类型
 
 Skill 自进化
 ├── src/skill-evolution-automation.ts 自动反思/提案/审计/验证流水线
@@ -106,7 +107,7 @@ Skill 自进化
 ├── src/skill-evolver.ts           Proposal 生成
 ├── src/skill-auditor.ts           Auditor Gate
 ├── src/skill-deployment-validator.ts   部署验证
-├── src/skill-evolution-store.ts   持久化层
+├── src/skill-evolution-store.ts   持久化与路径护栏
 └── src/skill-replay-runtime.ts    Replay 执行
 ```
 
@@ -150,7 +151,7 @@ node dist/index.js "写一个 markdown 文件 notes/plan.md，列出三个优化
 | 2026-06-13 | dao-run 鲁棒性 + Electron 桌面端 + 审计分层 |
 | 2026-06-13b | 代码库优化：index.ts 模块化、crossFileConsistency 精度、审计匹配改进、文档清理 |
 | 2026-06-13c | 架构拆分：路由层四模块化（Skill Evolution/Goal/Job/Chat routes），index.ts 7531→5586行 |
-| 2026-06-14 | 架构拆分收口：执行入口、job response、server response、消息工具与 Skill Evolution 自动化模块下沉，index.ts 约 8700→144行；补路径护栏、测试配置克隆、API request types 统一和死代码清理 |
+| 2026-06-14 | 架构拆分收口：执行入口、job response、server response、消息工具与 Skill Evolution 自动化模块下沉，index.ts 约 8700 行降至约 140 行；补路径护栏、测试配置克隆、API request types 统一和死代码清理 |
 
 ---
 

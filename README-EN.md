@@ -97,7 +97,7 @@ The skill-evolution path is now partially productized rather than just a design 
 | 2026-06-13 | dao-run robustness and desktop foundation | Fixed dao-run CLI silent failure (service-down now exits 1 with actionable guidance), added PreToolUse hook to protect CLAUDE.md from being overwritten, fixed restart-serve-9898.ps1 build race condition. Added Electron desktop app foundation, skill auditor with risk tiering, and comprehensive test coverage for skill evolution and workflow systems. |
 | 2026-06-13b | Codebase optimization and governance hardening | Extracted CLI/Doctor from index.ts (576 lines removed), fixed crossFileConsistency precision for patch_body+skill_defect cases, improved auditor capability matching with token-level fallback, added insufficient_evidence reasonCode, aligned CLAUDE.md with actual implementation, cleaned docs/ (26 archived, developer guide added), extended E2E test coverage, added agents/README and timeline.ts refactoring notes. Build passes, 223/223 unit tests green. |
 | 2026-06-13c | Route-layer modularization | Extracted Skill Evolution, Goal, Job, and Chat routes from `src/index.ts`; index.ts moved from 7531 to 5586 lines at that checkpoint. |
-| 2026-06-14 | Architecture split closure and Skill Evolution hardening | Moved execution entrypoints, task execution, job responses, server responses, chat message utilities, progress updates, router/auth/SSE helpers, and Skill Evolution automation/builders into dedicated modules. `src/index.ts` is now a 144-line CLI/export aggregation layer. Added skill-evolution path containment, cloned test config overrides, shared API request types, and removed replay dead code. Build passes, 226/226 unit tests green. |
+| 2026-06-14 | Architecture split closure and Skill Evolution hardening | Moved execution entrypoints, task execution, job responses, server responses, chat message utilities, progress updates, router/auth/SSE helpers, and Skill Evolution automation/builders into dedicated modules. `src/index.ts` is now an approximately 140-line CLI/export aggregation layer. Added skill-evolution path containment, cloned test config overrides, shared API request types, and removed replay dead code. Build passes, 226/226 unit tests green. |
 ## Terminology
 
 Use these terms consistently across the runtime, API, UI, and planning docs:
@@ -117,7 +117,7 @@ Use these terms consistently across the runtime, API, UI, and planning docs:
 ## Architecture
 
 - `src/orchestrator.ts`: planner/executor loop, protocol correction, evidence checks, and file-write validation
-- `src/index.ts`: 144-line CLI/export aggregation layer and router entrypoint forwarding
+- `src/index.ts`: approximately 140-line CLI/export aggregation layer and router entrypoint forwarding
 - `src/server/router.ts`: HTTP route table and handler dispatch
 - `src/server/chat-routes.ts`: OpenAI Chat, Responses, and Anthropic Messages handlers
 - `src/server/job-routes.ts`: job CRUD, approval, resume/retry/review, events, streams, and browser views
