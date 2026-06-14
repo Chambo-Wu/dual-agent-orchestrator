@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { PROJECT_ROOT } from "./paths.js";
-import { getSkillEvolutionProposalCandidateRoot } from "./skill-evolution-store.js";
+import {
+  getSkillEvolutionProposalCandidateRoot,
+  resolveSkillEvolutionLiveTargetPath,
+  resolveSkillEvolutionSnapshotTargetPath,
+} from "./skill-evolution-store.js";
 import {
   evaluateSkillMarkdownPatchPolicy,
   hasRiskyManifestEscalation,
@@ -33,7 +35,7 @@ function resolveCandidateManifestPath(proposal: SkillEvolutionProposal): string 
   if (!target) {
     return null;
   }
-  const path = resolve(candidateRoot, target);
+  const path = resolveSkillEvolutionSnapshotTargetPath(candidateRoot, target);
   return existsSync(path) ? path : null;
 }
 
@@ -42,7 +44,7 @@ function resolveLiveManifestPath(proposal: SkillEvolutionProposal): string | nul
   if (!target) {
     return null;
   }
-  const path = resolve(PROJECT_ROOT, target);
+  const path = resolveSkillEvolutionLiveTargetPath(target);
   return existsSync(path) ? path : null;
 }
 
@@ -524,9 +526,10 @@ export function validateSkillEvolutionProposal(input: {
   const baselineMissingRequirements = isolatedReplay?.baseline.missingRequirements
     ?? reflectedBaselineMissingRequirements;
   const risk = resolveValidationRiskProfile(candidateManifest, liveManifest);
+  const candidateRoot = getSkillEvolutionProposalCandidateRoot(proposal.id, proposal.candidateDir);
   const changedFiles = proposal.targetFiles.filter((targetFile) => {
-    const candidatePath = resolve(getSkillEvolutionProposalCandidateRoot(proposal.id, proposal.candidateDir), targetFile);
-    const livePath = resolve(PROJECT_ROOT, targetFile);
+    const candidatePath = resolveSkillEvolutionSnapshotTargetPath(candidateRoot, targetFile);
+    const livePath = resolveSkillEvolutionLiveTargetPath(targetFile);
     if (!existsSync(candidatePath)) {
       return false;
     }
@@ -535,10 +538,10 @@ export function validateSkillEvolutionProposal(input: {
     return candidateContent !== liveContent;
   });
   const candidateMarkdownPath = proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))
-    ? resolve(getSkillEvolutionProposalCandidateRoot(proposal.id, proposal.candidateDir), proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))!)
+    ? resolveSkillEvolutionSnapshotTargetPath(candidateRoot, proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))!)
     : null;
   const liveMarkdownPath = proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))
-    ? resolve(PROJECT_ROOT, proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))!)
+    ? resolveSkillEvolutionLiveTargetPath(proposal.targetFiles.find((targetFile) => targetFile.endsWith("/SKILL.md") || targetFile.endsWith("\\SKILL.md"))!)
     : null;
   const markdownSectionPolicy = evaluateSkillMarkdownPatchPolicy({
     reflection,
@@ -674,6 +677,7 @@ export function validateSkillEvolutionProposal(input: {
     && markdownSectionPolicy.policyReady
     && riskSatisfied;
 
+  const hasReadyRuntimeEvidence = runtimeBoundary.trueRuntimeReplayReady && candidateVerified && !!candidateManifest && !silentBypassSignal;
   const reasonCode = !candidateSelected
     ? "candidate_not_selected"
     : silentBypassSignal
@@ -684,7 +688,7 @@ export function validateSkillEvolutionProposal(input: {
         ? "candidate_not_verified"
       : !candidateVerified
         ? "candidate_not_verified"
-        : baselineFailedChecks.length === 0 && candidateFailedChecks.length === 0
+        : baselineFailedChecks.length === 0 && candidateFailedChecks.length === 0 && !hasReadyRuntimeEvidence
           ? "insufficient_evidence"
         : baselineVerified && candidateFailedChecks.length > baselineFailedChecks.length
           ? "baseline_regression"

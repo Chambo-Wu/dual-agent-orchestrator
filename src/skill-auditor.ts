@@ -1,7 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PROJECT_ROOT } from "./paths.js";
-import { getSkillEvolutionProposalCandidateRoot } from "./skill-evolution-store.js";
+import {
+  getSkillEvolutionProposalCandidateRoot,
+  resolveSkillEvolutionLiveTargetPath,
+  resolveSkillEvolutionSnapshotTargetPath,
+} from "./skill-evolution-store.js";
 import {
   evaluateSkillMarkdownPatchPolicy,
   hasInstallSourceEscalation,
@@ -36,8 +40,8 @@ function resolveCandidatePaths(proposal: SkillEvolutionProposal): Array<{
   const candidateRoot = getSkillEvolutionProposalCandidateRoot(proposal.id, proposal.candidateDir);
   return proposal.targetFiles.map((targetFile) => ({
     targetFile,
-    livePath: resolve(PROJECT_ROOT, targetFile),
-    candidatePath: resolve(candidateRoot, targetFile),
+    livePath: resolveSkillEvolutionLiveTargetPath(targetFile),
+    candidatePath: resolveSkillEvolutionSnapshotTargetPath(candidateRoot, targetFile),
   }));
 }
 
@@ -508,7 +512,7 @@ export function auditSkillEvolutionProposal(input: {
   }
 
   const scoped = proposal.targetFiles.length > 0
-    && proposal.targetFiles.every((targetFile) => allowedTargets.has(resolve(PROJECT_ROOT, targetFile)));
+    && proposal.targetFiles.every((targetFile) => allowedTargets.has(resolveSkillEvolutionLiveTargetPath(targetFile)));
   checks.push(buildCheck(
     "patch_is_non_empty_and_scoped",
     scoped && countChangedFiles(candidatePaths) > 0,

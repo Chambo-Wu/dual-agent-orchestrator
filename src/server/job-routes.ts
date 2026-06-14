@@ -1,6 +1,10 @@
-import { type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody, responseAlreadyStarted } from "./shared.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody } from "./shared.js";
+import { getHeaderValue } from "./auth.js";
+import { sseWriteEvent } from "./sse.js";
+import { filterJobEvents, parseNonNegativeIntegerParam, parseStringSetParam, readJobEventQuery } from "./job-event-query.js";
+import { normalizeDaoRunGoal } from "./job-request.js";
 import { listStoredJobs, readJobRecord, updateStoredJobRecord, updateJobControlState, resolveApprovalRequest, type StoredJobRecord } from "../job-store.js";
 import { getActiveJobSession, cancelActiveJobSession, resolvePendingApproval } from "../job-runtime.js";
 import { appendEvent, getEvents, subscribe, getNextSeq, loadEventsFromDisk } from "../job-event-bus.js";
@@ -21,24 +25,11 @@ import {
   buildJobRouteSet,
   buildResumeFollowTarget,
   isRecoveryLifecycleEvent,
-  formatProgressUpdate,
-  attachRequestAbortCancellation,
-  executeJobByMode,
-  normalizeDaoRunGoal,
-  buildModelsResponse,
-  buildHealthResponse,
-  resolveRequestedModel,
-  parseNonNegativeIntegerParam,
-  sseWrite,
-  sseWriteEvent,
-  isObjectRecord,
-  buildWorkflowPayload,
-  filterJobEvents,
-  readJobEventQuery,
-  parseStringSetParam,
-  getHeaderValue,
-  buildWorkflowEvent,
-} from "../index.js";
+} from "../job-response.js";
+import { buildWorkflowPayload, buildHealthResponse } from "../server-response.js";
+import { buildModelsResponse } from "../model-api.js";
+import { executeJobByMode } from "../execution-service.js";
+import { isObjectRecord } from "../task-execution.js";
 import type { Job } from "../types.js";
 
 interface CreateJobRequest {

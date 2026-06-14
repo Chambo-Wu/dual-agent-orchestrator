@@ -1,70 +1,44 @@
-import { type IncomingMessage, type ServerResponse } from "node:http";
-import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody, responseAlreadyStarted } from "./shared.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { AnthropicMessagesRequest, ChatCompletionRequest, ResponsesRequest } from "../api-types.js";
+import { jsonResponse, readJsonBody } from "./shared.js";
+import { shouldIncludeWorkflowEvents, shouldMirrorProgressToContent } from "./request-flags.js";
 import type { OrchestratorEvent, OrchestratorEventCallback } from "../types.js";
 import type { CompletionOverrides } from "../providers/openai-compatible.js";
 import {
-  runTaskFromMessages,
-  runTaskFromMessagesWithRegistration,
-  runToolMode,
-  formatProgressUpdate,
   normalizeChatMessages,
   normalizeAnthropicMessages,
   normalizeAnthropicToolMessages,
   normalizeResponsesInput,
   normalizeOpenAIToolMessages,
-  shouldIncludeWorkflowEvents,
-  shouldMirrorProgressToContent,
   splitContentForStreaming,
-  attachRequestAbortCancellation,
-  sseWrite,
-  sseWriteEvent,
-  buildWorkflowPayload,
-  buildWorkflowEvent,
   summarizeToolResultContent,
   safeParseToolInput,
-  buildAggregatedToolResult,
-  shouldAggregateToolProgress,
-  createProgressAggregationState,
-  buildAggregatedToolStart,
-  accumulateToolProgressResult,
   extractLatestOpenAIWriteToolCompletion,
   extractLatestOpenAIResearchReadCompletion,
   extractLatestAnthropicWriteToolCompletion,
   extractLatestAnthropicResearchReadCompletion,
   hasAnthropicToolHistory,
-} from "../index.js";
-
-interface ChatCompletionRequest {
-  model?: string;
-  messages?: Array<{ role?: string; content?: string | unknown[]; tool_calls?: unknown[]; tool_call_id?: string; name?: string }>;
-  stream?: boolean;
-  include_workflow_events?: boolean;
-  include_progress_updates?: boolean;
-  tools?: unknown[];
-  tool_choice?: unknown;
-  temperature?: number;
-  max_tokens?: number;
-  top_p?: number;
-  stop?: string | string[];
-  stream_options?: { include_usage?: boolean };
-}
-
-interface ResponseInputItem { role?: string; content?: string | Array<{ type?: string; text?: string }>; }
-interface ResponsesRequest { model?: string; input?: string | ResponseInputItem[]; instructions?: string; stream?: boolean; include_workflow_events?: boolean; }
-interface AnthropicContentBlock { type?: string; text?: string; id?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string; content?: string; }
-interface AnthropicMessage { role?: string; content?: string | AnthropicContentBlock[]; }
-interface AnthropicMessagesRequest { model?: string; system?: string | AnthropicContentBlock[]; messages?: AnthropicMessage[]; stream?: boolean; include_workflow_events?: boolean; tools?: Array<{ name?: string; description?: string; input_schema?: Record<string, unknown> }>; tool_choice?: unknown; max_tokens?: number; temperature?: number; top_p?: number; top_k?: number; stop_sequences?: string[]; }
-
-type ProgressAggregationState = {
-  tool: string;
-  step?: number;
-  startCount: number;
-  resultCount: number;
-  successCount: number;
-  failureCount: number;
-  candidateResults: number;
-  summaries: string[];
-};
+} from "../chat-message-utils.js";
+import type { ProgressAggregationState } from "../progress-updates.js";
+import {
+  accumulateToolProgressResult,
+  buildAggregatedToolResult,
+  buildAggregatedToolStart,
+  createProgressAggregationState,
+  formatProgressUpdate,
+  shouldAggregateToolProgress,
+} from "../progress-updates.js";
+import {
+  runTaskFromMessages,
+  runTaskFromMessagesWithRegistration,
+  runToolMode,
+  attachRequestAbortCancellation,
+} from "../execution-service.js";
+import {
+  buildWorkflowPayload,
+} from "../server-response.js";
+import { buildWorkflowEvent } from "../job-response.js";
+import { sseWrite, sseWriteEvent } from "./sse.js";
 
 const OPENAI_MODEL_ID = "dual-agent-orchestrator";
 
@@ -173,6 +147,7 @@ function buildToolChatCompletionChunk(model: string, id: string, toolCall: { id:
 
 async function handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<ChatCompletionRequest>(req);
+  const requestMessages = body.messages ?? [];
   const toolMode = Array.isArray(body.tools) && body.tools.length > 0;
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
   const mirrorProgressToContent = body.stream && !toolMode && shouldMirrorProgressToContent(body.include_progress_updates);
@@ -180,11 +155,11 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const detachRequestAbort = attachRequestAbortCancellation(res, () => requestJobId);
 
   if (toolMode) {
-    if (extractLatestOpenAIWriteToolCompletion(body.messages as any)) {
+    if (extractLatestOpenAIWriteToolCompletion(requestMessages)) {
       jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
       return;
     }
-    if (extractLatestOpenAIResearchReadCompletion(body.messages as any)) {
+    if (extractLatestOpenAIResearchReadCompletion(requestMessages)) {
       jsonResponse(res, 200, buildChatCompletionResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
       return;
     }
@@ -195,7 +170,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     if (body.top_p !== undefined) overrides.topP = body.top_p;
     if (body.stop !== undefined) overrides.stop = body.stop;
     if (body.tool_choice !== undefined) overrides.toolChoice = body.tool_choice;
-    const toolResult = await runToolMode(normalizeOpenAIToolMessages((body.messages || []) as any), body.model, body.tools, overrides);
+    const toolResult = await runToolMode(normalizeOpenAIToolMessages(requestMessages), body.model, body.tools, overrides);
 
     if (!body.stream) {
       if (toolResult.toolCalls.length > 0) {
@@ -345,7 +320,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
 
     try {
       const resultForModel = await runTaskFromMessagesWithRegistration(
-        normalizeChatMessages((body.messages || []) as any),
+        normalizeChatMessages(requestMessages),
         body.model,
         combinedOnEvent,
         (jobId) => { requestJobId = jobId; },
@@ -390,7 +365,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   // Non-streaming path
   try {
     const resultForModel = await runTaskFromMessagesWithRegistration(
-      normalizeChatMessages((body.messages || []) as any),
+      normalizeChatMessages(requestMessages),
       body.model,
       undefined,
       (jobId) => { requestJobId = jobId; },
@@ -503,9 +478,10 @@ function buildAnthropicMessageResponse(model: string, content: string, workflow?
 
 async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody<AnthropicMessagesRequest>(req);
-  const messages = normalizeAnthropicMessages(body.messages as any, body.system);
+  const requestMessages = body.messages ?? [];
+  const messages = normalizeAnthropicMessages(requestMessages, body.system);
   const requestedToolMode = Array.isArray(body.tools) && body.tools.length > 0;
-  const hasToolHistory = hasAnthropicToolHistory(body.messages as any);
+  const hasToolHistory = hasAnthropicToolHistory(requestMessages);
   const toolMode = requestedToolMode && hasToolHistory;
   const includeWorkflowEvents = shouldIncludeWorkflowEvents(req, body.include_workflow_events);
   let requestJobId: string | null = null;
@@ -588,11 +564,11 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
   detachRequestAbort();
 
   if (toolMode) {
-    if (extractLatestAnthropicWriteToolCompletion(body.messages as any)) {
+    if (extractLatestAnthropicWriteToolCompletion(requestMessages)) {
       jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "File written successfully."));
       return;
     }
-    if (extractLatestAnthropicResearchReadCompletion(body.messages as any)) {
+    if (extractLatestAnthropicResearchReadCompletion(requestMessages)) {
       jsonResponse(res, 200, buildAnthropicMessageResponse(body.model || OPENAI_MODEL_ID, "Research evidence read successfully. Please summarize and finish without further tool calls."));
       return;
     }
@@ -606,7 +582,7 @@ async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse
         parameters: tool.input_schema || {},
       },
     }));
-    const toolResult = await runToolMode(normalizeAnthropicToolMessages(body.messages as any, body.system), body.model, convertedTools);
+    const toolResult = await runToolMode(normalizeAnthropicToolMessages(requestMessages, body.system), body.model, convertedTools);
 
     if (!body.stream) {
       if (toolResult.toolCalls.length > 0) {

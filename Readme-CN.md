@@ -73,6 +73,7 @@ npm run serve:restart:9898
 | 2026-06-13 | dao-run 鲁棒性与桌面端基础 | 修复 dao-run CLI 静默失败、添加 PreToolUse hook 保护 CLAUDE.md、修复构建竞态。新增 Electron 桌面端基础、skill auditor 风险分层、全面测试覆盖。 |
 | 2026-06-13b | 代码库优化与治理加固 | 从 index.ts 提取 CLI/Doctor（减少 576 行）、修复 crossFileConsistency 精度、改进 auditor capability matching 增加 token-level 回退、添加 insufficient_evidence reasonCode、对齐 CLAUDE.md 与实现、清理 docs/（26 份归档，新增开发者指南）、扩展 E2E 测试、添加 agents/README 与 timeline.ts 重构说明。构建通过，223/223 单元测试全绿。 |
 | 2026-06-13c | 架构拆分：路由层四模块化 | 提取 `src/server/skill-evolution-routes.ts`（715行/13 handler）、`goal-routes.ts`（452行/11 handler）、`job-routes.ts`（1052行/17 handler）、`chat-routes.ts`（821行/3 handler+7 builder）。index.ts 7531→5586行。构建通过，223/223 测试全绿。 |
+| 2026-06-14 | 架构拆分收口与 Skill 自进化加固 | 将执行入口沉到 `execution-service.ts` / `task-execution.ts`，将 job response / workflow event 沉到 `job-response.ts`，将 health/workflow payload、消息归一化、进度聚合、server router/auth/sse、Skill Evolution automation/builders 等继续拆出。`index.ts` 从最早约 8700 行降到 144 行，定位为 CLI/export 聚合层。补齐 skill evolution 路径护栏、test config clone、API request shared types、dead code 清理；构建通过，226/226 单元测试全绿。 |
 系统围绕两个模型角色构建：
 
 - `planner`：更强的规划模型，负责理解目标、拆解步骤、审计进展、决定重试，并生成最终答案
@@ -113,16 +114,26 @@ npm run serve:restart:9898
 - `src/tools.ts`：本地工具与搜索 / 抓取 / 文件执行
 - `src/workflow-runtime.ts`：workflow 执行与 replan 流程
 - `src/workflow-plan.ts`：workflow plan schema 解析与校验
-- `src/index.ts`：HTTP 路由装配 + 核心执行（5586行）
+- `src/index.ts`：CLI/export 聚合层与路由入口转发（144行）
 - `src/server/`：路由模块
+  - `router.ts`：HTTP 路由装配
   - `shared.ts`：共享 HTTP 工具
-  - `skill-evolution-routes.ts`：Skill Evolution API（715行）
+  - `auth.ts`：API 鉴权
+  - `sse.ts`：SSE 写入工具
+  - `skill-evolution-routes.ts`：Skill Evolution API（621行）
   - `goal-routes.ts`：Goal CRUD（452行）
-  - `job-routes.ts`：Job CRUD + Stream（1052行）
-  - `chat-routes.ts`：Chat/Responses/Messages（821行）
+  - `job-routes.ts`：Job CRUD + Stream（1043行）
+  - `chat-routes.ts`：Chat/Responses/Messages（797行）
+- `src/execution-service.ts`：OpenAI / Anthropic / Responses 执行入口
+- `src/task-execution.ts`：Job / Task / Team 执行服务
+- `src/job-response.ts`：Job response、workflow summary、workflow event 聚合
+- `src/server-response.ts`：Health response 与 workflow payload
+- `src/chat-message-utils.ts`：Chat/Tool/Anthropic 消息归一化
+- `src/progress-updates.ts`：流式进度聚合
 - `src/cli/`：CLI 入口
   - `entry.ts`：main、server、task/team/dao-run 执行器
   - `doctor.ts`：配置诊断
+- `src/skill-evolution-automation.ts` / `skill-evolution-builders.ts`：Skill 自进化自动流水线与 proposal/reflection 构建桥接
 - `src/goals-dashboard.ts`：goal dashboard 渲染
 - `runtime/jobs/`：持久化 job 记录
 - `runtime/logs/`：每次运行的 JSONL 日志

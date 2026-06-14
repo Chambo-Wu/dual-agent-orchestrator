@@ -61,7 +61,7 @@
 语言：      TypeScript（strict mode）
 运行时：    Node.js ≥ 20
 构建：      tsc
-测试：      node:test（223 单元测试 + 集成 + E2E）
+测试：      node:test（226 单元测试 + 集成 + E2E）
 配置：      YAML（多模型候选队列、策略开关）
 桌面端：    Electron（基础可用）
 Agent 层：  Claude Code CLI 入口（/dao-run、/dao-exec）
@@ -72,9 +72,12 @@ Agent 层：  Claude Code CLI 入口（/dao-run、/dao-exec）
 ## 架构一览
 
 ```
-src/index.ts (5586行 — 路由装配 + 核心执行)
+src/index.ts (144行 — CLI/export 聚合 + 路由入口转发)
 └── src/server/
+    ├── router.ts                  HTTP 路由装配
     ├── shared.ts                  共享 HTTP 工具
+    ├── auth.ts                    API 鉴权
+    ├── sse.ts                     SSE 写入工具
     ├── skill-evolution-routes.ts  Skill Evolution API (13 handler)
     ├── goal-routes.ts             Goal CRUD (11 handler)
     ├── job-routes.ts              Job CRUD + Stream (17 handler)
@@ -84,12 +87,22 @@ src/index.ts (5586行 — 路由装配 + 核心执行)
     └── doctor.ts                  配置诊断
 
 执行引擎
+├── src/execution-service.ts  OpenAI/Anthropic/Responses 执行入口
+├── src/task-execution.ts     Job/Task/Team 执行服务
 ├── src/orchestrator.ts       Planner/Executor 主循环
 ├── src/workflow-runtime.ts   Workflow DAG 执行与 Replan
 ├── src/team.ts               Team Mode 多 Agent 协同
 └── src/tools.ts              12 个内置工具
 
+响应与事件
+├── src/job-response.ts       Job response / workflow event 聚合
+├── src/server-response.ts    Health / workflow payload
+├── src/chat-message-utils.ts Chat/Tool/Anthropic 消息归一化
+└── src/progress-updates.ts   流式进度聚合
+
 Skill 自进化
+├── src/skill-evolution-automation.ts 自动反思/提案/审计/验证流水线
+├── src/skill-evolution-builders.ts    Reflection / proposal 构建桥接
 ├── src/skill-evolver.ts           Proposal 生成
 ├── src/skill-auditor.ts           Auditor Gate
 ├── src/skill-deployment-validator.ts   部署验证
@@ -137,6 +150,7 @@ node dist/index.js "写一个 markdown 文件 notes/plan.md，列出三个优化
 | 2026-06-13 | dao-run 鲁棒性 + Electron 桌面端 + 审计分层 |
 | 2026-06-13b | 代码库优化：index.ts 模块化、crossFileConsistency 精度、审计匹配改进、文档清理 |
 | 2026-06-13c | 架构拆分：路由层四模块化（Skill Evolution/Goal/Job/Chat routes），index.ts 7531→5586行 |
+| 2026-06-14 | 架构拆分收口：执行入口、job response、server response、消息工具与 Skill Evolution 自动化模块下沉，index.ts 约 8700→144行；补路径护栏、测试配置克隆、API request types 统一和死代码清理 |
 
 ---
 

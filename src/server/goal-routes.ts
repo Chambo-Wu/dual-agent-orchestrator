@@ -1,6 +1,6 @@
 import { type IncomingMessage, type ServerResponse } from "node:http";
 import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody } from "./shared.js";
-import { executeJobByMode } from "../index.js";
+import { executeJobByMode } from "../execution-service.js";
 import type { OrchestratorConfig } from "../types.js";
 import { appendGoalEvent, buildGoalRecord, listGoals, persistGoal, readGoal, readGoalEvents } from "../goal-store.js";
 import { resumeGoal, reviewGoal, retryGoalTask, runNextGoalTask } from "../goal-runtime.js";

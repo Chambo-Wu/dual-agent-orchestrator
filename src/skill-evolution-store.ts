@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { PROJECT_ROOT, resolveRuntimeAwarePath } from "./paths.js";
 import { buildCandidateManifestContent, buildStructuredSkillMarkdownCandidate } from "./skill-evolver.js";
 import type {
@@ -63,12 +63,39 @@ function proposalRollbackRoot(proposalId: string, candidateDir = "runtime/skill-
   return resolve(proposalDir(proposalId, candidateDir), "rollback");
 }
 
+export function resolveSkillEvolutionLiveTargetPath(targetFile: string): string {
+  const resolvedPath = isAbsolute(targetFile) ? resolve(targetFile) : resolve(PROJECT_ROOT, targetFile);
+  assertPathWithinRoot(resolvedPath, PROJECT_ROOT, `Skill evolution target escapes the workspace: ${targetFile}`);
+  return resolvedPath;
+}
+
+export function resolveSkillEvolutionSnapshotTargetPath(snapshotRoot: string, targetFile: string): string {
+  const resolvedSnapshotRoot = resolve(snapshotRoot);
+  if (!isAbsolute(targetFile)) {
+    const resolvedPath = resolve(resolvedSnapshotRoot, targetFile);
+    assertPathWithinRoot(resolvedPath, resolvedSnapshotRoot, `Skill evolution snapshot target escapes the snapshot root: ${targetFile}`);
+    return resolvedPath;
+  }
+  const snapshotRelativeTarget = targetFile.replace(/\\/g, "/").replace(/:/g, "").replace(/^\/+/, "");
+  const resolvedPath = resolve(resolvedSnapshotRoot, snapshotRelativeTarget);
+  assertPathWithinRoot(resolvedPath, resolvedSnapshotRoot, `Skill evolution snapshot target escapes the snapshot root: ${targetFile}`);
+  return resolvedPath;
+}
+
+function assertPathWithinRoot(path: string, root: string, message: string): void {
+  const relativePath = relative(resolve(root), resolve(path));
+  const normalizedRelativePath = relativePath.replace(/\\/g, "/");
+  if (isAbsolute(relativePath) || normalizedRelativePath === ".." || normalizedRelativePath.startsWith("../")) {
+    throw new Error(message);
+  }
+}
+
 function proposalCandidateFilePath(
   proposalId: string,
   targetFile: string,
   candidateDir = "runtime/skill-evolution",
 ): string {
-  return resolve(proposalCandidateRoot(proposalId, candidateDir), targetFile);
+  return resolveSkillEvolutionSnapshotTargetPath(proposalCandidateRoot(proposalId, candidateDir), targetFile);
 }
 
 function auditReportPath(proposalId: string, candidateDir = "runtime/skill-evolution"): string {
@@ -236,7 +263,7 @@ function materializeCandidateSkillSnapshot(
   mkdirSync(proposalCandidateRoot(proposal.id, candidateDir), { recursive: true });
   const reflection = readSkillReflectionForProposal(proposal, candidateDir);
   for (const targetFile of proposal.targetFiles) {
-    const sourcePath = resolve(PROJECT_ROOT, targetFile);
+    const sourcePath = resolveSkillEvolutionLiveTargetPath(targetFile);
     const destinationPath = proposalCandidateFilePath(proposal.id, targetFile, candidateDir);
     mkdirSync(dirname(destinationPath), { recursive: true });
     const nextContent = buildCandidateFileContent(proposal, targetFile, sourcePath, reflection);
@@ -446,9 +473,9 @@ export function applyAcceptedSkillProposal(
   mkdirSync(rollbackDir, { recursive: true });
 
   const operations = proposal.targetFiles.map((targetFile) => {
-    const livePath = resolve(PROJECT_ROOT, targetFile);
-    const candidatePath = resolve(candidateRoot, targetFile);
-    const rollbackPath = resolve(rollbackDir, targetFile);
+    const livePath = resolveSkillEvolutionLiveTargetPath(targetFile);
+    const candidatePath = resolveSkillEvolutionSnapshotTargetPath(candidateRoot, targetFile);
+    const rollbackPath = resolveSkillEvolutionSnapshotTargetPath(rollbackDir, targetFile);
     return {
       targetFile,
       livePath,

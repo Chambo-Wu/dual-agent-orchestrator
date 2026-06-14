@@ -17,14 +17,11 @@ import type { OrchestratorConfig } from "../types.js";
 
 // Circular imports from index.ts — all used only at runtime inside exported functions.
 // eslint-disable-next-line import/no-cycle
-import {
-  resolveTeamAgents,
-  handleRequest,
-  getServerApiKey,
-  getExposedModels,
-  assertHealthyExecutorSelection,
-  recoverInterruptedJobs,
-} from "../index.js";
+import { getExposedModels } from "../model-api.js";
+import { getServerApiKey } from "../server/auth.js";
+import { handleRequest } from "../server/router.js";
+import { assertHealthyExecutorSelection, recoverInterruptedJobs } from "../task-execution.js";
+import { resolveTeamAgents } from "../team-agents.js";
 
 export function getPort(args: string[]): number {
   const explicitPort = args[1] ? Number(args[1]) : Number(process.env.PORT ?? "9898");

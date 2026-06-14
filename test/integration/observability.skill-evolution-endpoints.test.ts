@@ -179,10 +179,17 @@ test("skill propose endpoint scaffolds candidate SKILL.md when the live skill ha
     }), proposeRes);
     const proposeBody = JSON.parse(proposeRes.body) as {
       candidate_path?: string;
+      proposal?: {
+        targetFiles?: string[];
+      };
     };
 
     assert.equal(proposeRes.statusCode, 201);
-    const candidateMarkdownPath = join(String(proposeBody.candidate_path), config.skills.builtinDir, "find.code_symbol", "SKILL.md");
+    const candidateMarkdownTarget = proposeBody.proposal?.targetFiles?.find((target) =>
+      target.endsWith("/SKILL.md") || target.endsWith("\\SKILL.md")
+    );
+    assert.equal(typeof candidateMarkdownTarget, "string");
+    const candidateMarkdownPath = join(String(proposeBody.candidate_path), candidateMarkdownTarget!);
     assert.equal(existsSync(candidateMarkdownPath), true);
     const candidateMarkdown = readFileSync(candidateMarkdownPath, "utf8");
     assert.equal(/(^|\n)#\s+Skill:/i.test(candidateMarkdown), true);
@@ -2548,7 +2555,8 @@ test("skill evolution proposal accept endpoint records accepted decision", async
 
     const liveManifest = JSON.parse(readFileSync(join(skillDir, "skill.json"), "utf8")) as { description?: string };
     assert.equal(liveManifest.description, "Accepted candidate skill description.");
-    const rollbackManifestPath = join(String(acceptBody.rollback_path), config.skills.builtinDir, "find.code_symbol", "skill.json");
+    assert.equal(typeof candidateTarget, "string");
+    const rollbackManifestPath = join(String(acceptBody.rollback_path), candidateTarget!);
     assert.equal(existsSync(rollbackManifestPath), true);
     const rollbackManifest = JSON.parse(readFileSync(rollbackManifestPath, "utf8")) as { description?: string };
     assert.equal(rollbackManifest.description, "Locate repository symbols before editing.");

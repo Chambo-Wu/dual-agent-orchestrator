@@ -1,10 +1,12 @@
 import { existsSync } from "node:fs";
 import { loadEventsFromDisk } from "./job-event-bus.js";
+import type { StoredJobRecord } from "./job-store.js";
 import type { validateSkillEvolutionProposal } from "./skill-deployment-validator.js";
 import {
 	getSkillEvolutionProposalCandidateRoot,
 	getSkillEvolutionProposalRollbackRoot,
 	listSkillEvolutionProposals,
+	listSkillReflectionRecords,
 	readSkillAuditReport,
 	readSkillDeploymentValidationReport,
 	readSkillEvolutionDecisionRecord,
@@ -21,6 +23,49 @@ import type { OrchestratorConfig } from "./types.js";
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+export function resolveSkillEvolutionSummary(record: StoredJobRecord, config: OrchestratorConfig): Record<string, unknown> | null {
+	const selectedSkillId = record.job.selectedSkill?.skill_id ?? record.plan.selectedSkill?.skill_id;
+	if (!selectedSkillId) {
+		return null;
+	}
+
+	const candidateDir = config.skillEvolution.candidateDir;
+	const reflectionIds = new Set(
+		listSkillReflectionRecords(selectedSkillId, candidateDir)
+			.filter((reflection) => reflection.jobId === record.job.id)
+			.map((reflection) => reflection.id),
+	);
+	if (reflectionIds.size === 0) {
+		return null;
+	}
+	const proposals = listSkillEvolutionProposals(candidateDir)
+		.filter((proposal) => proposal.skillId === selectedSkillId && reflectionIds.has(proposal.sourceReflectionId))
+		.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+	if (proposals.length === 0) {
+		return null;
+	}
+
+	const latest = proposals[0]!;
+	const latestRecord = buildSkillEvolutionProposalControlPlaneRecord(latest, config);
+	return {
+		proposal_count: proposals.length,
+		latest_proposal_id: latest.id,
+		latest_status: latest.status,
+		latest_patch_summary: latest.patchSummary,
+		latest_change_summary: latest.controlPlaneSummary?.changeHeadline ?? latest.diffSummary?.changedFiles.map((file) => file.summary).join(" ") ?? null,
+		latest_rationale_summary: latest.controlPlaneSummary?.rationaleHeadline ?? latest.rationaleSummary?.reason ?? null,
+		latest_changed_files: latest.controlPlaneSummary?.changedFiles ?? latest.targetFiles,
+		latest_created_at: latest.createdAt,
+		latest_decided_at: latest.decidedAt ?? null,
+		latest_validation_summary: latestRecord.validation_summary,
+		latest_ops_summary: latestRecord.ops_summary,
+		statuses: proposals.reduce<Record<string, number>>((acc, proposal) => {
+			acc[proposal.status] = (acc[proposal.status] ?? 0) + 1;
+			return acc;
+		}, {}),
+	};
 }
 
 export function shouldAutoAcceptSkillEvolution(validation: ReturnType<typeof validateSkillEvolutionProposal>, config: OrchestratorConfig): boolean {

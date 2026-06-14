@@ -1,7 +1,9 @@
 import { type IncomingMessage, type ServerResponse } from "node:http";
+import { isAbsolute, relative, resolve } from "node:path";
 import { loadConfig } from "../config.js";
 import type { OrchestratorConfig } from "../types.js";
 import { classifyFailure } from "../failure-classification.js";
+import { WORKSPACE_ROOT } from "../paths.js";
 
 let configOverrideForTests: OrchestratorConfig | null = null;
 
@@ -10,7 +12,19 @@ export function getRuntimeConfig(): OrchestratorConfig {
 }
 
 export function setConfigOverrideForTests(config: OrchestratorConfig | null): void {
-  configOverrideForTests = config;
+  if (!config) {
+    configOverrideForTests = null;
+    return;
+  }
+
+  const normalizedConfig = structuredClone(config);
+  if (isAbsolute(normalizedConfig.skills.builtinDir)) {
+    const relativeBuiltinDir = relative(WORKSPACE_ROOT, resolve(normalizedConfig.skills.builtinDir)).replace(/\\/g, "/");
+    if (relativeBuiltinDir && !relativeBuiltinDir.startsWith("../") && relativeBuiltinDir !== "..") {
+      normalizedConfig.skills.builtinDir = relativeBuiltinDir;
+    }
+  }
+  configOverrideForTests = normalizedConfig;
 }
 
 export function jsonResponse(res: ServerResponse, statusCode: number, payload: unknown): void {

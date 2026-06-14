@@ -6,14 +6,10 @@ import { createUiEvent } from "../workflow-ui-events.js";
 import type { OrchestratorConfig } from "../types.js";
 import type {
   SkillEvolutionDecisionRecord,
-  SkillEvolutionProposal,
   SkillReflectionRecord,
 } from "../skill-evolution-types.js";
-import { buildSkillOutcomeSummary } from "../skill-outcome.js";
-import { buildSkillReflectionRecord } from "../skill-reflection.js";
 import { getSkillManifest, listAvailableSkills, listInstalledSkills } from "../skill-registry.js";
 import { getInstalledSkillRecord, installSkillById } from "../skill-installer.js";
-import { generateSkillEvolutionProposal } from "../skill-evolver.js";
 import { auditSkillEvolutionProposal } from "../skill-auditor.js";
 import { validateSkillEvolutionProposalWithRuntimeReplay } from "../skill-deployment-validator.js";
 import {
@@ -34,9 +30,10 @@ import {
   readSkillReflectionRecord,
   updateSkillEvolutionProposal,
 } from "../skill-evolution-store.js";
+import { buildSkillEvolutionProposal, buildSkillReflectionFromRecord } from "../skill-evolution-builders.js";
 import { buildSkillEvolutionOpsSummary, buildSkillEvolutionProposalControlPlaneRecord } from "../skill-evolution-control-plane.js";
 import { renderSkillEvolutionOpsDashboardHtml } from "../skill-evolution-ops-dashboard.js";
-import { mergeJobEvents, resolveSelectedSkillSummary, resolveSkillVerificationSummary, createLifecycleEvent } from "../index.js";
+import { createLifecycleEvent } from "../job-response.js";
 import { getRuntimeConfig, jsonResponse, jsonErrorResponse, readJsonBody } from "./shared.js";
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -130,17 +127,6 @@ export async function handleListSkillReflections(req: IncomingMessage, res: Serv
   jsonResponse(res, 200, buildSkillReflectionsResponse(skillId, config.skillEvolution.candidateDir, limit));
 }
 
-export function buildSkillReflectionFromRecord(record: StoredJobRecord): ReturnType<typeof buildSkillReflectionRecord> {
-  const events = mergeJobEvents(record, loadEventsFromDisk(record.job.id));
-  const selectedSkill = resolveSelectedSkillSummary(record, events);
-  const skillVerification = resolveSkillVerificationSummary(record);
-  const skillOutcome = buildSkillOutcomeSummary(record, events, selectedSkill, skillVerification);
-  return buildSkillReflectionRecord(skillOutcome, {
-    record,
-    events,
-  });
-}
-
 function findLatestSkillJobRecord(skillId: string): StoredJobRecord | null {
   for (const stored of listStoredJobs()) {
     const record = readJobRecord(stored.id);
@@ -181,86 +167,6 @@ function findReflectionForProposalCreate(
     return findLatestSkillReflectionRecord(requestedSkillId, config.skillEvolution.candidateDir);
   }
   return null;
-}
-
-function appendBulletToMarkdownSection(markdown: string, heading: string, bullet: string): string {
-  const headingPattern = new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "im");
-  const lines = markdown.split(/\r?\n/);
-  const headingIndex = lines.findIndex((line) => new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i").test(line.trim()));
-  if (headingIndex === -1) {
-    return `${markdown.trimEnd()}\n\n## ${heading}\n${bullet}\n`;
-  }
-  let insertIndex = lines.length;
-  for (let index = headingIndex + 1; index < lines.length; index += 1) {
-    if (/^##\s+/.test(lines[index] ?? "")) {
-      insertIndex = index;
-      break;
-    }
-  }
-  lines.splice(insertIndex, 0, bullet);
-  const next = lines.join("\n");
-  return headingPattern.test(next) ? next : `${next.trimEnd()}\n`;
-}
-
-function buildStructuredSkillMarkdown(
-  reflection: SkillReflectionRecord,
-  existingMarkdown: string | null,
-  skillId: string,
-): string {
-  const title = skillId;
-  const coreBullet = reflection.recommendedAction === "patch_verification"
-    ? `- Clarify the verification-critical steps for the ${reflection.reflectionKind} scenario: ${reflection.reason}`
-    : `- Refine the core procedure for the ${reflection.reflectionKind} scenario: ${reflection.reason}`;
-  const appendixBullet = `- Auto-evolve note (${reflection.reflectionKind}): ${reflection.reason}`;
-
-  const template = [
-    `# Skill: ${title}`,
-    "",
-    "## Core Procedure",
-    "- Start from the most relevant repository evidence before taking downstream action.",
-    "",
-    "## Scenario Extensions",
-    "- Add scenario-specific guidance here when repeated runs expose a reusable pattern.",
-    "",
-    "## Appendix",
-    "- Capture recurring pitfalls, evidence expectations, and reminders here.",
-    "",
-  ].join("\n");
-
-  let markdown = existingMarkdown && existingMarkdown.trim().length > 0
-    ? existingMarkdown
-    : template;
-  if (!/^#\s+Skill:/im.test(markdown)) {
-    markdown = `# Skill: ${title}\n\n${markdown.trimStart()}`;
-  }
-  if (!/^##\s+Core Procedure\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Core Procedure\n- Establish the stable body steps for this skill.\n`;
-  }
-  if (!/^##\s+Scenario Extensions\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Scenario Extensions\n- Add scenario-specific extensions here.\n`;
-  }
-  if (!/^##\s+Appendix\s*$/im.test(markdown)) {
-    markdown = `${markdown.trimEnd()}\n\n## Appendix\n- Capture recurring pitfalls and reminders here.\n`;
-  }
-
-  if (reflection.recommendedAction !== "append_appendix") {
-    markdown = appendBulletToMarkdownSection(markdown, "Core Procedure", coreBullet);
-  }
-  markdown = appendBulletToMarkdownSection(markdown, "Appendix", appendixBullet);
-  return markdown.endsWith("\n") ? markdown : `${markdown}\n`;
-}
-
-export function buildSkillEvolutionProposal(
-  reflection: SkillReflectionRecord,
-  candidateDir: string,
-  config: OrchestratorConfig,
-): SkillEvolutionProposal {
-  return generateSkillEvolutionProposal({
-    reflection,
-    candidateDir,
-    config,
-    manifest: getSkillManifest(reflection.skillId, config),
-  });
 }
 
 export async function handleCreateSkillReflection(req: IncomingMessage, res: ServerResponse, skillId: string): Promise<void> {

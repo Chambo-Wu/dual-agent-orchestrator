@@ -1,6 +1,8 @@
-import { dirname, relative, resolve } from "node:path";
-import { PROJECT_ROOT } from "./paths.js";
-import { getSkillEvolutionProposalCandidateRoot } from "./skill-evolution-store.js";
+import { dirname } from "node:path";
+import {
+  getSkillEvolutionProposalCandidateRoot,
+  resolveSkillEvolutionSnapshotTargetPath,
+} from "./skill-evolution-store.js";
 import type { StoredJobRecord } from "./job-store.js";
 import type { SkillEvolutionProposal, SkillIsolatedReplayEvent, SkillIsolatedReplayStepSummary, SkillRuntimeReplayTaskPayload } from "./skill-evolution-types.js";
 import type { SkillManifest } from "./skill-types.js";
@@ -16,16 +18,6 @@ function normalizePath(pathText: string): string {
   return pathText.replace(/\\/g, "/");
 }
 
-function resolveBuiltinBaseFromTargetFile(proposal: SkillEvolutionProposal, targetFile: string): string {
-  const normalized = normalizePath(targetFile);
-  const segments = normalized.split("/");
-  const skillSegmentIndex = segments.lastIndexOf(proposal.skillId);
-  if (skillSegmentIndex > 0) {
-    return segments.slice(0, skillSegmentIndex).join("/");
-  }
-  return normalizePath(dirname(dirname(normalized)));
-}
-
 export function resolveCandidateReplayBuiltinDir(proposal: SkillEvolutionProposal): {
   candidateRoot: string;
   builtinDirAbsolute: string;
@@ -38,8 +30,8 @@ export function resolveCandidateReplayBuiltinDir(proposal: SkillEvolutionProposa
     return null;
   }
   const candidateRoot = getSkillEvolutionProposalCandidateRoot(proposal.id, proposal.candidateDir);
-  const builtinBase = resolveBuiltinBaseFromTargetFile(proposal, targetFile);
-  const builtinDirAbsolute = resolve(candidateRoot, builtinBase);
+  const candidateTargetPath = resolveSkillEvolutionSnapshotTargetPath(candidateRoot, targetFile);
+  const builtinDirAbsolute = dirname(dirname(candidateTargetPath));
   return {
     candidateRoot,
     builtinDirAbsolute,

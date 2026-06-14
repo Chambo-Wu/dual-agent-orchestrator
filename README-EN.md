@@ -81,8 +81,9 @@ The skill-evolution path is now partially productized rather than just a design 
 - shipped: skill-aware outcome summaries, reflection records, proposal/audit/validate/accept-reject APIs, timeline/dashboard observability, and a first-pass auto pipeline driven by config flags
 - shipped: event and replay coverage for skill reflection and skill-evolution lifecycle updates
 - shipped: deployment validation now has deterministic isolated manifest replay, candidate runtime workflow materialization, manual runtime replay validation, and an opt-in automatic validation path via `skill_evolution.runtime_replay_in_auto_pipeline`
-- v1 heuristic only: auto-generated proposals currently produce minimal safe candidate edits instead of deep skill rewrites
-- not yet mature for broad autonomous rollout: automatic accept remains guarded by config, risk tiering, dynamic risk signals, stability checks, and validation readiness
+- shipped: V2 governance signals including proposal quality metadata, auto-accept eligibility contracts, ops queue filters, stuck-state/next-action summaries, rollback links, auditor remediation hints, dynamic risk clusters, and low-risk pilot allowlists
+- shipped: path containment for skill-evolution live targets and candidate/rollback snapshots; audit, validation, accept, and replay paths use the same helper
+- intentionally conservative: automatic accept remains guarded by config, risk tiering, dynamic risk signals, stability checks, validation readiness, and audit evidence
 
 ## Milestones
 
@@ -95,6 +96,8 @@ The skill-evolution path is now partially productized rather than just a design 
 | 2026-05-30 | Runtime replay validation checkpoint | Deterministic isolated manifest replay, replay job events, candidate workflow materialization, manual `stage=executed` validation reports, opt-in auto-pipeline runtime replay, and updated readiness/auto-accept gates. |
 | 2026-06-13 | dao-run robustness and desktop foundation | Fixed dao-run CLI silent failure (service-down now exits 1 with actionable guidance), added PreToolUse hook to protect CLAUDE.md from being overwritten, fixed restart-serve-9898.ps1 build race condition. Added Electron desktop app foundation, skill auditor with risk tiering, and comprehensive test coverage for skill evolution and workflow systems. |
 | 2026-06-13b | Codebase optimization and governance hardening | Extracted CLI/Doctor from index.ts (576 lines removed), fixed crossFileConsistency precision for patch_body+skill_defect cases, improved auditor capability matching with token-level fallback, added insufficient_evidence reasonCode, aligned CLAUDE.md with actual implementation, cleaned docs/ (26 archived, developer guide added), extended E2E test coverage, added agents/README and timeline.ts refactoring notes. Build passes, 223/223 unit tests green. |
+| 2026-06-13c | Route-layer modularization | Extracted Skill Evolution, Goal, Job, and Chat routes from `src/index.ts`; index.ts moved from 7531 to 5586 lines at that checkpoint. |
+| 2026-06-14 | Architecture split closure and Skill Evolution hardening | Moved execution entrypoints, task execution, job responses, server responses, chat message utilities, progress updates, router/auth/SSE helpers, and Skill Evolution automation/builders into dedicated modules. `src/index.ts` is now a 144-line CLI/export aggregation layer. Added skill-evolution path containment, cloned test config overrides, shared API request types, and removed replay dead code. Build passes, 226/226 unit tests green. |
 ## Terminology
 
 Use these terms consistently across the runtime, API, UI, and planning docs:
@@ -114,7 +117,19 @@ Use these terms consistently across the runtime, API, UI, and planning docs:
 ## Architecture
 
 - `src/orchestrator.ts`: planner/executor loop, protocol correction, evidence checks, and file-write validation
-- `src/index.ts`: HTTP API server, chat adapters, job control plane, and browser routes (CLI/Doctor extracted to `src/cli/`)
+- `src/index.ts`: 144-line CLI/export aggregation layer and router entrypoint forwarding
+- `src/server/router.ts`: HTTP route table and handler dispatch
+- `src/server/chat-routes.ts`: OpenAI Chat, Responses, and Anthropic Messages handlers
+- `src/server/job-routes.ts`: job CRUD, approval, resume/retry/review, events, streams, and browser views
+- `src/server/goal-routes.ts`: goal CRUD, run-next, retry/resume/review, events, and browser views
+- `src/server/skill-evolution-routes.ts`: skill list/install/reflection/proposal/audit/validate/accept/reject and ops routes
+- `src/execution-service.ts`: OpenAI/Responses/Anthropic execution entrypoints
+- `src/task-execution.ts`: job/task/team execution service, recovery, approval, and test injection points
+- `src/job-response.ts`: job response, workflow summary, and workflow event aggregation
+- `src/server-response.ts`: health response and workflow payload builders
+- `src/chat-message-utils.ts`: OpenAI/Anthropic/tool message normalization
+- `src/progress-updates.ts`: streaming progress aggregation
+- `src/api-types.ts`: shared OpenAI/Responses/Anthropic request types
 - `src/cli/entry.ts`: CLI entry point (main, server, task/team/dao-run runners)
 - `src/cli/doctor.ts`: configuration diagnostics (doctor report, config checks)
 - `src/workflow-ui-events.ts`: normalized frontend event schema
@@ -126,6 +141,9 @@ Use these terms consistently across the runtime, API, UI, and planning docs:
 - `src/workflow-plan.ts`: workflow plan schema parsing and validation
 - `src/workflow-runtime.ts`: workflow runtime execution and replan flow
 - `src/workflow-graph.ts`: DAG and replan-history view-model generation
+- `src/skill-evolution-automation.ts`: automatic reflect/propose/audit/validate/accept pipeline
+- `src/skill-evolution-builders.ts`: reflection/proposal builder bridge
+- `src/skill-evolution-store.ts`: skill-evolution persistence and path containment helpers
 - `runtime/jobs/`: persisted job records
 - `runtime/logs/`: per-run JSONL logs
 - `runtime/command-results/`: tool artifacts
